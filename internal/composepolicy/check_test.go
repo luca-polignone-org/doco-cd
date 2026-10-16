@@ -261,6 +261,14 @@ func TestCheck(t *testing.T) {
 			},
 			want: nil,
 		},
+		{
+			name: "path through a file with same external and internal path",
+			mod: func(in *Input) {
+				in.Paths = Paths{CheckoutExternal: intl, CheckoutInternal: intl}
+				volOnly(bind(intl + "/s"), bind(intl+"/plain/sub"))(in)
+			},
+			want: []Violation{vi("volumes", intl+"/plain/sub")},
+		},
 		{name: "relative symlink escaping", mod: volOnly(bind(ext + "/y/z")), want: []Violation{vi("volumes", ext+"/y/z")}},
 		{name: "path through a file", mod: volOnly(bind(ext + "/plain/sub")), want: []Violation{vi("volumes", ext+"/plain/sub")}},
 		{

@@ -228,7 +228,7 @@ func describe(schema *jsonschema.Schema, typ reflect.Type, value reflect.Value, 
 		}
 
 		switch typ {
-		case reflect.TypeFor[deploy.DestroyConfig](), reflect.TypeFor[deploy.AutoDiscoveryConfig](), reflect.TypeFor[deploy.ReconciliationConfig]():
+		case reflect.TypeFor[deploy.DestroyConfig](), reflect.TypeFor[deploy.AutoDiscoveryConfig](), reflect.TypeFor[deploy.ReconciliationConfig](), reflect.TypeFor[deploy.RollbackConfig]():
 			schema.Types = []string{"boolean", "object", "null"}
 		case reflect.TypeFor[secrettypes.ExternalSecretRef]():
 			schema.Types = []string{"string", "number", "boolean", "object"}

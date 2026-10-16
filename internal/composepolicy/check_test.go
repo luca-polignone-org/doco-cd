@@ -265,7 +265,7 @@ func TestCheck(t *testing.T) {
 			name: "path through a file with same external and internal path",
 			mod: func(in *Input) {
 				in.Paths = Paths{CheckoutExternal: intl, CheckoutInternal: intl}
-				volOnly(bind(intl + "/s"), bind(intl+"/plain/sub"))(in)
+				volOnly(bind(intl+"/s"), bind(intl+"/plain/sub"))(in)
 			},
 			want: []Violation{vi("volumes", intl+"/plain/sub")},
 		},

@@ -29,22 +29,27 @@ targets:
 	}
 
 	bad := map[string]string{
-		"version":        "version: 2",
-		"glob key":       "version: 1\ntargets: {\"noi/*\": {repository: https://x/y}}",
-		"no repo":        "version: 1\ntargets: {\"noi/a\": {}}",
-		"bad object":     "version: 1\ntargets: {\"noi\": {repository: https://x/y}}",
-		"empty context":  "version: 1\ntargets: {\"/a\": {repository: https://x/y}}",
-		"empty project":  "version: 1\ntargets: {\"noi/\": {repository: https://x/y}}",
-		"deep object":    "version: 1\ntargets: {\"noi/a/b\": {repository: https://x/y}}",
-		"relative path":  "version: 1\ndefault: {bind_allowlist: [srv]}",
-		"target path":    "version: 1\ntargets: {\"noi/a\": {repository: https://x/y, bind_allowlist: [srv]}}",
-		"cap ALL":        "version: 1\ndefault: {cap_add_allowlist: [ALL]}",
-		"cap CAP_ALL":    "version: 1\ndefault: {cap_add_allowlist: [cap_all]}",
-		"cap empty":      "version: 1\ndefault: {cap_add_allowlist: [\"CAP_\"]}",
-		"unknown key":    "version: 1\nfoo: 1",
-		"unknown nested": "version: 1\ndefault: {bind: [/a]}",
-		"yaml":           "version: [",
-		"empty":          "",
+		"version":         "version: 2",
+		"glob key":        "version: 1\ntargets: {\"noi/*\": {repository: https://x/y}}",
+		"no repo":         "version: 1\ntargets: {\"noi/a\": {}}",
+		"bad object":      "version: 1\ntargets: {\"noi\": {repository: https://x/y}}",
+		"empty context":   "version: 1\ntargets: {\"/a\": {repository: https://x/y}}",
+		"empty project":   "version: 1\ntargets: {\"noi/\": {repository: https://x/y}}",
+		"deep object":     "version: 1\ntargets: {\"noi/a/b\": {repository: https://x/y}}",
+		"relative path":   "version: 1\ndefault: {bind_allowlist: [srv]}",
+		"target path":     "version: 1\ntargets: {\"noi/a\": {repository: https://x/y, bind_allowlist: [srv]}}",
+		"cap ALL":         "version: 1\ndefault: {cap_add_allowlist: [ALL]}",
+		"cap CAP_ALL":     "version: 1\ndefault: {cap_add_allowlist: [cap_all]}",
+		"cap empty":       "version: 1\ndefault: {cap_add_allowlist: [\"CAP_\"]}",
+		"unknown key":     "version: 1\nfoo: 1",
+		"unknown nested":  "version: 1\ndefault: {bind: [/a]}",
+		"yaml":            "version: [",
+		"default repo":    "version: 1\ndefault: {repository: https://x/y}",
+		"default ref":     "version: 1\ndefault: {reference: main}",
+		"default target":  "version: 1\ndefault: {config_target: t}",
+		"two documents":   "version: 1\n---\nversion: 1",
+		"broken trailing": "version: 1\n---\n[",
+		"empty":           "",
 	}
 	for name, doc := range bad {
 		if _, err := Parse([]byte(doc)); err == nil {
@@ -56,9 +61,10 @@ targets:
 func TestParseNormalization(t *testing.T) {
 	doc := `
 version: 1
-default: {repository: "/srv/repos/x", reference: " dev ", cap_add_allowlist: [" cap_net_admin "]}
+default: {cap_add_allowlist: [" cap_net_admin "]}
 targets:
   "noi/a": {repository: " https://github.com/o/r ", config_target: t}
+  "noi/b": {repository: "/srv/repos/x", reference: " dev "}
 `
 
 	f, err := Parse([]byte(doc))
@@ -67,8 +73,6 @@ targets:
 	}
 
 	want := TargetPolicy{
-		Repository:      "file:///srv/repos/x",
-		Reference:       "dev",
 		CapAddAllowlist: []string{"NET_ADMIN"},
 	}
 	if !reflect.DeepEqual(f.Default, want) {
@@ -76,6 +80,10 @@ targets:
 	}
 
 	if got := f.Targets["noi/a"]; got.Repository != "https://github.com/o/r" || got.ConfigTarget != "t" {
+		t.Errorf("target = %+v", got)
+	}
+
+	if got := f.Targets["noi/b"]; got.Repository != "file:///srv/repos/x" || got.Reference != "dev" {
 		t.Errorf("target = %+v", got)
 	}
 }

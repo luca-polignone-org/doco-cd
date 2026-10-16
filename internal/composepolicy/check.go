@@ -18,7 +18,7 @@ var defaultCaps = []string{
 }
 
 // forbiddenSecurityOpt vieta ogni sostituzione del profilo seccomp o AppArmor (anche un
-// file committato può essere permissivo), label=disable e systempaths=unconfined.
+// file committato può essere permissivo), label=disable, label=type:spc_t e systempaths=unconfined.
 func forbiddenSecurityOpt(opt string) bool {
 	o := strings.ToLower(strings.TrimSpace(opt))
 	for _, prefix := range []string{"seccomp=", "seccomp:", "apparmor=", "apparmor:"} {
@@ -27,7 +27,12 @@ func forbiddenSecurityOpt(opt string) bool {
 		}
 	}
 
-	return o == "label=disable" || o == "label:disable" || o == "systempaths=unconfined"
+	switch o {
+	case "label=disable", "label:disable", "label=type:spc_t", "label:type:spc_t", "systempaths=unconfined":
+		return true
+	}
+
+	return false
 }
 
 // targetFor restituisce la policy effettiva del target: default per le liste che la
@@ -105,17 +110,11 @@ func identityMatches(tp TargetPolicy, id Identity) bool {
 	}
 
 	// Con reference dichiarata, una sorgente OCI (Reference vuota) non corrisponde.
-	if tp.Reference != "" && (id.Reference == "" || !referenceMatches(id.Reference, tp.Reference)) {
+	if tp.Reference != "" && (id.Reference == "" || !git.ReferenceMatches(id.Reference, tp.Reference)) {
 		return false
 	}
 
 	return tp.ConfigTarget == "" || tp.ConfigTarget == id.ConfigTarget
-}
-
-// referenceMatches estende git.ReferenceMatches ai tag: upstream fa corrispondere solo
-// la forma breve di un branch, mentre la policy dichiara un tag con il suo nome corto.
-func referenceMatches(resolved, configured string) bool {
-	return git.ReferenceMatches(resolved, configured) || resolved == git.TagPrefix+configured
 }
 
 func checkService(p *types.Project, svc types.ServiceConfig, pc pathChecker, tp TargetPolicy) []Violation {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strings"
 
@@ -66,8 +67,20 @@ func Parse(data []byte) (*File, error) {
 		return nil, fmt.Errorf("decode compose policy: %w", err)
 	}
 
+	// Un secondo documento sarebbe ignorato in silenzio: meglio rifiutare il file.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New("compose policy: multiple YAML documents or trailing data")
+	}
+
 	if f.Version != fileVersion {
 		return nil, fmt.Errorf("compose policy: unsupported version %d", f.Version)
+	}
+
+	// default porta solo le liste: un repository o una reference di default
+	// legherebbero ogni voce che non li dichiara.
+	if strings.TrimSpace(f.Default.Repository+f.Default.Reference+f.Default.ConfigTarget) != "" {
+		return nil, errors.New("compose policy default: repository, reference and config_target are not allowed")
 	}
 
 	if err := normalizeTarget(&f.Default, false); err != nil {

@@ -66,7 +66,16 @@ func TestCheck(t *testing.T) {
 	cfgInt := t.TempDir()
 
 	mustSymlink(t, "/etc", filepath.Join(intl, "etc"))
-	mustSymlink(t, "/srv/secret", filepath.Join(intl, "x"))
+	gone := t.TempDir()
+	if err := os.RemoveAll(gone); err != nil {
+		t.Fatal(err)
+	}
+
+	mustSymlink(t, filepath.Join(gone, "secret"), filepath.Join(intl, "x"))
+	mustMkdir(t, filepath.Join(intl, "foo"))
+	mustSymlink(t, filepath.Join(intl, "foo"), filepath.Join(intl, "s"))
+	mustSymlink(t, "loop", filepath.Join(intl, "loop"))
+	mustSymlink(t, "./sub/", filepath.Join(intl, "dot"))
 	mustSymlink(t, "../../../nope", filepath.Join(intl, "y"))
 	mustMkdir(t, filepath.Join(intl, "sub"))
 	mustSymlink(t, "sub", filepath.Join(intl, "inner"))
@@ -139,13 +148,19 @@ func TestCheck(t *testing.T) {
 		},
 		{
 			name: "tag as reference",
-			tp:   &TargetPolicy{Repository: "https://github.com/o/r", Reference: "v1.0.0"},
+			tp:   &TargetPolicy{Repository: "https://github.com/o/r", Reference: "refs/tags/v1.0.0"},
 			mod:  ident(func(i *Identity) { i.Reference = "refs/tags/v1.0.0" }),
 			want: nil,
 		},
 		{
+			name: "short name does not match a tag",
+			tp:   &TargetPolicy{Repository: "https://github.com/o/r", Reference: "main"},
+			mod:  ident(func(i *Identity) { i.Reference = "refs/tags/main" }),
+			want: []Violation{pv("target", "noi/web")},
+		},
+		{
 			name: "other tag",
-			tp:   &TargetPolicy{Repository: "https://github.com/o/r", Reference: "v1.0.0"},
+			tp:   &TargetPolicy{Repository: "https://github.com/o/r", Reference: "refs/tags/v1.0.0"},
 			mod:  ident(func(i *Identity) { i.Reference = "refs/tags/v2.0.0" }),
 			want: []Violation{pv("target", "noi/web")},
 		},
@@ -233,6 +248,18 @@ func TestCheck(t *testing.T) {
 			name: "dangling symlink",
 			mod:  volOnly(bind(ext+"/x"), bind(ext+"/x/sub")),
 			want: []Violation{vi("volumes", ext+"/x"), vi("volumes", ext+"/x/sub")},
+		},
+		{name: "absolute symlink inside checkout", mod: volOnly(bind(ext + "/s")), want: []Violation{vi("volumes", ext+"/s")}},
+		{name: "absolute symlink in the middle", mod: volOnly(bind(ext + "/s/f")), want: []Violation{vi("volumes", ext+"/s/f")}},
+		{name: "symlink loop", mod: volOnly(bind(ext + "/loop")), want: []Violation{vi("volumes", ext+"/loop")}},
+		{name: "relative symlink with dot components", mod: volOnly(bind(ext + "/dot/f")), want: nil},
+		{
+			name: "absolute symlink with same external and internal path",
+			mod: func(in *Input) {
+				in.Paths = Paths{CheckoutExternal: intl, CheckoutInternal: intl}
+				volOnly(bind(intl + "/s"))(in)
+			},
+			want: nil,
 		},
 		{name: "relative symlink escaping", mod: volOnly(bind(ext + "/y/z")), want: []Violation{vi("volumes", ext+"/y/z")}},
 		{name: "path through a file", mod: volOnly(bind(ext + "/plain/sub")), want: []Violation{vi("volumes", ext+"/plain/sub")}},
@@ -324,6 +351,9 @@ func TestCheck(t *testing.T) {
 		secOpt("label=disable"),
 		secOpt("label:disable"),
 		secOpt("systempaths=unconfined"),
+		secOpt("label=type:spc_t"),
+		secOpt("label:type:spc_t"),
+		secOpt("LABEL=TYPE:SPC_T"),
 		{name: "security_opt allowed", mod: app(func(s *types.ServiceConfig) { s.SecurityOpt = []string{"no-new-privileges:true"} }), want: nil},
 		{
 			name: "external host network",
@@ -396,7 +426,27 @@ func TestCheck(t *testing.T) {
 			mod:  volOnly(bind("/run/foo.sock")),
 			want: []Violation{vi("volumes", "/run/foo.sock")},
 		},
-		{name: "other file in /run", tp: allow("/run"), mod: volOnly(bind("/run/app/data")), want: nil},
+		{
+			name: "any path in /run",
+			tp:   allow("/run"),
+			mod:  volOnly(bind("/run/app/data")),
+			want: []Violation{vi("volumes", "/run/app/data")},
+		},
+		{
+			name: "rootless docker directory",
+			tp:   allow("/run/user"),
+			mod:  volOnly(bind("/run/user/1000")),
+			want: []Violation{vi("volumes", "/run/user/1000")},
+		},
+		{
+			name: "any path in /var/run",
+			tp:   allow("/var"),
+			mod:  volOnly(bind("/var/run/x")),
+			want: []Violation{vi("volumes", "/var/run/x")},
+		},
+		{name: "var ancestor", tp: allow("/"), mod: volOnly(bind("/var")), want: []Violation{vi("volumes", "/var")}},
+		{name: "root ancestor", tp: allow("/"), mod: volOnly(bind("/")), want: []Violation{vi("volumes", "/")}},
+		{name: "similar prefix is not run", tp: allow("/"), mod: volOnly(bind("/runner")), want: nil},
 		{name: "sock elsewhere", tp: allow("/srv"), mod: volOnly(bind("/srv/app.sock")), want: nil},
 
 		{
@@ -577,7 +627,7 @@ func TestCheck(t *testing.T) {
 					types.ServiceConfig{Name: "a", Privileged: true, NetworkMode: "host", CgroupParent: "x"},
 				)
 				in.Project.Secrets = types.Secrets{"z": {File: "/s2"}, "y": {File: "/s1"}}
-				in.Project.Configs = types.Configs{"c": {File: "/c1"}}
+				in.Project.Configs = types.Configs{"c": {File: "/c1"}, "a": {File: "/c0"}}
 			},
 			want: []Violation{
 				pv("swarm", "true"),
@@ -585,6 +635,7 @@ func TestCheck(t *testing.T) {
 				pv("deploy.external_secrets_files", "/e2"),
 				pv("secrets.y.file", "/s1"),
 				pv("secrets.z.file", "/s2"),
+				pv("configs.a.file", "/c0"),
 				pv("configs.c.file", "/c1"),
 				{Service: "a", Field: "privileged", Value: "true"},
 				{Service: "a", Field: "network_mode", Value: "host"},

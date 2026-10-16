@@ -14,8 +14,9 @@ import (
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
-var socketPaths = []string{"/var/run/docker.sock", "/run/docker.sock"}
-var socketDirs = []string{"/run/containerd", "/var/run/containerd"}
+// runtimeDirs contengono i socket dei runtime (docker.sock, containerd, rootless in
+// /run/user/<uid>): niente che li tocchi può essere montato.
+var runtimeDirs = []string{"/run", "/var/run"}
 
 type pathChecker struct {
 	paths Paths
@@ -49,6 +50,14 @@ func within(external, internal, hostPath string) bool {
 		return false
 	}
 
+	// Se il daemon vede la checkout a un path diverso da quello interno, un symlink
+	// assoluto verrebbe risolto nel namespace dell'host e non in quello del container.
+	if filepath.Clean(external) != filepath.Clean(internal) {
+		if err = rejectAbsoluteSymlinks(internal, rel); err != nil {
+			return false
+		}
+	}
+
 	resolved, err := evalExistingPrefix(filepath.Join(internal, rel))
 	if err != nil {
 		return false
@@ -62,7 +71,64 @@ func within(external, internal, hostPath string) bool {
 	return filesystem.InBasePath(root, resolved)
 }
 
-var errDanglingSymlink = errors.New("dangling symlink")
+var (
+	errDanglingSymlink = errors.New("dangling symlink")
+	errUnsafeSymlink   = errors.New("unsafe symlink")
+	errSymlinkLoop     = errors.New("too many symlinks")
+)
+
+const maxSymlinkHops = 40
+
+// rejectAbsoluteSymlinks percorre i componenti di rel sotto root e fallisce al primo
+// symlink con destinazione assoluta (anche raggiunto attraverso un symlink relativo).
+// Si ferma, senza errore, al primo componente inesistente: il resto lo giudica
+// evalExistingPrefix.
+func rejectAbsoluteSymlinks(root, rel string) error {
+	pending := strings.Split(filepath.ToSlash(rel), "/")
+	cur := root
+
+	for hops := 0; len(pending) > 0; {
+		comp := pending[0]
+		pending = pending[1:]
+
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+
+		next := filepath.Join(cur, comp)
+
+		fi, err := os.Lstat(next)
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+
+		if err != nil {
+			return err
+		}
+
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+
+		if hops++; hops > maxSymlinkHops {
+			return fmt.Errorf("%w: %s", errSymlinkLoop, next)
+		}
+
+		target, err := os.Readlink(next)
+		if err != nil || filepath.IsAbs(target) {
+			return errors.Join(fmt.Errorf("%w: %s", errUnsafeSymlink, next), err)
+		}
+
+		pending = append(strings.Split(filepath.ToSlash(target), "/"), pending...)
+	}
+
+	return nil
+}
 
 // evalExistingPrefix risolve i symlink del più lungo prefisso esistente e vi riattacca
 // il resto, così un path non ancora creato sotto un symlink resta comunque risolto. Un
@@ -117,22 +183,16 @@ func (pc pathChecker) bindAllowed(hostPath string) bool {
 	return false
 }
 
-// touchesSocket è vero per il socket, per un file *.sock nelle directory dei runtime e
-// per ogni antenato di questi path: montare /run espone /run/docker.sock.
+// touchesSocket è vero per /run, /var/run, ogni path sotto di essi e ogni loro antenato
+// (/, /var): montare un antenato espone i socket dei runtime, qualunque allowlist ci sia.
 func touchesSocket(p string) bool {
-	for _, s := range socketPaths {
-		if p == s || filesystem.InBasePath(p, s) {
+	for _, d := range runtimeDirs {
+		if filesystem.InBasePath(d, p) || filesystem.InBasePath(p, d) {
 			return true
 		}
 	}
 
-	for _, d := range socketDirs {
-		if filesystem.InBasePath(p, d) || (filesystem.InBasePath(d, p) && strings.HasSuffix(p, ".sock")) {
-			return true
-		}
-	}
-
-	return (strings.HasPrefix(p, "/var/run/") || strings.HasPrefix(p, "/run/")) && strings.HasSuffix(p, ".sock")
+	return false
 }
 
 func bindSource(p *types.Project, vol types.ServiceVolumeConfig) (string, bool) {

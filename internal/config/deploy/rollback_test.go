@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"go.yaml.in/yaml/v4"
+
+	"github.com/kimdre/doco-cd/internal/common/types/duration"
 )
 
 func TestRollbackConfigYAML(t *testing.T) {
@@ -59,8 +61,30 @@ func TestRollbackConfigJSON(t *testing.T) {
 		t.Fatalf("%v %+v", err, c)
 	}
 
+	c = RollbackConfig{Timeout: 1}
+	if err := json.Unmarshal([]byte("null"), &c); err != nil {
+		t.Fatal(err)
+	}
+
 	if err := json.Unmarshal([]byte(`"x"`), &c); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+func TestRollbackEffectiveTimeouts(t *testing.T) {
+	var nilCfg *RollbackConfig
+	if nilCfg.EffectiveTimeout() != DefaultRollbackTimeout || nilCfg.EffectivePreRollbackTimeout() != DefaultPreRollbackTimeout {
+		t.Fatal("nil config must yield defaults")
+	}
+
+	zero := &RollbackConfig{}
+	if zero.EffectiveTimeout() != 5*time.Minute || zero.EffectivePreRollbackTimeout() != 30*time.Second {
+		t.Fatal("zero fields must yield defaults")
+	}
+
+	set := &RollbackConfig{Timeout: duration.Duration(time.Minute), PreRollbackTimeout: duration.Duration(time.Second)}
+	if set.EffectiveTimeout() != time.Minute || set.EffectivePreRollbackTimeout() != time.Second {
+		t.Fatal("set fields must be returned as is")
 	}
 }
 

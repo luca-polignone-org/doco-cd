@@ -11,6 +11,44 @@ const (
 	PermPrivateFile = 0o600 // file leggibile solo dal processo
 )
 
+// tempFile è il sottoinsieme di *os.File usato da AtomicWriteFile; un'interfaccia
+// permette ai test di iniettare errori nelle singole operazioni.
+type tempFile interface {
+	Name() string
+	Write(p []byte) (int, error)
+	Chmod(mode os.FileMode) error
+	Sync() error
+	Close() error
+}
+
+// dirFile è il sottoinsieme di *os.File usato per il fsync della directory.
+type dirFile interface {
+	Sync() error
+	Close() error
+}
+
+// Seam di test: in produzione puntano alle funzioni di os, i test li sostituiscono
+// per iniettare errori che il filesystem reale non produce in modo deterministico.
+var (
+	createTempFile = func(dir, pattern string) (tempFile, error) {
+		f, err := os.CreateTemp(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+
+		return f, nil
+	}
+	renameFile    = os.Rename
+	openDirectory = func(name string) (dirFile, error) {
+		d, err := os.Open(name)
+		if err != nil {
+			return nil, err
+		}
+
+		return d, nil
+	}
+)
+
 // AtomicWriteFile scrive data in path passando da un file temporaneo nella stessa
 // directory: write, fsync, rename, fsync della directory. Un crash a metà lascia il
 // file precedente intatto, mai uno scritto a metà. È lo schema di selfupdate.Store.
@@ -20,7 +58,7 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
 
-	file, err := os.CreateTemp(dir, ".tmp-*")
+	file, err := createTempFile(dir, ".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temporary file in %s: %w", dir, err)
 	}
@@ -47,11 +85,11 @@ func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("close %s: %w", path, err)
 	}
 
-	if err = os.Rename(tempPath, path); err != nil {
+	if err = renameFile(tempPath, path); err != nil {
 		return fmt.Errorf("publish %s: %w", path, err)
 	}
 
-	d, err := os.Open(dir)
+	d, err := openDirectory(dir)
 	if err != nil {
 		return fmt.Errorf("open directory %s: %w", dir, err)
 	}

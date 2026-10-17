@@ -211,6 +211,9 @@ func (s *StageManager) RunStages(ctx context.Context, admitMutation MutationAdmi
 		})
 	}
 
+	// Fork: a successful deploy becomes the target's last good (never a destroy).
+	s.recordLastGood(ctx)
+
 	// Success (deploy or destroy) closes any recorded failure, retries stop.
 	s.clearDeploymentFailure()
 

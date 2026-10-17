@@ -646,9 +646,11 @@ func createRouteCatalog(h *Handler, mounts Mounts, builder *schemaBuilder) ([]Ro
 			WithJSONSchemaRef(openapi3.NewSchemaRef("#/components/schemas/WebhookPayload", webhookPayload.Value)),
 	}
 
-	restEnabled := func(config *app.Config) bool { return config.ApiSecret != "" }
+	restEnabled := func(config *app.Config) bool { return config.ApiSecret != "" || config.JWTJWKSURL != "" }
 	webhookEnabled := func(config *app.Config) bool { return config.WebhookSecret != "" }
-	mcpEnabled := func(config *app.Config) bool { return config.McpEnabled && config.ApiSecret != "" }
+	mcpEnabled := func(config *app.Config) bool {
+		return config.McpEnabled && (config.ApiSecret != "" || config.JWTJWKSURL != "")
+	}
 	alwaysEnabled := func(*app.Config) bool { return true }
 
 	healthResponses, err := standardResponses(builder, map[int]*openapi3.ResponseRef{http.StatusOK: stringResponse}, http.StatusServiceUnavailable)

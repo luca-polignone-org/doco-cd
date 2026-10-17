@@ -28,10 +28,14 @@ func (h *Handler) addSyncWindowTool(server *sdkmcp.Server) {
 
 // listSyncWindows reports the sync-window policy and an optional decision.
 func (h *Handler) listSyncWindows(
-	_ context.Context,
+	ctx context.Context,
 	_ *sdkmcp.CallToolRequest,
 	input listSyncWindowsInput,
 ) (*sdkmcp.CallToolResult, syncwindow.Report, error) {
+	if err := h.authorizeTool(ctx, "syncwindows", "get", "*"); err != nil {
+		return nil, syncwindow.Report{}, err
+	}
+
 	target := syncwindow.Target{
 		Repository: strings.TrimSpace(input.Repository),
 		Deployment: strings.TrimSpace(input.Deployment),

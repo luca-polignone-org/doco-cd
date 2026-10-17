@@ -4,10 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strconv"
 
+	dockerswarm "github.com/moby/moby/api/types/swarm"
+
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -27,10 +31,8 @@ func (h *Handler) StackActionApiHandler(w http.ResponseWriter, r *http.Request) 
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -49,6 +51,11 @@ func (h *Handler) StackActionApiHandler(w http.ResponseWriter, r *http.Request) 
 	}
 
 	jobLog = jobLog.With(slog.String("context", contextName))
+
+	// Fork: authorized before the stack lookup, so a denied caller cannot probe which stacks exist.
+	if !h.authorize(w, jobID, principal, "stacks", "action/"+r.PathValue("action"), deploy.ObjectName(contextName, stackName)) {
+		return
+	}
 
 	services, err := controlplane.GetStackServices(ctx, dockerCli, stackName)
 	if err != nil {
@@ -179,10 +186,8 @@ func (h *Handler) StackApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -202,8 +207,14 @@ func (h *Handler) StackApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog = jobLog.With(slog.String("context", contextName))
 
+	object := deploy.ObjectName(contextName, stackName)
+
 	switch r.Method {
 	case http.MethodGet:
+		if !h.authorize(w, jobID, principal, "stacks", "get", object) {
+			return
+		}
+
 		services, err := swarm.GetStackServices(ctx, dockerCli.Client(), stackName)
 		if err != nil {
 			errMsg := "failed to get stack: " + stackName
@@ -220,6 +231,10 @@ func (h *Handler) StackApiHandler(w http.ResponseWriter, r *http.Request) {
 
 		restapi.JSONResponse(w, services, jobID, http.StatusOK)
 	case http.MethodDelete:
+		if !h.authorize(w, jobID, principal, "stacks", "delete", object) {
+			return
+		}
+
 		err := controlplane.RemoveStack(ctx, dockerCli, stackName, jobLog)
 		if err != nil {
 			errMsg := "failed to remove stack: " + stackName
@@ -259,10 +274,8 @@ func (h *Handler) GetStacksApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -280,6 +293,12 @@ func (h *Handler) GetStacksApiHandler(w http.ResponseWriter, r *http.Request) {
 		restapi.JSONError(w, err, errMsg, jobID, http.StatusInternalServerError)
 
 		return
+	}
+
+	if h.rbac.Enabled() {
+		maps.DeleteFunc(stacks, func(name string, _ []dockerswarm.Service) bool {
+			return !h.rbac.Enforce(principal, "stacks", "get", deploy.ObjectName(contextName, name))
+		})
 	}
 
 	if len(stacks) == 0 {

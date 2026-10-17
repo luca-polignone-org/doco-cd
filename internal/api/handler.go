@@ -15,6 +15,8 @@ import (
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/rbac"
+	"github.com/kimdre/doco-cd/internal/restapi"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 )
 
@@ -47,6 +49,9 @@ type Dependencies struct {
 	Runs                  RunOperations           `validate:"required,nostructlevel"`
 	SecretProvider        secretprovider.SecretProvider
 	HealthFailureReporter HealthFailureReporter `validate:"required"`
+	// Fork: Auth nil keeps the upstream x-api-key check; RBAC nil allows everything.
+	Auth *restapi.Authenticator
+	RBAC *rbac.Enforcer
 }
 
 // Handler adapts REST requests to Docker and control-plane operations.
@@ -58,6 +63,8 @@ type Handler struct {
 	controlPlaneRuns      RunOperations
 	secretProvider        secretprovider.SecretProvider
 	healthFailureReporter HealthFailureReporter
+	auth                  *restapi.Authenticator
+	rbac                  *rbac.Enforcer
 }
 
 // NewHandler validates dependencies and constructs the REST API adapter.
@@ -78,5 +85,7 @@ func NewHandler(dependencies Dependencies) (*Handler, error) {
 		controlPlaneRuns:      dependencies.Runs,
 		secretProvider:        dependencies.SecretProvider,
 		healthFailureReporter: dependencies.HealthFailureReporter,
+		auth:                  dependencies.Auth,
+		rbac:                  dependencies.RBAC,
 	}, nil
 }

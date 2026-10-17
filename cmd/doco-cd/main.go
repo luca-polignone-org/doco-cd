@@ -234,6 +234,16 @@ func run() error {
 		stages.SetComposePolicy(holder)
 	}
 
+	// Fork: JWT verifier and RBAC enforcer; targets/sync is checked in pre-deploy.
+	authenticator, enforcer, err := newForkAuth(c, log)
+	if err != nil {
+		log.Critical("failed to set up API authorization", logger.ErrAttr(err))
+
+		return err
+	}
+
+	stages.SetRBAC(enforcer)
+
 	// Log if proxy is used
 	if c.HttpProxy != (transport.ProxyOptions{}) {
 		log.Info("using HTTP proxy", slog.String("url", GetProxyUrlRedacted(c.HttpProxy.URL)))
@@ -509,6 +519,8 @@ func run() error {
 		HealthFailureReporter: func(w http.ResponseWriter, log *slog.Logger, jobID string, failureType, cause error) {
 			reportHealthFailure(w, log, jobID, failureType, cause, notifier)
 		},
+		Auth: authenticator,
+		RBAC: enforcer,
 	})
 	if err != nil {
 		log.Critical("failed to create API handler", logger.ErrAttr(err))
@@ -632,7 +644,7 @@ func run() error {
 		Webhook: http.HandlerFunc(h.WebhookHandler),
 	}
 
-	if c.McpEnabled && c.ApiSecret != "" {
+	if c.McpEnabled && (c.ApiSecret != "" || c.JWTJWKSURL != "") {
 		mcpHandler, err := mcp.NewHandler(mcp.Dependencies{
 			Version:              app.Version,
 			APISecret:            c.ApiSecret,
@@ -644,6 +656,9 @@ func run() error {
 			Contexts:             contexts,
 			Runs:                 controlPlaneRuns,
 			SyncWindows:          c.SyncWindows,
+			Auth:                 authenticator,
+			RBAC:                 enforcer,
+			PollConfig:           c.PollConfig,
 		})
 		if err != nil {
 			log.Critical("failed to create MCP handler", logger.ErrAttr(err))

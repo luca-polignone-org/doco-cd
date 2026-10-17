@@ -25,10 +25,12 @@ func (h *Handler) CompactMirrorsHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
+		return
+	}
 
+	if !h.authorize(w, jobID, principal, "storage", "update", "*") {
 		return
 	}
 

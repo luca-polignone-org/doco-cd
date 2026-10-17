@@ -52,10 +52,14 @@ func (h *Handler) addRunTools(server *sdkmcp.Server) {
 
 // listDeploymentRuns returns filtered control-plane run records.
 func (h *Handler) listDeploymentRuns(
-	_ context.Context,
+	ctx context.Context,
 	_ *sdkmcp.CallToolRequest,
 	input listDeploymentRunsInput,
 ) (*sdkmcp.CallToolResult, listDeploymentRunsOutput, error) {
+	if err := h.authorizeTool(ctx, "runs", "get", "*"); err != nil {
+		return nil, listDeploymentRunsOutput{}, err
+	}
+
 	limit := 50
 
 	if input.Limit != nil {
@@ -81,10 +85,14 @@ func (h *Handler) listDeploymentRuns(
 
 // getDeploymentRun returns one control-plane run by job ID.
 func (h *Handler) getDeploymentRun(
-	_ context.Context,
+	ctx context.Context,
 	_ *sdkmcp.CallToolRequest,
 	input getDeploymentRunInput,
 ) (*sdkmcp.CallToolResult, getDeploymentRunOutput, error) {
+	if err := h.authorizeTool(ctx, "runs", "get", "*"); err != nil {
+		return nil, getDeploymentRunOutput{}, err
+	}
+
 	jobID := strings.TrimSpace(input.JobID)
 	if jobID == "" {
 		return nil, getDeploymentRunOutput{}, errors.New("missing job id")

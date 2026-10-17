@@ -49,6 +49,10 @@ func (h *Handler) compactMirrors(
 	_ *sdkmcp.CallToolRequest,
 	input compactMirrorsInput,
 ) (*sdkmcp.CallToolResult, compactMirrorsOutput, error) {
+	if err := h.authorizeTool(ctx, "storage", "update", "*"); err != nil {
+		return nil, compactMirrorsOutput{}, err
+	}
+
 	wait := valueOr(input.Wait, false)
 
 	jobID, err := h.controlPlaneRuns.TriggerMirrorCompaction(ctx, "", controlplane.MirrorCompactionRequest{

@@ -15,6 +15,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/rbac"
 )
 
 // Jobs that rebuild containers from a deployed revision (scheduled and one-off jobs, cert
@@ -29,6 +30,7 @@ var (
 	composePolicy atomic.Pointer[composepolicy.Holder]
 	// verifiedObjects maps an object to the outcome of its last checkForkPolicies (true = passed).
 	verifiedObjects sync.Map
+	rbacEnforcer    atomic.Pointer[rbac.Enforcer]
 )
 
 // SetComposePolicy registers the compose policy of the process and the job gate; nil disables
@@ -101,22 +103,22 @@ func declaredFilesOf(c *deploy.Config) declaredFiles {
 // checkForkPolicies applies the fork policies to the project just loaded, before pre-deploy
 // touches anything: a violation is a terminal error of the stage. The outcome is recorded for
 // forkJobGate.
-func (s *StageManager) checkForkPolicies(ctx context.Context) error {
+//
+// targets/sync is not checked here: runForkPreDeployStage checks it before pre-deploy starts,
+// and pre-deploy is the only caller of loadComposeProjectHash, so a second check would only
+// write a second audit line for every allowed run.
+func (s *StageManager) checkForkPolicies(_ context.Context) error {
 	object := s.DeployConfig.Object()
 
-	err := s.evaluateForkPolicies(ctx, object)
+	err := s.evaluateForkPolicies(object)
 	verifiedObjects.Store(object, err == nil)
 
 	return err
 }
 
-func (s *StageManager) evaluateForkPolicies(ctx context.Context, object string) error {
+func (s *StageManager) evaluateForkPolicies(object string) error {
 	if s.Docker.SwarmMode && s.DeployConfig.Rollback != nil {
 		return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{{Field: "swarm", Value: "true"}}}
-	}
-
-	if err := s.checkTargetSync(ctx, object); err != nil {
-		return err
 	}
 
 	f := composePolicy.Load().Current()
@@ -201,17 +203,54 @@ func (s *StageManager) policyPaths() composepolicy.Paths {
 	return p
 }
 
-// checkTargetSync is where the RBAC check of targets/sync will go; for now it allows everything.
-func (s *StageManager) checkTargetSync(context.Context, string) error { return nil }
+// SetRBAC registers the enforcer of the process for the targets/sync check; nil disables it.
+func SetRBAC(e *rbac.Enforcer) { rbacEnforcer.Store(e) }
 
-// runForkPreDeployStage is the pre-deploy stage of the deploy stage order: upstream
-// RunPreDeployStage, then forkPolicyGate.
+// checkTargetSync checks targets/sync on the project when the run carries a principal
+// (poll/run and trigger_poll). Webhooks and scheduled polls carry none: their secret or the
+// operator's configuration authorizes them.
+func (s *StageManager) checkTargetSync(ctx context.Context, object string) error {
+	p, ok := rbac.PrincipalFrom(ctx)
+	if !ok {
+		return nil
+	}
+
+	if rbacEnforcer.Load().Enforce(p, "targets", "sync", object) {
+		return nil
+	}
+
+	return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{{Field: "rbac", Value: "targets/sync"}}}
+}
+
+// runForkPreDeployStage is the pre-deploy stage of the deploy stage order: targets/sync, then
+// upstream RunPreDeployStage, then forkPolicyGate.
+//
+// targets/sync comes first, before external secrets are resolved (pki-role issues real
+// certificates) and before the cached-preflight "no changes" skip, so a denied caller gets a
+// terminal PolicyDeniedError on every target. The denial is about the caller, not the project:
+// it does not touch the forkJobGate record, so it neither marks the object as verified nor
+// lets a caller without permission disable the jobs of a target that passed.
 func (s *StageManager) runForkPreDeployStage(ctx context.Context, stageLog *slog.Logger) error {
+	if err := s.checkTargetSync(ctx, s.DeployConfig.Object()); err != nil {
+		return err
+	}
+
 	if err := s.RunPreDeployStage(ctx, stageLog); err != nil {
 		return err
 	}
 
 	return s.forkPolicyGate(ctx)
+}
+
+// runForkDestroyStage is the destroy stage of the destroy stage order: targets/sync, then
+// upstream RunDestroyStage. Destroy has no pre-deploy, so a run carrying a principal is checked
+// here, before anything is removed.
+func (s *StageManager) runForkDestroyStage(ctx context.Context, stageLog *slog.Logger) error {
+	if err := s.checkTargetSync(ctx, s.DeployConfig.Object()); err != nil {
+		return err
+	}
+
+	return s.RunDestroyStage(ctx, stageLog)
 }
 
 // forkPolicyGate makes sure the fork policies saw the project even when pre-deploy did not
@@ -226,6 +265,11 @@ func (s *StageManager) forkPolicyGate(ctx context.Context) error {
 	return err
 }
 
-func (s *StageManager) forkPoliciesActive(_ context.Context) bool {
-	return composePolicy.Load() != nil || (s.Docker.SwarmMode && s.DeployConfig.Rollback != nil)
+// forkPoliciesActive also counts a run that carries a principal while RBAC is on, so that the
+// first deploy of such a run goes through checkTargetSync. Without an enforcer a principal
+// changes nothing, which keeps the upstream path for any caller that sets one.
+func (s *StageManager) forkPoliciesActive(ctx context.Context) bool {
+	_, hasPrincipal := rbac.PrincipalFrom(ctx)
+
+	return composePolicy.Load() != nil || (hasPrincipal && rbacEnforcer.Load() != nil) || (s.Docker.SwarmMode && s.DeployConfig.Rollback != nil)
 }

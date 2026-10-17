@@ -8,6 +8,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/controlplane"
 )
 
@@ -67,6 +68,10 @@ func (h *Handler) listScheduledJobs(
 		return nil, listScheduledJobsOutput{}, fmt.Errorf("failed to list scheduled jobs: %w", err)
 	}
 
+	jobs = filterAllowedObjects(ctx, h, "jobs", jobs, func(job controlplane.ScheduledJobInfo) string {
+		return deploy.ObjectName(job.Context, job.Stack)
+	})
+
 	return nil, listScheduledJobsOutput{Jobs: jobs}, nil
 }
 
@@ -85,6 +90,10 @@ func (h *Handler) triggerScheduledJob(
 
 	contextClient, err := h.resolveDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, triggerScheduledJobOutput{}, err
+	}
+
+	if err := h.authorizeScheduledJob(ctx, contextClient.Name, jobName, strings.TrimSpace(input.Stack)); err != nil {
 		return nil, triggerScheduledJobOutput{}, err
 	}
 

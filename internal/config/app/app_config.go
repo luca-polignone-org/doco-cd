@@ -121,6 +121,12 @@ type Config struct {
 	SelfUpdateEnabled             bool                   `env:"SELF_UPDATE_ENABLED,notEmpty" envDefault:"false"`                                                 // SelfUpdateEnabled lets doco-cd deploy the stack that contains its own container. Without it such a deployment is refused instead of killing this process mid-deploy.
 	SelfUpdateStrategy            string                 `env:"SELF_UPDATE_STRATEGY,notEmpty" envDefault:"auto" validate:"oneof=auto scale_out applier"`         // SelfUpdateStrategy is how doco-cd replaces its own container: scale_out starts a second container and hands over, applier delegates to a throwaway clone, auto picks scale_out unless the compose file rules it out
 	ComposePolicyFile             string                 `env:"COMPOSE_POLICY_FILE"`                                                                             // ComposePolicyFile is the path of the fork compose policy (reloaded when its mtime changes); empty disables the policy
+	JWTJWKSURL                    string                 `env:"JWT_JWKS_URL"`                                                                                    // JWTJWKSURL enables JWT authentication on the API (fork)
+	JWTIssuer                     string                 `env:"JWT_ISSUER"`                                                                                      // JWTIssuer is the expected iss claim
+	JWTAudience                   string                 `env:"JWT_AUDIENCE"`                                                                                    // JWTAudience is the expected aud claim
+	JWTGroupsClaim                string                 `env:"JWT_GROUPS_CLAIM,notEmpty" envDefault:"groups"`                                                   // JWTGroupsClaim is the claim that carries the groups
+	APIKeyEnabled                 bool                   `env:"API_KEY_ENABLED,notEmpty" envDefault:"true"`                                                      // APIKeyEnabled=false rejects the x-api-key header
+	RBACPolicyFile                string                 `env:"RBAC_POLICY_FILE"`                                                                                // RBACPolicyFile is the path of the RBAC policy CSV (reloaded when its mtime changes)
 }
 
 // GetConfig returns the app Config.
@@ -147,8 +153,13 @@ func GetConfig() (*Config, error) {
 		return nil, fmt.Errorf("%w: %w", config.ErrParseConfigFailed, err)
 	}
 
-	if cfg.McpEnabled && cfg.ApiSecret == "" {
+	if cfg.McpEnabled && cfg.ApiSecret == "" && cfg.JWTJWKSURL == "" {
 		return nil, errors.New("MCP_ENABLED requires API_SECRET")
+	}
+
+	err = cfg.validateForkAuth()
+	if err != nil {
+		return nil, err
 	}
 
 	err = cfg.parsePollConfig()
@@ -401,6 +412,28 @@ func (cfg *Config) parseSyncWindows() error {
 	}
 
 	cfg.SyncWindows = policy
+
+	return nil
+}
+
+// validateForkAuth rejects the combinations that would leave the API open or
+// lock it out entirely.
+func (cfg *Config) validateForkAuth() error {
+	if cfg.JWTJWKSURL != "" && (cfg.JWTIssuer == "" || cfg.JWTAudience == "") {
+		return errors.New("JWT_JWKS_URL requires JWT_ISSUER and JWT_AUDIENCE")
+	}
+
+	if cfg.JWTJWKSURL != "" && cfg.RBACPolicyFile == "" {
+		return errors.New("JWT_JWKS_URL requires RBAC_POLICY_FILE: without RBAC every valid token would be admin")
+	}
+
+	if cfg.RBACPolicyFile != "" && cfg.ComposePolicyFile == "" {
+		return errors.New("RBAC_POLICY_FILE requires COMPOSE_POLICY_FILE: it binds <context>/<project> to its repository")
+	}
+
+	if cfg.RBACPolicyFile != "" && !cfg.APIKeyEnabled && cfg.JWTJWKSURL == "" {
+		return errors.New("RBAC_POLICY_FILE with API_KEY_ENABLED=false requires JWT_JWKS_URL")
+	}
 
 	return nil
 }

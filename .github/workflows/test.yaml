@@ -98,6 +98,9 @@ jobs:
       - name: Enable Swarm mode
         if: matrix.mode == 'swarm'
         run: docker swarm init
+      # TEMPORARY (poli.2 Task 4): race check of the token reload; removed before merge.
+      - run: go test -race -count=1 -ldflags="$BW_SDK_BUILD_FLAGS" -timeout 10m ./internal/secretprovider/openbao/...
+        timeout-minutes: 10
       - run: go test -ldflags="$BW_SDK_BUILD_FLAGS" -v -coverprofile=coverage-${{ matrix.mode }}.out -covermode=atomic -timeout 20m ./...
         timeout-minutes: 20
         env:

@@ -278,6 +278,11 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			return fmt.Errorf("failed to encode external secret references: %w", err)
 		}
 
+		// Fork: the secret allowlist of the compose policy, before any secret is read.
+		if err := s.checkForkSecrets(encodedSecrets, true); err != nil {
+			return err
+		}
+
 		// Resolve external secrets
 		resolvedSecrets, err := s.SecretProvider.ResolveSecretReferences(ctx, encodedSecrets)
 		if err != nil {

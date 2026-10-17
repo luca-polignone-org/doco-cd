@@ -1,7 +1,6 @@
 package stages
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -35,15 +34,18 @@ var (
 	rbacEnforcer    atomic.Pointer[rbac.Enforcer]
 )
 
-// SetComposePolicy registers the compose policy of the process and the job gate; nil disables
-// both. It is called at startup, before any scheduler reads docker.ForkJobGate.
+// SetComposePolicy registers the compose policy of the process, the job gate and the secret gate;
+// nil disables all three. It is called at startup, before any scheduler reads docker.ForkJobGate
+// or docker.ForkSecretGate.
 func SetComposePolicy(h *composepolicy.Holder) {
 	composePolicy.Store(h)
 
 	if h != nil {
 		docker.ForkJobGate = forkJobGate
+		docker.ForkSecretGate = forkSecretGate
 	} else {
 		docker.ForkJobGate = nil
+		docker.ForkSecretGate = nil
 	}
 }
 
@@ -129,15 +131,8 @@ func (s *StageManager) evaluateForkPolicies(object string) error {
 	}
 
 	violations := f.Check(composepolicy.Input{
-		Project: s.Docker.Project,
-		Identity: composepolicy.Identity{
-			Object: object,
-			// The repository that declares name and context is the one holding the deploy config.
-			Repository:   cmp.Or(s.Repository.ConfigSourceUrl, s.Repository.SourceUrl),
-			Reference:    s.Repository.ResolvedReference,
-			ConfigTarget: s.DeployConfig.Internal.ConfigTarget,
-			Swarm:        s.Docker.SwarmMode,
-		},
+		Project:        s.Docker.Project,
+		Identity:       s.forkIdentity(object),
 		Paths:          s.policyPaths(),
 		DeployEnvFiles: s.externalPaths(s.forkDeclared.EnvFiles, true),
 		SecretsFiles:   s.externalPaths(s.forkDeclared.ExternalSecretsFiles, false),

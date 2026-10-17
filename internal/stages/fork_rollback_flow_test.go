@@ -185,6 +185,9 @@ type staticSecretProvider struct {
 	err    error
 }
 
+// Name is called by the secret allowlist check before every resolution.
+func (p *staticSecretProvider) Name() string { return "fork-test" }
+
 func (p *staticSecretProvider) ResolveSecretReferences(context.Context, map[string]string) (secrettypes.ResolvedSecrets, error) {
 	return p.values, p.err
 }

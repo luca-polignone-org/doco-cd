@@ -51,6 +51,10 @@ func (f *File) targetFor(object string) (TargetPolicy, bool) {
 		tp.CapAddAllowlist = f.Default.CapAddAllowlist
 	}
 
+	if tp.SecretAllowlist == nil {
+		tp.SecretAllowlist = f.Default.SecretAllowlist
+	}
+
 	return tp, true
 }
 

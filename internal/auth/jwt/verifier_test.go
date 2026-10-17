@@ -472,6 +472,7 @@ func TestFailedRefreshKeepsKnownKeys(t *testing.T) {
 	wantInvalid(t, v, rs256(t, "nope", exp))
 	wantPrincipal(t, v, rs256(t, "rsa", exp), rbac.Principal{Subject: "alice"})
 
+	s.setStatus(http.StatusOK) // 200 with a body that is not JSON hits the decode error branch
 	s.setBody([]byte("not json"))
 
 	clk.now = clk.now.Add(31 * time.Second)

@@ -93,7 +93,9 @@ func TestPreDeploySecretAllowlist(t *testing.T) {
 }
 
 func TestCheckForkSecretsNoPolicy(t *testing.T) {
+	prev := composePolicy.Load()
 	SetComposePolicy(nil)
+	t.Cleanup(func() { SetComposePolicy(prev) })
 
 	s, _ := newSecretStageManager(t, nil)
 	if err := s.checkForkSecrets(map[string]string{"DB": "kv:secret:x/y:z"}, true); err != nil {
@@ -124,11 +126,19 @@ func TestLastGoodSecretAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	verifiedObjects.Store("default/web", true)
+	t.Cleanup(func() { verifiedObjects.Clear() })
+
 	err = sm.loadLastGoodFiles(context.Background(), cfg, t.TempDir())
 	requirePolicyDenied(t, err, []composepolicy.Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/other/db:PASS"}})
 
 	if p.calls != 0 {
 		t.Fatalf("provider called %d times, want 0", p.calls)
+	}
+
+	// The rollback checks with record=false: a denied last good does not change the job gate verdict.
+	if v, _ := verifiedObjects.Load("default/web"); v != true {
+		t.Fatalf("job gate verdict = %v, want true: the rollback must not record a denial", v)
 	}
 }
 
@@ -156,6 +166,7 @@ func TestEveryResolveIsGated(t *testing.T) {
 	}
 
 	call := regexp.MustCompile(`ResolveSecretReferences\(|\.GetSecrets?\(`)
+	lineComment := regexp.MustCompile(`(?m)^\s*//.*$`)
 	root := filepath.Join("..", "..")
 	found := map[string]int{}
 
@@ -208,7 +219,9 @@ func TestEveryResolveIsGated(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		src := string(data)
+		// Whole-line comments are blanked out so a gate quoted in one does not count; trailing and block
+		// comments and string literals are not handled, and the gates above are not inside any.
+		src := lineComment.ReplaceAllString(string(data), "")
 		if gi, ri := strings.Index(src, gate), call.FindStringIndex(src); gi < 0 || gi > ri[0] {
 			t.Fatalf("%s: %q must come before the secret read", file, gate)
 		}

@@ -698,7 +698,7 @@ func TestRollbackPoisoned(t *testing.T) {
 
 	t.Run("without rollback", func(t *testing.T) {
 		sm, _ := newForkFailureManager(t, nil)
-		if sm.rollbackPoisoned("c1", stageLog) {
+		if sm.rollbackPoisoned(t.Context(), "c1", stageLog) {
 			t.Fatal("poisoned without rollback")
 		}
 	})
@@ -707,7 +707,7 @@ func TestRollbackPoisoned(t *testing.T) {
 		sm, _ := newForkFailureManager(t, &deploy.RollbackConfig{Enabled: true})
 		putDiskFailure(t, sm, rollback.Failure{Object: "default/web", CommitSHA: "c1", State: rollback.StateFailed})
 
-		if sm.rollbackPoisoned("c1", stageLog) {
+		if sm.rollbackPoisoned(t.Context(), "c1", stageLog) {
 			t.Fatal("a failed commit must be retried")
 		}
 	})
@@ -717,7 +717,7 @@ func TestRollbackPoisoned(t *testing.T) {
 			sm, _ := newForkFailureManager(t, &deploy.RollbackConfig{Enabled: true})
 			putDiskFailure(t, sm, rollback.Failure{Object: "default/web", CommitSHA: " c1 ", State: state, Decision: "block"})
 
-			if !sm.rollbackPoisoned("c1", stageLog) {
+			if !sm.rollbackPoisoned(t.Context(), "c1", stageLog) {
 				t.Fatal("the commit must not be redeployed")
 			}
 		})
@@ -727,7 +727,7 @@ func TestRollbackPoisoned(t *testing.T) {
 		sm, _ := newForkFailureManager(t, &deploy.RollbackConfig{Enabled: true})
 		putDiskFailure(t, sm, rollback.Failure{Object: "default/web", CommitSHA: "c1", Stage: "deploy", State: rollback.StateBlocked, Decision: "block"})
 
-		if sm.rollbackPoisoned("c2", stageLog) {
+		if sm.rollbackPoisoned(t.Context(), "c2", stageLog) {
 			t.Fatal("a new commit must deploy")
 		}
 
@@ -750,7 +750,7 @@ func TestRollbackPoisoned(t *testing.T) {
 		}
 
 		var buf bytes.Buffer
-		if sm.rollbackPoisoned("c2", slog.New(slog.NewTextHandler(&buf, nil))) || !strings.Contains(buf.String(), "failed to reset rollback state") {
+		if sm.rollbackPoisoned(t.Context(), "c2", slog.New(slog.NewTextHandler(&buf, nil))) || !strings.Contains(buf.String(), "failed to reset rollback state") {
 			t.Fatalf("log %q", buf.String())
 		}
 	})

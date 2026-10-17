@@ -10,9 +10,12 @@ import (
 	"github.com/kimdre/doco-cd/internal/commitstatus"
 	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/hooks"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/selfupdate"
+	"github.com/kimdre/doco-cd/internal/stages"
 )
 
 func selfUpdateMetadata(record selfupdate.Record) notification.Metadata {
@@ -70,6 +73,24 @@ func (r *selfUpdateReporter) reportSuccess(ctx context.Context, log *logger.Logg
 		Description: commitstatus.SuccessDescription(startedAt, time.Now()),
 		Summary:     summary,
 	})
+
+	// Fork: the predecessor stayed silent on ErrHandover; the successor announces the deploy.
+	stages.EmitOutcome(log.Logger, selfUpdateOutcome(record, hooks.OutcomeDeployed, startedAt))
+}
+
+// selfUpdateOutcome is the outcome event of a resolved handover, built from its journal record.
+func selfUpdateOutcome(record selfupdate.Record, kind hooks.Outcome, startedAt time.Time) hooks.Event {
+	ev := hooks.NewEvent(deploy.ObjectName(record.Context, record.Stack))
+	ev.Outcome = kind
+	ev.Repository = record.Source.RepoName
+	ev.Ref = record.Source.Reference
+	ev.Commit = record.Source.CommitSHA
+
+	if !startedAt.IsZero() {
+		ev.DurationMS = time.Since(startedAt).Milliseconds()
+	}
+
+	return ev
 }
 
 func (r *selfUpdateReporter) reportFailure(ctx context.Context, log *logger.Logger, record selfupdate.Record) {
@@ -103,6 +124,16 @@ func (r *selfUpdateReporter) reportFailure(ctx context.Context, log *logger.Logg
 	}
 
 	r.postCommitStatus(ctx, log, record, status)
+
+	// Fork: a self-update that did not become healthy is a terminal failure of the deploy.
+	var startedAt time.Time
+	if record.Source.CommitStatus != nil {
+		startedAt = record.Source.CommitStatus.StartedAt
+	}
+
+	ev := selfUpdateOutcome(record, hooks.OutcomeFailed, startedAt)
+	ev.Error = reason
+	stages.EmitOutcome(log.Logger, ev)
 }
 
 // postCommitStatus resolves the commit status the predecessor left pending. The

@@ -28,12 +28,15 @@ type Executor interface {
 
 // Outcome is the result of Run. Err is the reason of a blocked (unreadable last good) or
 // rollback_failed outcome, for the log; PersistErr is the error of the final store write.
+// LastGood is the last good Run read, nil when there is none or it could not be read: the
+// outcome event reports its commit, and its images once it runs again.
 type Outcome struct {
 	State      State
 	Decision   hooks.Decision
 	ToCommit   string
 	Err        error
 	PersistErr error
+	LastGood   *LastGood
 }
 
 // Run decides and runs the rollback after a failed deploy. The failure is already on disk with
@@ -54,7 +57,15 @@ func Run(ctx context.Context, store *Store, decider Decider, exec Executor, f Fa
 		return finish(store, f, StateFailed, "", "", nil)
 	}
 
-	if err = exec.Supports(lg); err != nil {
+	out := runFrom(ctx, store, decider, exec, f, lg, preTimeout, timeout)
+	out.LastGood = &lg
+
+	return out
+}
+
+// runFrom is the part of Run that has a last good to roll back to.
+func runFrom(ctx context.Context, store *Store, decider Decider, exec Executor, f Failure, lg LastGood, preTimeout, timeout time.Duration) Outcome {
+	if err := exec.Supports(lg); err != nil {
 		return finish(store, f, StateRollbackFailed, "", "", err)
 	}
 
@@ -73,7 +84,7 @@ func Run(ctx context.Context, store *Store, decider Decider, exec Executor, f Fa
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err = exec.Deploy(rctx, lg); err != nil {
+	if err := exec.Deploy(rctx, lg); err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return finish(store, f, StateFailed, "", "", ctx.Err())
 		}

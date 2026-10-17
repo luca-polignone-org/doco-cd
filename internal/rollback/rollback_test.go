@@ -84,7 +84,7 @@ func TestRunWithoutLastGood(t *testing.T) {
 	d, e := &fakeDecider{decision: hooks.DecisionProceed}, &fakeExecutor{}
 
 	out := Run(t.Context(), s, d, e, runFailure(), time.Second, time.Second)
-	if out.State != StateFailed || out.Decision != "" || out.ToCommit != "" || out.Err != nil || out.PersistErr != nil {
+	if out.State != StateFailed || out.Decision != "" || out.ToCommit != "" || out.Err != nil || out.PersistErr != nil || out.LastGood != nil {
 		t.Fatalf("outcome %+v", out)
 	}
 
@@ -102,7 +102,8 @@ func TestRunProceedRollsBack(t *testing.T) {
 	d, e := &fakeDecider{decision: hooks.DecisionProceed}, &fakeExecutor{}
 
 	out := Run(t.Context(), s, d, e, runFailure(), 3*time.Second, time.Minute)
-	if out.State != StateRolledBack || out.Decision != hooks.DecisionProceed || out.ToCommit != "c1" || out.Err != nil || out.PersistErr != nil {
+	if out.State != StateRolledBack || out.Decision != hooks.DecisionProceed || out.ToCommit != "c1" || out.Err != nil || out.PersistErr != nil ||
+		out.LastGood == nil || out.LastGood.CommitSHA != "c1" {
 		t.Fatalf("outcome %+v", out)
 	}
 
@@ -205,7 +206,7 @@ func TestRunCorruptLastGoodBlocks(t *testing.T) {
 	d, e := &fakeDecider{decision: hooks.DecisionProceed}, &fakeExecutor{}
 
 	out := Run(t.Context(), s, d, e, runFailure(), time.Second, time.Second)
-	if out.State != StateBlocked || out.Decision != hooks.DecisionInvalid || out.Err == nil || out.PersistErr != nil {
+	if out.State != StateBlocked || out.Decision != hooks.DecisionInvalid || out.Err == nil || out.PersistErr != nil || out.LastGood != nil {
 		t.Fatalf("outcome %+v", out)
 	}
 

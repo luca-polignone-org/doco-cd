@@ -251,6 +251,25 @@ func run() error {
 		stages.SetPreRollback(&hooks.PreRollbackClient{URL: c.HookPreRollbackURL, Signer: hooks.Signer{Secret: []byte(c.HookSecret)}})
 	}
 
+	// Fork: outbox of the outcome events (internal/stages/fork_outcome.go). Without
+	// HOOK_OUTCOME_URL there is none: no event, no <data>/fork/outbox, no metrics.
+	var outbox *hooks.Outbox
+	if c.HookOutcomeURL != "" {
+		outbox, err = hooks.NewOutbox(hooks.OutboxConfig{
+			Dir:    filepath.Join(c.DataMountPath, "fork", "outbox"),
+			URL:    c.HookOutcomeURL,
+			Signer: hooks.Signer{Secret: []byte(c.HookSecret)},
+			Log:    log.Logger,
+		})
+		if err != nil {
+			log.Critical("failed to create the outcome outbox", logger.ErrAttr(err))
+
+			return err
+		}
+
+		stages.SetOutbox(outbox)
+	}
+
 	// Log if proxy is used
 	if c.HttpProxy != (transport.ProxyOptions{}) {
 		log.Info("using HTTP proxy", slog.String("url", GetProxyUrlRedacted(c.HttpProxy.URL)))
@@ -407,6 +426,13 @@ func run() error {
 			notificationForNewAppVersion(log.Logger, notifier)
 		},
 	)
+
+	// Fork: the outbox delivers until shutdown cancels ctx; undelivered events stay on disk.
+	if outbox != nil {
+		graceful.SafeGo(&wg, log.Logger, func() {
+			outbox.Run(ctx)
+		})
+	}
 
 	// Initialize SSH agent with the global and domain scoped SSH keys, if any are configured
 	sshKeys := []ssh.KeyRecord{{PrivateKey: c.SSHPrivateKey, Passphrase: c.SSHPrivateKeyPassphrase}}

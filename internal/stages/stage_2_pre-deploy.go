@@ -348,7 +348,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 
 	// Fork: a commit that ended rolled_back, blocked or rollback_failed is not redeployed, not
 	// even after a restart; a new commit or the unblock action releases it.
-	if s.rollbackPoisoned(strings.TrimSpace(s.Repository.Revision), stageLog) {
+	if s.rollbackPoisoned(ctx, strings.TrimSpace(s.Repository.Revision), stageLog) {
 		return skipDeployment(SkipReasonRolledBack, "use a new commit or the unblock action")
 	}
 

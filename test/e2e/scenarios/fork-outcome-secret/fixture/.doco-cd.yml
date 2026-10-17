@@ -1,0 +1,10 @@
+name: e2e-fork-outcome-secret
+working_dir: deploy
+rollback:
+  enabled: true
+# resolved by the webhook store of the e2e hook receiver, with a value the test knows
+external_secrets:
+  E2E_TOKEN:
+    store_ref: e2e
+    remote_ref:
+      key: token

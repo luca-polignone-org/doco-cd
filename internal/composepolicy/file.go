@@ -25,6 +25,9 @@ type TargetPolicy struct {
 	ConfigTarget    string   `yaml:"config_target"`
 	BindAllowlist   []string `yaml:"bind_allowlist"`
 	CapAddAllowlist []string `yaml:"cap_add_allowlist"`
+	// SecretAllowlist restricts external_secrets references (Portico fork, spec 4). nil means the
+	// key is absent and nothing is checked; a present empty list allows no reference.
+	SecretAllowlist *[]string `yaml:"secret_allowlist"`
 }
 
 // File is the compose policy compiled by Portico (3b). The keys of targets are exact
@@ -59,6 +62,10 @@ const fileVersion = 1
 
 // Parse reads and normalizes a compose policy; any defect is an error.
 func Parse(data []byte) (*File, error) {
+	if err := rejectNullSecretAllowlist(data); err != nil {
+		return nil, err
+	}
+
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 
@@ -134,6 +141,17 @@ func normalizeTarget(tp *TargetPolicy, needRepository bool) error {
 		}
 
 		tp.CapAddAllowlist[i] = c
+	}
+
+	if tp.SecretAllowlist != nil {
+		for i, e := range *tp.SecretAllowlist {
+			e = strings.TrimSpace(e)
+			if err := validateSecretEntry(e); err != nil {
+				return fmt.Errorf("secret_allowlist entry %q: %w", e, err)
+			}
+
+			(*tp.SecretAllowlist)[i] = e
+		}
 	}
 
 	return nil

@@ -339,15 +339,34 @@ func TestRollbackExecutorRefusals(t *testing.T) {
 			lg := rollbackLastGood(r, "good", rollbackConfig)
 			tc.setup(sm, &lg)
 
-			err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), lg)
+			// As rollback.Run does: Supports, then Deploy.
+			ex := stageExecutor{s: sm, log: sm.Log}
+
+			err := ex.Supports(lg)
+			if err == nil {
+				err = ex.Deploy(t.Context(), lg)
+			}
+
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("Deploy() error = %v, want it to mention %q", err, tc.want)
+				t.Fatalf("Supports()/Deploy() error = %v, want it to mention %q", err, tc.want)
 			}
 
 			if len(*got) != 0 {
 				t.Fatal("a refused rollback reached DeployStack")
 			}
 		})
+	}
+}
+
+// Deploy decodes the saved config on its own too: a caller that skipped Supports still gets the error.
+func TestRollbackExecutorDeployBadConfig(t *testing.T) {
+	r := newRollbackRepo(t)
+	sm := newRollbackManager(t, r, &lastGoodClient{})
+	stubDeployLastGood(t, nil)
+
+	lg := rollbackLastGood(r, "good", "name: [\n")
+	if err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), lg); err == nil || !strings.Contains(err.Error(), "decode last good deploy config") {
+		t.Fatalf("Deploy() error = %v", err)
 	}
 }
 
@@ -795,7 +814,7 @@ func TestUnblockTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		changed, err := UnblockTarget(data, "default/web")
+		changed, err := UnblockTarget(t.Context(), data, "default/web")
 		if err != nil || !changed {
 			t.Fatalf("UnblockTarget() = %v, %v", changed, err)
 		}
@@ -809,7 +828,7 @@ func TestUnblockTarget(t *testing.T) {
 	t.Run("nothing to unblock", func(t *testing.T) {
 		data := t.TempDir()
 
-		if changed, err := UnblockTarget(data, "default/web"); changed || err != nil {
+		if changed, err := UnblockTarget(t.Context(), data, "default/web"); changed || err != nil {
 			t.Fatalf("missing: %v, %v", changed, err)
 		}
 
@@ -817,7 +836,7 @@ func TestUnblockTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if changed, err := UnblockTarget(data, "default/web"); changed || err != nil {
+		if changed, err := UnblockTarget(t.Context(), data, "default/web"); changed || err != nil {
 			t.Fatalf("failed: %v, %v", changed, err)
 		}
 	})
@@ -834,7 +853,7 @@ func TestUnblockTarget(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if changed, err := UnblockTarget(data, "default/web"); !changed || err != nil {
+		if changed, err := UnblockTarget(t.Context(), data, "default/web"); !changed || err != nil {
 			t.Fatalf("UnblockTarget() = %v, %v", changed, err)
 		}
 
@@ -844,9 +863,239 @@ func TestUnblockTarget(t *testing.T) {
 		}
 	})
 
+	// Only a corrupt record is replaced: an I/O error (here EISDIR) is returned, the API answers 500.
+	t.Run("read error is returned", func(t *testing.T) {
+		data := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(data, "fork", "failures", "default", "web.json"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+
+		changed, err := UnblockTarget(t.Context(), data, "default/web")
+		if changed || err == nil || errors.Is(err, rollback.ErrCorrupt) {
+			t.Fatalf("UnblockTarget() = %v, %v; want the read error", changed, err)
+		}
+	})
+
+	t.Run("waits for the target lock", func(t *testing.T) {
+		unlock, err := lockForkTarget(t.Context(), "default/unblock-locked")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if changed, err := UnblockTarget(ctx, t.TempDir(), "default/unblock-locked"); changed || !errors.Is(err, context.Canceled) {
+			t.Fatalf("UnblockTarget() = %v, %v; want context canceled while the target is locked", changed, err)
+		}
+	})
+
 	t.Run("invalid object", func(t *testing.T) {
-		if _, err := UnblockTarget(t.TempDir(), "no-slash"); err == nil {
+		if _, err := UnblockTarget(t.Context(), t.TempDir(), "no-slash"); err == nil {
 			t.Fatal("want an error")
 		}
 	})
+}
+
+// An OCI target is rollback_failed without asking pre_rollback: there is nothing to veto.
+func TestRunForkRollbackUnsupportedSkipsPreRollback(t *testing.T) {
+	r := newRollbackRepo(t)
+	sm := newRollbackManager(t, r, &lastGoodClient{})
+	sm.Repository.Source = config.SourceTypeOCI
+	calls := startPreRollback(t, "proceed")
+	got := stubDeployLastGood(t, nil)
+
+	if err := rollback.StoreFor(sm.AppConfig.DataMountPath).PutLastGood(rollbackLastGood(r, "good", rollbackConfig)); err != nil {
+		t.Fatal(err)
+	}
+
+	recordMemoryFailure(sm, StageDeploy)
+	sm.runForkRollback(t.Context(), StageDeploy)
+
+	if f := diskFailure(t, sm); f.State != rollback.StateRollbackFailed || f.Decision != "" || *calls != 0 || len(*got) != 0 {
+		t.Fatalf("failure %+v, pre_rollback calls %d, deploys %d", f, *calls, len(*got))
+	}
+}
+
+func TestLockForkTarget(t *testing.T) {
+	unlock, err := lockForkTarget(t.Context(), "default/lock-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if _, err = lockForkTarget(ctx, "default/lock-test"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("second lock = %v, want context canceled", err)
+	}
+
+	unlock()
+
+	again, err := lockForkTarget(t.Context(), "default/lock-test")
+	if err != nil {
+		t.Fatalf("lock after unlock: %v", err)
+	}
+
+	again()
+}
+
+func TestRunForkDeployStage(t *testing.T) {
+	stageLog := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	newDeploy := func(t *testing.T, rb *deploy.RollbackConfig) *StageManager {
+		t.Helper()
+
+		sm, _ := newForkFailureManager(t, rb)
+		sm.Stages = &Stages{Deploy: &DeployStageData{}}
+		sm.Repository.Source = config.SourceTypeOCI
+		sm.Docker.Cmd = destroyOwnershipTestCli{apiClient: &lastGoodClient{}}
+
+		return sm
+	}
+
+	t.Run("without rollback no lock is taken", func(t *testing.T) {
+		sm := newDeploy(t, nil)
+
+		// No artifact path: upstream DeployStack refuses the request, past the fork part.
+		if err := sm.runForkDeployStage(t.Context(), stageLog); err == nil || errors.Is(err, ErrSkipDeployment) {
+			t.Fatalf("runForkDeployStage() error = %v, want the upstream deploy error", err)
+		}
+
+		if sm.forkTargetUnlock != nil {
+			t.Fatal("a target lock was taken without rollback")
+		}
+	})
+
+	t.Run("with rollback the lock is held until released", func(t *testing.T) {
+		sm := newDeploy(t, &deploy.RollbackConfig{Enabled: true})
+
+		if err := sm.runForkDeployStage(t.Context(), stageLog); err == nil || errors.Is(err, ErrSkipDeployment) {
+			t.Fatalf("runForkDeployStage() error = %v, want the upstream deploy error", err)
+		}
+
+		if sm.forkTargetUnlock == nil {
+			t.Fatal("the target lock must be held after the stage")
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if _, err := lockForkTarget(ctx, "default/web"); err == nil {
+			t.Fatal("the target lock is free while the stage manager holds it")
+		}
+
+		sm.releaseForkTarget()
+		sm.releaseForkTarget()
+
+		unlock, err := lockForkTarget(t.Context(), "default/web")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		unlock()
+	})
+
+	t.Run("lock wait canceled", func(t *testing.T) {
+		sm := newDeploy(t, &deploy.RollbackConfig{Enabled: true})
+
+		unlock, err := lockForkTarget(t.Context(), "default/web")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unlock()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		if err := sm.runForkDeployStage(ctx, stageLog); !errors.Is(err, context.Canceled) {
+			t.Fatalf("runForkDeployStage() error = %v, want context canceled", err)
+		}
+	})
+}
+
+// Two jobs of the same object: A is inside runForkRollback (holding the target lock, as
+// runForkDeployStage leaves it), B passed pre-deploy with the same failed commit and reaches its
+// deploy stage. B waits for A, then skips the commit A rolled back instead of deploying it.
+func TestConcurrentJobWaitsForRollbackAndSkipsPoisonedCommit(t *testing.T) {
+	r := newRollbackRepo(t)
+	a := newRollbackManager(t, r, &lastGoodClient{})
+	startPreRollback(t, "proceed")
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	deploys := 0
+
+	deployLastGood = func(context.Context, docker.DeployRequest) error {
+		deploys++
+
+		close(entered)
+		<-release
+
+		return nil
+	}
+
+	t.Cleanup(func() { deployLastGood = docker.DeployStack })
+
+	if err := rollback.StoreFor(a.AppConfig.DataMountPath).PutLastGood(rollbackLastGood(r, "good", rollbackConfig)); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, err := lockForkTarget(t.Context(), "default/web")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	a.forkTargetUnlock = unlock
+
+	recordMemoryFailure(a, StageDeploy)
+
+	aDone := make(chan struct{})
+
+	go func() {
+		defer close(aDone)
+
+		a.runForkRollback(t.Context(), StageDeploy)
+		a.releaseForkTarget()
+	}()
+
+	<-entered
+
+	b := newTestStageManager(t)
+	b.Log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	b.AppConfig.DataMountPath = a.AppConfig.DataMountPath
+	b.DeployConfig = deploy.New("web", "main")
+	b.DeployConfig.Rollback = &deploy.RollbackConfig{Enabled: true}
+	b.Repository = &RepositoryData{Source: config.SourceTypeGit, Name: a.Repository.Name, Revision: "failed-commit"}
+	b.Stages = &Stages{Deploy: &DeployStageData{}}
+
+	bErr := make(chan error, 1)
+
+	go func() { bErr <- b.runForkDeployStage(t.Context(), b.Log) }()
+
+	select {
+	case err := <-bErr:
+		t.Fatalf("job B left its deploy stage while A was rolling back: %v", err)
+	default:
+	}
+
+	close(release)
+	<-aDone
+
+	err = <-bErr
+
+	b.releaseForkTarget()
+
+	var skip *SkipError
+	if !errors.As(err, &skip) || skip.Reason != SkipReasonRolledBack {
+		t.Fatalf("job B error = %v, want the rolled back skip", err)
+	}
+
+	if deploys != 1 {
+		t.Fatalf("deploys = %d, want only the rollback", deploys)
+	}
+
+	if f := diskFailure(t, a); f.State != rollback.StateRolledBack {
+		t.Fatalf("failure %+v", f)
+	}
 }

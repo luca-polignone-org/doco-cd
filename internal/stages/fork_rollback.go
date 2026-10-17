@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -325,8 +326,10 @@ var deployLastGood = docker.DeployStack
 // memory, not from disk: if the initial write failed, an empty CommitSHA read back from disk
 // would make the failed commit look new to rollbackPoisoned, and it would be deployed again.
 //
-// It runs inside RunStages, before the mutation admission is released, so it does not race
-// another deploy of the same project.
+// The mutation admission around RunStages is a global semaphore, not a per-target lock, so the
+// exclusion against another job of the same object is the fork target lock: runForkDeployStage
+// takes it for a target with rollback enabled, and RunStages releases it only after this function
+// returned (see lockForkTarget for the lock order).
 func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName) {
 	if s.DeployConfig.Destroy.Enabled || !stageRecordsDeploymentFailure(stageName) {
 		return
@@ -395,17 +398,27 @@ func (s *StageManager) rollbackPoisoned(revision string, stageLog *slog.Logger) 
 
 // UnblockTarget puts the failure of object back to failed with the same commit, without deleting
 // it: a blocked target still runs containers labeled with the failed commit, and without the
-// failure the next poll would see "no changes" and never retry (#1702). An unreadable record,
-// which blocks the target, is replaced by a failed one of the deploy stage, so the next run
-// retries with a full recreate. It reports false when nothing is blocked.
-func UnblockTarget(dataMountPath, object string) (bool, error) {
+// failure the next poll would see "no changes" and never retry (#1702). A corrupt record (it
+// does not decode, or has an unknown version), which blocks the target, is replaced by a failed
+// one of the deploy stage, so the next run retries with a full recreate; an I/O error is
+// returned. It reports false when nothing is blocked. It holds the fork target lock, so it never
+// interleaves with a deploy or a rollback of the same object in this process.
+func UnblockTarget(ctx context.Context, dataMountPath, object string) (bool, error) {
+	unlock, err := lockForkTarget(ctx, object)
+	if err != nil {
+		return false, err
+	}
+	defer unlock()
+
 	st := rollback.StoreFor(dataMountPath)
 
 	f, ok, err := st.GetFailure(object)
 
 	switch {
-	case err != nil:
+	case errors.Is(err, rollback.ErrCorrupt):
 		f = rollback.Failure{Object: object, Stage: string(StageDeploy), FailedAt: time.Now().UTC()}
+	case err != nil:
+		return false, err
 	case !ok || f.State == rollback.StateFailed:
 		return false, nil
 	}
@@ -415,12 +428,98 @@ func UnblockTarget(dataMountPath, object string) (bool, error) {
 	return true, st.PutFailure(f)
 }
 
+// forkTargetLocks holds one lock per object: a channel of capacity 1, so a waiter can give up
+// when its context ends.
+var forkTargetLocks sync.Map
+
+// lockForkTarget takes the fork's lock of object. It serializes, within this process, the deploy
+// stage, the rollback flow and the success bookkeeping (last good, failure cleared) of a target
+// with rollback enabled, and the unblock action.
+//
+// Lock order: deployment limiters (pre-deploy and mutation admission, taken by reconciliation
+// before and around RunStages) -> fork target lock -> lock.LockStack (taken inside DeployStack).
+// The holder of the target lock never waits for a limiter, and nothing takes the target lock
+// while holding LockStack, so the order cannot deadlock.
+func lockForkTarget(ctx context.Context, object string) (func(), error) {
+	v, _ := forkTargetLocks.LoadOrStore(object, make(chan struct{}, 1))
+	ch, _ := v.(chan struct{})
+
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait for target %s: %w", object, ctx.Err())
+	}
+}
+
+// runForkDeployStage is the deploy stage of the deploy stage order. For a target with rollback
+// enabled it takes the fork target lock, held until RunStages returns (releaseForkTarget), so
+// the rollback flow of handleStageFailure runs under it; then it checks the poison again. A job
+// whose pre-deploy passed while another job of the same object was rolling back waited here, and
+// now skips the commit that rollback marked. Without rollback it is RunDeployStage.
+func (s *StageManager) runForkDeployStage(ctx context.Context, stageLog *slog.Logger) error {
+	if s.forkStore() != nil {
+		unlock, err := lockForkTarget(ctx, s.DeployConfig.Object())
+		if err != nil {
+			return err
+		}
+
+		s.forkTargetUnlock = unlock
+
+		if s.rollbackPoisoned(strings.TrimSpace(s.Repository.Revision), stageLog) {
+			return skipDeployment(SkipReasonRolledBack, "use a new commit or the unblock action")
+		}
+	}
+
+	return s.RunDeployStage(ctx, stageLog)
+}
+
+// releaseForkTarget releases the fork target lock taken by runForkDeployStage, if any.
+func (s *StageManager) releaseForkTarget() {
+	if s.forkTargetUnlock != nil {
+		s.forkTargetUnlock()
+		s.forkTargetUnlock = nil
+	}
+}
+
 var errRollbackUnsupported = errors.New("rollback not supported for this deployment")
 
 // stageExecutor redeploys the last good with the same DeployStack as a regular deploy.
 type stageExecutor struct {
 	s   *StageManager
 	log *slog.Logger
+}
+
+// Supports refuses, before pre_rollback is asked, what cannot roll back: config and compose in
+// different repositories (repository_url, current or saved), OCI sources and Swarm (spec, "Last
+// good" and "Rischi"), and a last good of another repository.
+//
+// targets/sync is not checked again: the same job already passed it in pre-deploy for this
+// object, and the rollback deploys the same object from the same repository.
+func (e stageExecutor) Supports(lg rollback.LastGood) error {
+	s := e.s
+
+	switch {
+	case s.Docker.SwarmMode:
+		return fmt.Errorf("%w: swarm mode", errRollbackUnsupported)
+	case s.Repository.Source == config.SourceTypeOCI:
+		return fmt.Errorf("%w: OCI source", errRollbackUnsupported)
+	case s.DeployConfig.RepositoryUrl != "":
+		return fmt.Errorf("%w: repository_url", errRollbackUnsupported)
+	case !sameRepository(lg.SourceURL, s.Repository.SourceUrl):
+		return fmt.Errorf("%w: last good was recorded from another repository", errRollbackUnsupported)
+	}
+
+	cfg, err := decodeLastGoodConfig(lg.DeployConfig)
+	if err != nil {
+		return err
+	}
+
+	if cfg.RepositoryUrl != "" {
+		return fmt.Errorf("%w: repository_url", errRollbackUnsupported)
+	}
+
+	return nil
 }
 
 func (e stageExecutor) Deploy(ctx context.Context, lg rollback.LastGood) error {
@@ -441,26 +540,10 @@ func (e stageExecutor) Deploy(ctx context.Context, lg rollback.LastGood) error {
 func (e stageExecutor) lastGoodRequest(ctx context.Context, lg rollback.LastGood) (docker.DeployRequest, error) {
 	s := e.s
 
-	// Config and compose in different repositories (repository_url), OCI sources and Swarm do not
-	// roll back (spec, "Last good" and "Rischi"); nor does a last good of another repository.
-	switch {
-	case s.Docker.SwarmMode:
-		return docker.DeployRequest{}, fmt.Errorf("%w: swarm mode", errRollbackUnsupported)
-	case s.Repository.Source == config.SourceTypeOCI:
-		return docker.DeployRequest{}, fmt.Errorf("%w: OCI source", errRollbackUnsupported)
-	case s.DeployConfig.RepositoryUrl != "":
-		return docker.DeployRequest{}, fmt.Errorf("%w: repository_url", errRollbackUnsupported)
-	case !sameRepository(lg.SourceURL, s.Repository.SourceUrl):
-		return docker.DeployRequest{}, fmt.Errorf("%w: last good was recorded from another repository", errRollbackUnsupported)
-	}
-
+	// rollback.Run called Supports first, so the source is supported here.
 	cfg, err := decodeLastGoodConfig(lg.DeployConfig)
 	if err != nil {
 		return docker.DeployRequest{}, err
-	}
-
-	if cfg.RepositoryUrl != "" {
-		return docker.DeployRequest{}, fmt.Errorf("%w: repository_url", errRollbackUnsupported)
 	}
 
 	internalPath, externalPath, err := e.publishLastGood(ctx, lg.CommitSHA)
@@ -653,6 +736,10 @@ func (s *StageManager) renderLastGood(ctx context.Context, cfg *deploy.Config, i
 
 // checkLastGoodPolicy applies the compose policy in force to the pinned last good project, with
 // the files the saved config declares: a violation is rollback_failed.
+//
+// It does not touch verifiedObjects (the job gate): that records the outcome of the pre-deploy
+// check of the commit the target was asked to deploy. A denied rollback deploys nothing, and the
+// next pre-deploy of the target checks it again and updates the gate.
 func (s *StageManager) checkLastGoodPolicy(cfg *deploy.Config, project *types.Project, declared declaredFiles, internalPath, externalPath string) error {
 	f := composePolicy.Load().Current()
 	if f == nil {

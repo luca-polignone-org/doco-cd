@@ -65,7 +65,7 @@ func (s *StageManager) GetDeployStageOrder() StageOrder {
 		Funcs: map[StageName]StageFunc{
 			StageInit:       func(ctx context.Context, stageLog *slog.Logger) error { return s.RunInitStage(ctx, stageLog) },
 			StagePreDeploy:  s.runForkPreDeployStage, // Fork: RunPreDeployStage plus forkPolicyGate
-			StageDeploy:     func(ctx context.Context, stageLog *slog.Logger) error { return s.RunDeployStage(ctx, stageLog) },
+			StageDeploy:     s.runForkDeployStage,    // Fork: target lock and poison re-check, then RunDeployStage
 			StagePostDeploy: func(ctx context.Context, stageLog *slog.Logger) error { return s.RunPostDeployStage(ctx, stageLog) },
 			StageCleanup:    func(ctx context.Context, stageLog *slog.Logger) error { return s.RunCleanupStage(ctx, stageLog) },
 		},
@@ -106,6 +106,9 @@ func (s *StageManager) RunStages(ctx context.Context, admitMutation MutationAdmi
 			releaseMutation()
 		}
 	}()
+
+	// Fork: the target lock of runForkDeployStage covers the rollback flow and the success path.
+	defer s.releaseForkTarget()
 
 	stageOrder := s.GetDeployStageOrder()
 	if s.DeployConfig.Destroy.Enabled {

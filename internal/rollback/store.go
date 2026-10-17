@@ -76,6 +76,10 @@ func (s *Store) Root() string { return s.root }
 
 var errBadObject = errors.New("object must be <context>/<project>")
 
+// ErrCorrupt marks a record that was read but cannot be decoded or has an unknown version, as
+// opposed to an I/O error reading it.
+var ErrCorrupt = errors.New("corrupt record")
+
 func splitObject(object string) (string, string, error) {
 	ctx, project, ok := strings.Cut(object, "/")
 	if !ok || ctx == "" || project == "" || strings.Contains(project, "/") {
@@ -137,11 +141,11 @@ func (s *Store) GetFailure(object string) (Failure, bool, error) {
 
 	var f Failure
 	if err = json.Unmarshal(data, &f); err != nil {
-		return Failure{}, false, fmt.Errorf("decode failure %s: %w", object, err)
+		return Failure{}, false, fmt.Errorf("%w: decode failure %s: %w", ErrCorrupt, object, err)
 	}
 
 	if f.Version != storeVersion {
-		return Failure{}, false, fmt.Errorf("failure %s: unsupported version %d", object, f.Version)
+		return Failure{}, false, fmt.Errorf("%w: failure %s: unsupported version %d", ErrCorrupt, object, f.Version)
 	}
 
 	return f, true, nil

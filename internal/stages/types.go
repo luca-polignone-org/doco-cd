@@ -315,6 +315,8 @@ type StageManager struct {
 	// forkDeployedCommit is the commit the deploy stage stamped on a successful deploy: the last
 	// good records it instead of re-reading a branch tip that may have moved since.
 	forkDeployedCommit string
+	// forkTargetUnlock releases the fork target lock taken by runForkDeployStage (fork_rollback.go).
+	forkTargetUnlock func()
 }
 
 // memoizedShortSHA pairs a full commit SHA with its shortest unique prefix.

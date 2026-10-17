@@ -34,7 +34,7 @@ func (h *Handler) unblockProject(w http.ResponseWriter, r *http.Request, jobLog 
 
 	object := deploy.ObjectName(contextName, projectName)
 
-	changed, err := stages.UnblockTarget(h.appConfig.DataMountPath, object)
+	changed, err := stages.UnblockTarget(r.Context(), h.appConfig.DataMountPath, object)
 	if err != nil {
 		jobLog.With(logger.ErrAttr(err)).Error("failed to unblock project", slog.String("object", object))
 		restapi.JSONError(w, "failed to unblock project", err.Error(), jobID, http.StatusInternalServerError)

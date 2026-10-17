@@ -2,6 +2,7 @@ package rollback
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -18,6 +19,10 @@ type Decider interface {
 // the saved deploy config, pins the images, applies the compose policy in force and force
 // recreates the whole project.
 type Executor interface {
+	// Supports reports, before pre_rollback is asked, why lg cannot be rolled back at all (e.g.
+	// an unsupported source): asking for a veto on a rollback that cannot happen would record a
+	// misleading proceed.
+	Supports(lg LastGood) error
 	Deploy(ctx context.Context, lg LastGood) error
 }
 
@@ -35,6 +40,10 @@ type Outcome struct {
 // state failed (recordDeploymentFailure writes it), so a crash halfway still leaves the commit
 // marked. Any pre_rollback outcome other than proceed blocks, and an unreadable last good blocks
 // without asking: never a blind rollback.
+//
+// A job cancelled by shutdown (context.Canceled) during pre_rollback or the rollback keeps the
+// failure failed: a sticky blocked or rollback_failed would outlive the restart, while a hard
+// crash at the same point leaves failed too, and the next run retries.
 func Run(ctx context.Context, store *Store, decider Decider, exec Executor, f Failure, preTimeout, timeout time.Duration) Outcome {
 	lg, ok, err := store.GetLastGood(f.Object)
 	if err != nil {
@@ -45,10 +54,18 @@ func Run(ctx context.Context, store *Store, decider Decider, exec Executor, f Fa
 		return finish(store, f, StateFailed, "", "", nil)
 	}
 
+	if err = exec.Supports(lg); err != nil {
+		return finish(store, f, StateRollbackFailed, "", "", err)
+	}
+
 	decision := decider.Decide(ctx, hooks.PreRollbackRequest{
 		Object: f.Object, FailedCommit: f.CommitSHA, LastGoodCommit: lg.CommitSHA,
 		Stage: f.Stage, Error: f.Error,
 	}, preTimeout)
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return finish(store, f, StateFailed, "", "", ctx.Err())
+	}
+
 	if decision != hooks.DecisionProceed {
 		return finish(store, f, StateBlocked, decision, "", nil)
 	}
@@ -57,6 +74,10 @@ func Run(ctx context.Context, store *Store, decider Decider, exec Executor, f Fa
 	defer cancel()
 
 	if err = exec.Deploy(rctx, lg); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return finish(store, f, StateFailed, "", "", ctx.Err())
+		}
+
 		return finish(store, f, StateRollbackFailed, decision, lg.CommitSHA, fmt.Errorf("rollback to %s: %w", lg.CommitSHA, err))
 	}
 

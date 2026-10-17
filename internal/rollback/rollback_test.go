@@ -26,11 +26,14 @@ func (d *fakeDecider) Decide(_ context.Context, req hooks.PreRollbackRequest, ti
 }
 
 type fakeExecutor struct {
-	err   error
-	block bool
-	calls int
-	got   LastGood
+	err         error
+	unsupported error
+	block       bool
+	calls       int
+	got         LastGood
 }
+
+func (e *fakeExecutor) Supports(LastGood) error { return e.unsupported }
 
 func (e *fakeExecutor) Deploy(ctx context.Context, lg LastGood) error {
 	e.calls++
@@ -234,4 +237,77 @@ func TestRunPersistError(t *testing.T) {
 	if out.State != StateRolledBack || out.PersistErr == nil {
 		t.Fatalf("outcome %+v", out)
 	}
+}
+
+// A last good the executor cannot roll back is rollback_failed without asking pre_rollback.
+func TestRunUnsupportedSkipsPreRollback(t *testing.T) {
+	s := storeWithLastGood(t)
+	unsupported := errors.New("rollback not supported: OCI source")
+	d, e := &fakeDecider{decision: hooks.DecisionProceed}, &fakeExecutor{unsupported: unsupported}
+
+	out := Run(t.Context(), s, d, e, runFailure(), time.Second, time.Second)
+	if out.State != StateRollbackFailed || out.Decision != "" || !errors.Is(out.Err, unsupported) {
+		t.Fatalf("outcome %+v", out)
+	}
+
+	if d.calls != 0 || e.calls != 0 {
+		t.Fatalf("decider %d / executor %d calls, want none", d.calls, e.calls)
+	}
+
+	if f := mustFailure(t, s); f.State != StateRollbackFailed || f.Decision != "" {
+		t.Fatalf("failure %+v", f)
+	}
+}
+
+// cancelingDecider cancels the job (shutdown) while pre_rollback is pending.
+type cancelingDecider struct{ cancel context.CancelFunc }
+
+func (d cancelingDecider) Decide(context.Context, hooks.PreRollbackRequest, time.Duration) hooks.Decision {
+	d.cancel()
+
+	return hooks.DecisionHTTPError
+}
+
+// cancelingExecutor cancels the job while the rollback deploys.
+type cancelingExecutor struct{ cancel context.CancelFunc }
+
+func (cancelingExecutor) Supports(LastGood) error { return nil }
+
+func (e cancelingExecutor) Deploy(ctx context.Context, _ LastGood) error {
+	e.cancel()
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+// A shutdown during pre_rollback or the rollback keeps the failure failed: nothing sticky.
+func TestRunCanceledKeepsFailed(t *testing.T) {
+	t.Run("during pre_rollback", func(t *testing.T) {
+		s := storeWithLastGood(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		e := &fakeExecutor{}
+
+		out := Run(ctx, s, cancelingDecider{cancel: cancel}, e, runFailure(), time.Second, time.Second)
+		if out.State != StateFailed || !errors.Is(out.Err, context.Canceled) || e.calls != 0 {
+			t.Fatalf("outcome %+v, executor calls %d", out, e.calls)
+		}
+
+		if f := mustFailure(t, s); f.State != StateFailed || f.Decision != "" {
+			t.Fatalf("failure %+v", f)
+		}
+	})
+
+	t.Run("during the rollback", func(t *testing.T) {
+		s := storeWithLastGood(t)
+		ctx, cancel := context.WithCancel(t.Context())
+
+		out := Run(ctx, s, &fakeDecider{decision: hooks.DecisionProceed}, cancelingExecutor{cancel: cancel}, runFailure(), time.Second, time.Minute)
+		if out.State != StateFailed || !errors.Is(out.Err, context.Canceled) || out.ToCommit != "" {
+			t.Fatalf("outcome %+v", out)
+		}
+
+		if f := mustFailure(t, s); f.State != StateFailed || f.Decision != "" {
+			t.Fatalf("failure %+v", f)
+		}
+	})
 }

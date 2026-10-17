@@ -85,6 +85,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
        contents: write # write to upload the SBOM file
+       packages: read # fork: the GHCR package is private, Trivy must log in to read the image
     needs:
       - build
       - release-notes # the release must exist before the SBOM is uploaded to it
@@ -99,6 +100,10 @@ jobs:
 
       - name: Generate Software Bill of Materials (SBOM)
         uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1
+        env:
+          # Fork: registry credentials for the private GHCR package (v0.127.0-poli.1 failed with UNAUTHORIZED).
+          TRIVY_USERNAME: ${{ github.actor }}
+          TRIVY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         with:
           image-ref: ghcr.io/${{ github.repository }}:${{ env.APP_VERSION }}
           scan-type: image

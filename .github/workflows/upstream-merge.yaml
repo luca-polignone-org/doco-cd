@@ -1,0 +1,45 @@
+name: Merge upstream
+
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: github.repository == 'luca-polignone-org/doco-cd'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits that touch .github/workflows/, and an upstream merge
+          # almost always does: this needs a token with the workflow scope.
+          token: ${{ secrets.UPSTREAM_MERGE_TOKEN }}
+
+      - name: Latest upstream release
+        id: up
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "tag=$(gh release view -R kimdre/doco-cd --json tagName -q .tagName)" >> "$GITHUB_OUTPUT"
+
+      - name: Open the merge PR if the tag is new
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_MERGE_TOKEN }}
+          TAG: ${{ steps.up.outputs.tag }}
+        run: |
+          git fetch https://github.com/kimdre/doco-cd.git "refs/tags/$TAG:refs/tags/$TAG"
+          if git merge-base --is-ancestor "$TAG" origin/main; then echo "already merged"; exit 0; fi
+          branch="upstream/$TAG"
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then echo "PR already open"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch" origin/main
+          if git merge --no-ff --no-edit "$TAG"; then conflict=""; else git add -A && git commit --no-edit -m "merge upstream $TAG (with conflicts to resolve)" && conflict=" - CONFLICTS"; fi
+          git push origin "$branch"
+          gh pr create --base main --head "$branch" --title "merge upstream $TAG$conflict" \
+            --body "Merge commit of upstream tag $TAG. Resolve any conflicts by hand, get CI green and a reviewer, then release $TAG-poli.1."

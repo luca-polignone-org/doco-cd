@@ -37,6 +37,8 @@ concurrency:
 jobs:
   build:
     name: Build documentation
+    # Fork: the documentation is published by upstream only.
+    if: github.repository == 'kimdre/doco-cd'
     runs-on: ubuntu-latest
     env:
       DOCO_CD_VERSION: ${{ github.event.release.tag_name || github.event.inputs.version || github.sha }}

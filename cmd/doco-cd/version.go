@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/avast/retry-go/v5"
@@ -85,8 +86,8 @@ func notificationForNewAppVersion(log *slog.Logger, notifier notification.Sender
 	if err != nil {
 		log.Error("failed to get latest application release version", logger.ErrAttr(err))
 	} else {
-		if app.Version != latestVersion {
-			log.Warn("new application version available",
+		if forkBaseVersion(app.Version) != latestVersion {
+			log.Warn("new application version available"+forkMergeNotice(app.Version),
 				slog.String("current", app.Version),
 				slog.String("latest", latestVersion),
 			)
@@ -96,7 +97,7 @@ func notificationForNewAppVersion(log *slog.Logger, notifier notification.Sender
 			// message). Otherwise a deploy-shaped template renders empty fields.
 			err = notifier.Send(notification.Info,
 				"New version of doco-cd is available",
-				fmt.Sprintf("Current Version: %s\nLatest Version: %s\n\nhttps://github.com/kimdre/doco-cd/releases", app.Version, latestVersion),
+				fmt.Sprintf("Current Version: %s\nLatest Version: %s%s\n\nhttps://github.com/kimdre/doco-cd/releases", app.Version, latestVersion, forkMergeNotice(app.Version)),
 				notification.Metadata{},
 				notification.WithoutBodyTemplate())
 			if err != nil {
@@ -106,4 +107,27 @@ func notificationForNewAppVersion(log *slog.Logger, notifier notification.Sender
 			log.Debug("application is up to date", slog.String("version", app.Version))
 		}
 	}
+}
+
+// forkVersionMarker separates the upstream base version from the fork release number.
+const forkVersionMarker = "-poli."
+
+// forkBaseVersion strips the -poli.N suffix: fork release v0.127.0-poli.3 is up to date with
+// upstream v0.127.0. A version without the suffix is returned unchanged.
+func forkBaseVersion(v string) string {
+	if i := strings.Index(v, forkVersionMarker); i >= 0 {
+		return v[:i]
+	}
+
+	return v
+}
+
+// forkMergeNotice is the suffix of the new version message of a fork release, with its leading
+// space; it is empty for any other version, so the upstream message is unchanged byte for byte.
+func forkMergeNotice(v string) string {
+	if !strings.Contains(v, forkVersionMarker) {
+		return ""
+	}
+
+	return " (fork luca-polignone-org/doco-cd: merge upstream needed)"
 }

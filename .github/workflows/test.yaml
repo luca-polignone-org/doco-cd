@@ -122,7 +122,7 @@ jobs:
           key: test-go-build-${{ runner.os }}-${{ hashFiles('go.mod', 'go.sum') }}
 
       - name: Upload coverage reports to Codecov
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.repository == 'kimdre/doco-cd' }}
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}

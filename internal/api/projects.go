@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"net/http"
 
+	composeapi "github.com/docker/compose/v5/pkg/api"
+
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -23,10 +26,8 @@ func (h *Handler) ProjectApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -46,8 +47,14 @@ func (h *Handler) ProjectApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog = jobLog.With(slog.String("context", contextName))
 
+	object := deploy.ObjectName(contextName, projectName)
+
 	switch r.Method {
 	case http.MethodGet:
+		if !h.authorize(w, jobLog, jobID, principal, "projects", "get", object) {
+			return
+		}
+
 		containers, err := docker.GetProjectContainers(ctx, dockerCli, projectName)
 		if err != nil {
 			errMsg := "failed to get project: " + projectName
@@ -64,6 +71,10 @@ func (h *Handler) ProjectApiHandler(w http.ResponseWriter, r *http.Request) {
 
 		restapi.JSONResponse(w, containers, jobID, http.StatusOK)
 	case http.MethodDelete:
+		if !h.authorize(w, jobLog, jobID, principal, "projects", "delete", object) {
+			return
+		}
+
 		timeoutSec, ok := getIntQueryParam(r, w, jobLog, jobID, "timeout", controlplane.DefaultProjectActionTimeout)
 		if !ok {
 			return
@@ -124,10 +135,8 @@ func (h *Handler) GetProjectsApiHandler(w http.ResponseWriter, r *http.Request) 
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -152,6 +161,10 @@ func (h *Handler) GetProjectsApiHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	projects = filterAllowed(h, principal, "projects", projects, func(p composeapi.Stack) string {
+		return deploy.ObjectName(contextName, p.Name)
+	})
+
 	if len(projects) == 0 {
 		restapi.JSONError(w, "no projects found", "", jobID, http.StatusNotFound)
 		return
@@ -170,10 +183,8 @@ func (h *Handler) ProjectActionApiHandler(w http.ResponseWriter, r *http.Request
 
 	jobLog.Debug("received api request")
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -199,6 +210,11 @@ func (h *Handler) ProjectActionApiHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	action := r.PathValue("action")
+
+	if !h.authorize(w, jobLog, jobID, principal, "projects", "action/"+action, deploy.ObjectName(contextName, projectName)) {
+		return
+	}
+
 	serviceName := r.URL.Query().Get("service")
 
 	operation, err := controlplane.ResolveProjectAction(ctx, dockerCli, projectName, action, controlplane.ProjectActionOptions{

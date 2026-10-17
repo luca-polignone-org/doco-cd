@@ -18,6 +18,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/rbac"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/source/oci"
 	"github.com/kimdre/doco-cd/internal/stages"
@@ -166,6 +167,10 @@ func (c *Runs) TriggerPoll(ctx context.Context, configs []poll.Config, wait bool
 		mode = RunSynchronous
 	}
 
+	// Fork: an asynchronous run executes under the application context and loses the
+	// request values, so the principal is carried into the run explicitly.
+	principal, hasPrincipal := rbac.PrincipalFrom(ctx)
+
 	err := c.Execute(ctx, jobID, RunExecution{
 		Mode:         mode,
 		PanicContext: "poll run",
@@ -174,6 +179,9 @@ func (c *Runs) TriggerPoll(ctx context.Context, configs []poll.Config, wait bool
 		// Polls triggered through the API or MCP are manual deployments,
 		// which sync windows with manual_sync let through.
 		runCtx = WithDeploymentOrigin(runCtx, syncwindow.OriginManual)
+		if hasPrincipal {
+			runCtx = rbac.WithPrincipal(runCtx, principal)
+		}
 
 		workerCount := defaultConcurrentPollExecutions
 		if c.poll.appConfig.MaxConcurrentDeployments > 0 {

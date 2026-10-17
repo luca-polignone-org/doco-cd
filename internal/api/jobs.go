@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/controlplane"
 
 	"github.com/kimdre/doco-cd/internal/logger"
@@ -24,10 +25,8 @@ func (h *Handler) GetScheduledJobsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -48,6 +47,10 @@ func (h *Handler) GetScheduledJobsHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	jobs = filterAllowed(h, principal, "jobs", jobs, func(job controlplane.ScheduledJobInfo) string {
+		return deploy.ObjectName(job.Context, job.Stack)
+	})
+
 	restapi.JSONResponse(w, jobs, jobID, http.StatusOK)
 }
 
@@ -62,10 +65,8 @@ func (h *Handler) TriggerScheduledJobHandler(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 
@@ -88,6 +89,10 @@ func (h *Handler) TriggerScheduledJobHandler(w http.ResponseWriter, r *http.Requ
 
 	wait, ok := getBoolQueryParam(r, w, jobLog, jobID, "wait", true)
 	if !ok {
+		return
+	}
+
+	if !h.authorizeScheduledJob(w, r, jobLog, jobID, principal, contextName, jobName, stackName) {
 		return
 	}
 

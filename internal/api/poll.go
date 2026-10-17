@@ -13,6 +13,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/controlplane"
 
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/rbac"
 	"github.com/kimdre/doco-cd/internal/restapi"
 	"github.com/kimdre/doco-cd/internal/stages"
 )
@@ -29,10 +30,8 @@ func (h *Handler) TriggerPollHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !restapi.ValidateApiKey(r, h.appConfig.ApiSecret) {
-		jobLog.Error(restapi.ErrInvalidApiKey.Error())
-		restapi.JSONError(w, restapi.ErrInvalidApiKey.Error(), "", jobID, http.StatusUnauthorized)
-
+	principal, ok := h.authenticate(w, r, jobLog, jobID)
+	if !ok {
 		return
 	}
 	defer func() {
@@ -65,7 +64,24 @@ func (h *Handler) TriggerPollHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	jobID, err := h.controlPlaneRuns.TriggerPoll(r.Context(), pollConfigs, wait, jobLog)
+	// Fork: with RBAC a caller picks which operator poll target to re-run, not how; the
+	// principal travels with the run so that pre-deploy can check targets/sync.
+	ctx := r.Context()
+
+	if h.rbac.Enabled() {
+		allowed, err := controlplane.RestrictPollConfigs(h.appConfig.PollConfig, pollConfigs)
+		if err != nil {
+			jobLog.Warn("poll configuration not allowed", logger.ErrAttr(err))
+			restapi.JSONError(w, "poll configuration not allowed", err.Error(), jobID, http.StatusBadRequest)
+
+			return
+		}
+
+		pollConfigs = allowed
+		ctx = rbac.WithPrincipal(ctx, principal)
+	}
+
+	jobID, err := h.controlPlaneRuns.TriggerPoll(ctx, pollConfigs, wait, jobLog)
 	if err != nil {
 		if blocked, ok := errors.AsType[*stages.SyncWindowBlockedError](err); ok {
 			jobLog.Info("poll jobs deferred by sync window", slog.String("reason", blocked.Error()))

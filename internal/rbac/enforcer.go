@@ -17,12 +17,14 @@ import (
 // (temp file + rename). A file truncated at a line boundary is still a valid CSV
 // that just lacks the last lines, and the enforcer cannot detect that.
 type Enforcer struct {
-	path    string
-	log     *slog.Logger
-	mu      sync.RWMutex
-	policy  *Policy
-	modTime time.Time
-	size    int64
+	path     string
+	log      *slog.Logger
+	mu       sync.RWMutex // guards policy, modTime, size, missing
+	reloadMu sync.Mutex   // serializes reloads, one reload and one log per version
+	missing  bool
+	policy   *Policy
+	modTime  time.Time
+	size     int64
 }
 
 // NewFileEnforcer loads the policy at path; the initial load must succeed.
@@ -61,13 +63,34 @@ func (e *Enforcer) reload() error {
 // Enabled reports whether RBAC is on, that is whether the enforcer is non-nil.
 func (e *Enforcer) Enabled() bool { return e != nil }
 
-func (e *Enforcer) current() *Policy {
-	if info, err := os.Stat(e.path); err == nil {
-		e.mu.RLock()
-		changed := !info.ModTime().Equal(e.modTime) || info.Size() != e.size
-		e.mu.RUnlock()
+// changed reports whether info differs from the loaded version, and records that
+// the file is present.
+func (e *Enforcer) changed(info os.FileInfo) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-		if changed {
+	e.missing = false
+
+	return !info.ModTime().Equal(e.modTime) || info.Size() != e.size
+}
+
+func (e *Enforcer) current() *Policy {
+	info, err := os.Stat(e.path)
+
+	switch {
+	case err != nil:
+		e.mu.Lock()
+		first := !e.missing
+		e.missing = true
+		e.mu.Unlock()
+
+		if first {
+			e.log.Error("rbac policy file missing, keeping last valid policy", slog.Any("error", err))
+		}
+	case e.changed(info):
+		e.reloadMu.Lock()
+		// Re-check: a concurrent request may have already handled this version.
+		if e.changed(info) {
 			if err = e.reload(); err != nil {
 				e.mu.Lock()
 				e.modTime, e.size = info.ModTime(), info.Size() // do not retry the same version
@@ -75,6 +98,8 @@ func (e *Enforcer) current() *Policy {
 				e.log.Error("rbac policy reload failed, keeping last valid policy", slog.Any("error", err))
 			}
 		}
+
+		e.reloadMu.Unlock()
 	}
 
 	e.mu.RLock()

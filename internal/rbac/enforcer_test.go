@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -159,14 +160,62 @@ func TestReloadKeepsLastValidPolicy(t *testing.T) {
 }
 
 func TestReloadFileRemoved(t *testing.T) {
-	e, path, _ := newTestEnforcer(t, enforcerPolicy)
+	e, path, buf := newTestEnforcer(t, enforcerPolicy)
+	alice := Principal{Subject: "alice"}
 
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
 
-	if !e.Enforce(Principal{Subject: "alice"}, "projects", "get", "noi/web") {
-		t.Fatal("decision must not change when the file disappears")
+	for range 3 {
+		if !e.Enforce(alice, "projects", "get", "noi/web") {
+			t.Fatal("decision must not change when the file disappears")
+		}
+	}
+
+	if n := strings.Count(buf.String(), "policy file missing"); n != 1 {
+		t.Fatalf("missing file must be logged once, got %d: %s", n, buf.String())
+	}
+
+	// The file comes back and goes away again: logged again.
+	writePolicy(t, path, enforcerPolicy)
+
+	if !e.Enforce(alice, "projects", "get", "noi/web") {
+		t.Fatal("restored file must be allowed")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+
+	e.Enforce(alice, "projects", "get", "noi/web")
+
+	if n := strings.Count(buf.String(), "policy file missing"); n != 2 {
+		t.Fatalf("second disappearance must be logged, got %d", n)
+	}
+}
+
+func TestConcurrentReloadLogsOnce(t *testing.T) {
+	e, path, buf := newTestEnforcer(t, enforcerPolicy)
+
+	writePolicy(t, path, "x, broken\n")
+
+	var wg sync.WaitGroup
+
+	for range 16 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			e.Enforce(Principal{Subject: "alice"}, "projects", "get", "noi/web")
+		}()
+	}
+
+	wg.Wait()
+
+	if n := strings.Count(buf.String(), "reload failed"); n != 1 {
+		t.Fatalf("reload failure must be logged once, got %d", n)
 	}
 }
 

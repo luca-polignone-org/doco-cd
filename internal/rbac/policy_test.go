@@ -76,7 +76,7 @@ func TestAllowed(t *testing.T) {
 }
 
 func TestGroupCycle(t *testing.T) {
-	p, err := Parse(strings.NewReader("g, a, role:b\ng, role:b, a\np, role:b, x, get, *, allow\n"))
+	p, err := Parse(strings.NewReader("g, a, role:b\ng, role:b, role:c\ng, role:c, role:b\np, role:c, x, get, *, allow\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,6 +93,7 @@ func TestParseErrors(t *testing.T) {
 		"p, a, b, c, d, maybe", // invalid effect
 		"p, a, b, c, d, allow, extra",
 		"g, a",                 // incomplete g
+		"g, a, b",              // g target is not a role
 		"x, a, b",              // unknown line type
 		"p, a, b, c, [, allow", // invalid glob
 		"p, , b, c, d, allow",  // empty field
@@ -109,4 +110,38 @@ func TestParseReadError(t *testing.T) {
 	if _, err := Parse(strings.NewReader(doc)); err == nil {
 		t.Fatal("expected read error")
 	}
+}
+
+func TestAllowedEmptyValues(t *testing.T) {
+	p, err := Parse(strings.NewReader("p, alice, projects, get, noi/*, allow\np, alice, *, *, *, allow\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	alice := Principal{Subject: "alice"}
+
+	runAllowed(t, p, []allowedCase{
+		{alice, "projects", "get", "noi/web", true},
+		{alice, "projects", "get", "noi/", false},
+		{alice, "projects", "get", "", false},
+		{alice, "projects", "", "noi/web", false},
+		{alice, "", "get", "noi/web", false},
+	})
+}
+
+func TestReservedSubjects(t *testing.T) {
+	p, err := Parse(strings.NewReader(
+		"p, role:x, r, get, *, allow\np, apikey, r, get, *, allow\ng, alice, role:x\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runAllowed(t, p, []allowedCase{
+		{Principal{Subject: "alice"}, "r", "get", "o", true},
+		{Principal{Subject: APIKeySubject}, "r", "get", "o", true},
+		{Principal{Subject: "role:x"}, "r", "get", "o", false},
+		{Principal{Subject: "bob", Groups: []string{"role:x"}}, "r", "get", "o", false},
+		{Principal{Subject: "bob", Groups: []string{APIKeySubject}}, "r", "get", "o", false},
+		{Principal{Subject: "bob", Groups: []string{"alice"}}, "r", "get", "o", true},
+	})
 }

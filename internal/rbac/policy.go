@@ -24,6 +24,10 @@ type Principal struct {
 // APIKeySubject is the subject used for requests authenticated with an API key.
 const APIKeySubject = "apikey"
 
+// rolePrefix marks role names. A principal can only reach a role through g lines,
+// never by presenting a role name as its subject or as one of its groups.
+const rolePrefix = "role:"
+
 type rule struct {
 	subject, resource, action, object string
 	allow                             bool
@@ -68,6 +72,10 @@ func Parse(r io.Reader) (*Policy, error) {
 		case "g":
 			if len(fields) != 3 {
 				return nil, fmt.Errorf("rbac policy line %d: g needs 3 fields", line)
+			}
+
+			if !strings.HasPrefix(fields[2], rolePrefix) {
+				return nil, fmt.Errorf("rbac policy line %d: g target %q must start with %q", line, fields[2], rolePrefix)
 			}
 
 			p.groups[fields[1]] = append(p.groups[fields[1]], fields[2])
@@ -115,11 +123,16 @@ func (p *Policy) subjects(pr Principal) map[string]bool {
 	seen := map[string]bool{}
 	queue := make([]string, 0, 1+len(pr.Groups))
 
-	if pr.Subject != "" {
+	if pr.Subject != "" && !strings.HasPrefix(pr.Subject, rolePrefix) {
 		queue = append(queue, pr.Subject)
 	}
 
-	queue = append(queue, pr.Groups...)
+	for _, g := range pr.Groups {
+		// A group claim must not impersonate a role or the API key subject.
+		if !strings.HasPrefix(g, rolePrefix) && g != APIKeySubject {
+			queue = append(queue, g)
+		}
+	}
 
 	for len(queue) > 0 {
 		s := queue[0]
@@ -143,6 +156,11 @@ func match(pattern, value string) bool {
 
 // Allowed reports whether the principal may perform action on object of resource.
 func (p *Policy) Allowed(pr Principal, resource, action, object string) bool {
+	// Empty values never match: "noi/*" must not match "noi/".
+	if resource == "" || action == "" || object == "" {
+		return false
+	}
+
 	subjects := p.subjects(pr)
 	allowed := false
 

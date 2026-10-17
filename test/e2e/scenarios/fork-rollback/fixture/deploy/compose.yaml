@@ -1,0 +1,11 @@
+# The include and the service env_file are files a copy of compose.yaml alone would not find:
+# the rollback republishes the whole artifact of the last good commit.
+include:
+  - extra.yaml
+services:
+  app:
+    image: alpine:3.22
+    command: ["sleep", "600"]
+    env_file: app.env
+    post_start:
+      - command: ["sh", "-c", "exit ${HOOK_EXIT:-0}"]

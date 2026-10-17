@@ -1,0 +1,8 @@
+# Never deploys: E2E_REQUIRED is unset, so the render fails after E2E_TOKEN was resolved.
+services:
+  app:
+    image: alpine:3.22
+    command: ["sleep", "600"]
+    environment:
+      TOKEN: ${E2E_TOKEN}
+      REQUIRED: ${E2E_REQUIRED:?required}

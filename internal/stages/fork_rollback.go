@@ -53,7 +53,7 @@ func (s *StageManager) persistForkFailure(f docker.DeploymentFailure, state roll
 
 	err := store.PutFailure(rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: f.Repository, Stack: f.Stack,
-		CommitSHA: f.CommitSHA, Stage: f.Stage, Error: truncateRunes(f.Error, 2000),
+		CommitSHA: f.CommitSHA, Stage: f.Stage, Error: truncateRunes(s.redactSecrets(f.Error), 2000),
 		FailedAt: f.FailedAt, State: state, Decision: decision,
 	})
 	if err != nil {
@@ -100,15 +100,16 @@ func truncateRunes(v string, n int) string {
 
 // recordLastGood makes a successful deploy the target's last good. A destroy never does, nor a
 // Swarm deploy (rollback is Compose only), and without rollback enabled nothing is written. A
-// failure is logged and never fails the deploy.
-func (s *StageManager) recordLastGood(ctx context.Context) {
+// failure is logged and never fails the deploy. It returns the images it collected, for the
+// outcome event, or nil when it collected none.
+func (s *StageManager) recordLastGood(ctx context.Context) []rollback.ServiceImage {
 	if s.DeployConfig.Destroy.Enabled || s.Docker.SwarmMode {
-		return
+		return nil
 	}
 
 	store := s.forkStore()
 	if store == nil {
-		return
+		return nil
 	}
 
 	object := s.DeployConfig.Object()
@@ -123,19 +124,19 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 
 	if commit == "" {
 		log.Error("failed to resolve deployed commit for last good")
-		return
+		return nil
 	}
 
 	images, err := s.serviceImages(ctx)
 	if err != nil {
 		log.Error("failed to collect images for last good", slog.Any("error", err))
-		return
+		return nil
 	}
 
 	cfg, err := deployConfigForLastGood(s.DeployConfig, s.forkDeclared)
 	if err != nil {
 		log.Error("failed to encode deploy config for last good", slog.Any("error", err))
-		return
+		return images
 	}
 
 	// The state goes before the ref. The JSON is what the rollback reads; the ref only keeps
@@ -149,7 +150,7 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 	})
 	if err != nil {
 		log.Error("failed to record last good deployment", slog.Any("error", err))
-		return
+		return images
 	}
 
 	if s.Repository.Source != config.SourceTypeOCI && s.Repository.MirrorDir != "" {
@@ -157,6 +158,8 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 			log.Error("failed to pin last good commit", slog.Any("error", err))
 		}
 	}
+
+	return images
 }
 
 // lastGoodDocument encodes the deploy config and its external secret references in one pass,
@@ -323,7 +326,11 @@ func SetPreRollback(c *hooks.PreRollbackClient) { preRollbackClient.Store(c) }
 var deployLastGood = docker.DeployStack
 
 // runForkRollback runs the rollback flow after a failed deploy, post-deploy or cleanup stage of
-// a target with rollback enabled; it never runs for a destroy. The failure comes from process
+// a target with rollback enabled; it never runs for a destroy. It reports whether the flow ran, in
+// which case it emitted the outcome event of the failure (emitRollbackOutcome). cause is the error
+// of the stage: the error of the record comes from it, redacted and then truncated, not from the
+// in-memory failure, which upstream already truncated (a secret straddling the cut would survive
+// redaction as a prefix). The failure comes from process
 // memory, not from disk: if the initial write failed, an empty CommitSHA read back from disk
 // would make the failed commit look new to rollbackPoisoned, and it would be deployed again.
 //
@@ -331,24 +338,24 @@ var deployLastGood = docker.DeployStack
 // exclusion against another job of the same object is the fork target lock: runForkDeployStage
 // takes it for a target with rollback enabled, and RunStages releases it only after this function
 // returned (see lockForkTarget for the lock order).
-func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName) {
+func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName, cause error) bool {
 	if s.DeployConfig.Destroy.Enabled || !stageRecordsDeploymentFailure(stageName) {
-		return
+		return false
 	}
 
 	st := s.forkStore()
 	if st == nil {
-		return
+		return false
 	}
 
 	mem, ok := docker.GetDeploymentFailure(s.Repository.Name, s.DeployConfig.Name)
 	if !ok {
-		return
+		return false
 	}
 
 	f := rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: mem.Repository, Stack: mem.Stack,
-		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(mem.Error, 2000),
+		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(s.redactSecrets(cause.Error()), 2000),
 		FailedAt: mem.FailedAt, State: rollback.StateFailed,
 	}
 
@@ -370,13 +377,18 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName)
 	}
 
 	log.Warn("deployment rollback finished", attrs...)
+
+	s.emitRollbackOutcome(ctx, f, out)
+
+	return true
 }
 
 // rollbackPoisoned reports whether the current revision of the target is a commit that ended
 // rolled_back, blocked or rollback_failed: pre-deploy then skips it, on every source and with or
 // without containers. On a new commit the failure goes back to failed with its own commit, so
-// the upstream retry stays the usual one and the success of the new commit clears it.
-func (s *StageManager) rollbackPoisoned(revision string, stageLog *slog.Logger) bool {
+// the upstream retry stays the usual one and the success of the new commit clears it. The reset
+// emits unblocked, before the new commit is deployed.
+func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, stageLog *slog.Logger) bool {
 	f, ok := s.loadForkFailure()
 	if !ok || f.State == rollback.StateFailed {
 		return false
@@ -386,6 +398,8 @@ func (s *StageManager) rollbackPoisoned(revision string, stageLog *slog.Logger) 
 		f.State, f.Decision = rollback.StateFailed, ""
 		if err := s.forkStore().PutFailure(f); err != nil {
 			stageLog.Error("failed to reset rollback state", slog.Any("error", err))
+		} else {
+			s.emitOutcome(ctx, hooks.OutcomeUnblocked)
 		}
 
 		return false
@@ -403,7 +417,8 @@ func (s *StageManager) rollbackPoisoned(revision string, stageLog *slog.Logger) 
 // does not decode, or has an unknown version), which blocks the target, is replaced by a failed
 // one of the deploy stage, so the next run retries with a full recreate; an I/O error is
 // returned. It reports false when nothing is blocked. It holds the fork target lock, so it never
-// interleaves with a deploy or a rollback of the same object in this process.
+// interleaves with a deploy or a rollback of the same object in this process. A successful unblock
+// emits unblocked with the repository and commit of the record.
 func UnblockTarget(ctx context.Context, dataMountPath, object string) (bool, error) {
 	unlock, err := lockForkTarget(ctx, object)
 	if err != nil {
@@ -426,7 +441,12 @@ func UnblockTarget(ctx context.Context, dataMountPath, object string) (bool, err
 
 	f.State, f.Decision = rollback.StateFailed, ""
 
-	return true, st.PutFailure(f)
+	err = st.PutFailure(f)
+	if err == nil {
+		emitUnblocked(f)
+	}
+
+	return true, err
 }
 
 // forkTargetLocks holds one lock per object: a channel of capacity 1, so a waiter can give up
@@ -492,7 +512,7 @@ func (s *StageManager) runForkDeployStage(ctx context.Context, stageLog *slog.Lo
 
 		s.forkTargetUnlock = unlock
 
-		if s.rollbackPoisoned(strings.TrimSpace(s.Repository.Revision), stageLog) {
+		if s.rollbackPoisoned(ctx, strings.TrimSpace(s.Repository.Revision), stageLog) {
 			// Pre-deploy passed, so this job already posted its per-stack "In Progress" status:
 			// close it as skipped, as the webhook skip path does. Upstream has no notification for
 			// a skip, so the "started" notification has no terminal counterpart to send.

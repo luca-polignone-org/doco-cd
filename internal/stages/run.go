@@ -215,10 +215,13 @@ func (s *StageManager) RunStages(ctx context.Context, admitMutation MutationAdmi
 	}
 
 	// Fork: a successful deploy becomes the target's last good (never a destroy).
-	s.recordLastGood(ctx)
+	images := s.recordLastGood(ctx)
 
 	// Success (deploy or destroy) closes any recorded failure, retries stop.
 	s.clearDeploymentFailure()
+
+	// Fork: outcome event deployed or destroyed.
+	s.emitSuccessOutcome(ctx, images)
 
 	return nil
 }
@@ -251,8 +254,11 @@ func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageNa
 		return err
 	}
 
-	// Fork: rollback to the last good deploy, behind the pre_rollback veto.
-	s.runForkRollback(ctx, stageName)
+	// Fork: rollback to the last good deploy, behind the pre_rollback veto; it emits its outcome
+	// event, otherwise the failure emits policy_denied or failed.
+	if !s.runForkRollback(ctx, stageName, err) {
+		s.emitFailureOutcome(ctx, stageName, err)
+	}
 
 	notifiedErr := s.NotifyFailure(err)
 

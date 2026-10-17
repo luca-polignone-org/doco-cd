@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -8,8 +9,10 @@ import (
 	"testing"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/hooks"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/rollback"
+	"github.com/kimdre/doco-cd/internal/stages"
 )
 
 func TestProjectActions(t *testing.T) {
@@ -111,6 +114,48 @@ func TestUnblockProjectAction(t *testing.T) {
 
 		if rr, body = serveFork(t, mux, http.MethodPost, target, "", true); rr.Code != http.StatusConflict {
 			t.Fatalf("second unblock: status = %d, body = %v, want 409", rr.Code, body)
+		}
+	})
+
+	t.Run("unblock emits unblocked once", func(t *testing.T) {
+		outbox := filepath.Join(t.TempDir(), "outbox")
+
+		o, err := hooks.NewOutbox(hooks.OutboxConfig{Dir: outbox, URL: "http://127.0.0.1:1/outcome"})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stages.SetOutbox(o)
+		t.Cleanup(func() { stages.SetOutbox(nil) })
+
+		data := t.TempDir()
+		if err := rollback.StoreFor(data).PutFailure(rollback.Failure{Object: "default/allowed", Repository: "org/repo", CommitSHA: "c2", Stage: "deploy", State: rollback.StateBlocked}); err != nil {
+			t.Fatal(err)
+		}
+
+		mux := newUnblockMux(t, hook, data, false)
+
+		for range 2 { // the second one is a 409 and emits nothing
+			serveFork(t, mux, http.MethodPost, target, "", true)
+		}
+
+		files, err := filepath.Glob(filepath.Join(outbox, "*.json"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("outbox files %v, err %v, want one event", files, err)
+		}
+
+		raw, err := os.ReadFile(files[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var e struct {
+			Event hooks.Event `json:"event"`
+		}
+
+		if err := json.Unmarshal(raw, &e); err != nil || e.Event.Outcome != hooks.OutcomeUnblocked || e.Event.Object != "default/allowed" ||
+			e.Event.Commit != "c2" || e.Event.Repository != "org/repo" {
+			t.Fatalf("event %s, err %v", raw, err)
 		}
 	})
 

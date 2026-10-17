@@ -5,7 +5,6 @@ package e2e
 import (
 	"bufio"
 	"bytes"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -30,35 +29,51 @@ const (
 	// forkRollbackHookURL is on the daemon's own loopback: the receiver shares its network
 	// namespace, like the JWKS sidecar of TestForkRBAC.
 	forkRollbackHookURL = "http://127.0.0.1:8090/pre-rollback"
+	forkOutcomeHookURL  = "http://127.0.0.1:8090/outcome"
 
 	forkRollbackFinished = "deployment rollback finished"
 	forkRollbackPoisoned = "deployment of this commit was rolled back or blocked, skipping"
 )
 
-// forkRollbackReceiverScript answers pre_rollback with the decision in /rec/decision and appends
-// every request (X-Doco-Signature and the raw body) to /rec/requests.jsonl. It does not verify
-// the signature itself: the test does, with hooks.Verify, on the recorded raw body.
+// forkRollbackReceiverScript is the hook receiver of the fork e2e tests. It answers pre_rollback
+// (/pre-rollback) with the decision in /rec/decision and every other POST (outcome events, commit
+// statuses) with an empty 200, and appends every POST (path, X-Doco-Signature and the raw body) to
+// /rec/requests.jsonl. GET /secret/<key> is a webhook secret store answering {"value": <the
+// content of /rec/secret>}, recorded with its path only. It does not verify signatures itself: the test does, with
+// hooks.Verify, on the recorded raw body.
 const forkRollbackReceiverScript = `import base64, http.server, json
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def reply(self, out):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
     def do_GET(self):
+        if self.path.startswith("/secret/"):
+            with open("/rec/requests.jsonl", "a") as f:
+                f.write(json.dumps({"path": self.path, "signature": "", "body": ""}) + "\n")
+            with open("/rec/secret") as f:
+                self.reply(json.dumps({"value": f.read().strip()}).encode())
+            return
         self.send_response(200)
         self.end_headers()
 
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         with open("/rec/requests.jsonl", "a") as f:
-            f.write(json.dumps({"signature": self.headers.get("X-Doco-Signature", ""),
+            f.write(json.dumps({"path": self.path,
+                                "signature": self.headers.get("X-Doco-Signature", ""),
                                 "body": base64.b64encode(body).decode()}) + "\n")
+        if self.path != "/pre-rollback":
+            self.reply(b"{}")
+            return
         with open("/rec/decision") as f:
             decision = f.read().strip()
-        out = json.dumps({"decision": decision}).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(out)))
-        self.end_headers()
-        self.wfile.write(out)
+        self.reply(json.dumps({"decision": decision}).encode())
 
     def log_message(self, *args):
         pass
@@ -147,8 +162,15 @@ func (r *preRollbackReceiver) start() {
 	h.t.Cleanup(func() { h.terminateContainer(sidecar) })
 }
 
-// requests returns the pre_rollback requests received so far, each checked against the HMAC.
-func (r *preRollbackReceiver) requests() []hooks.PreRollbackRequest {
+// recordedRequest is a POST the receiver recorded.
+type recordedRequest struct {
+	Path      string `json:"path"`
+	Signature string `json:"signature"`
+	Body      []byte `json:"body"` // base64 in the file, decoded by encoding/json
+}
+
+// recorded returns every POST received so far, in arrival order.
+func (r *preRollbackReceiver) recorded() []recordedRequest {
 	h := r.h
 	h.t.Helper()
 
@@ -161,28 +183,52 @@ func (r *preRollbackReceiver) requests() []hooks.PreRollbackRequest {
 		h.t.Fatalf("read recorded requests: %v", err)
 	}
 
-	var out []hooks.PreRollbackRequest
+	var out []recordedRequest
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
-	for scanner.Scan() {
-		var rec struct {
-			Signature string `json:"signature"`
-			Body      string `json:"body"`
-		}
+	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 
+	for scanner.Scan() {
+		var rec recordedRequest
 		if err := json.Unmarshal(scanner.Bytes(), &rec); err != nil {
 			h.t.Fatalf("decode recorded request %q: %v", scanner.Text(), err)
 		}
 
-		body, err := base64.StdEncoding.DecodeString(rec.Body)
-		if err != nil {
-			h.t.Fatalf("decode recorded body: %v", err)
+		out = append(out, rec)
+	}
+
+	return out
+}
+
+// signedBodies returns the bodies of the requests received on path, each checked against the HMAC.
+func (r *preRollbackReceiver) signedBodies(path string) [][]byte {
+	r.h.t.Helper()
+
+	var out [][]byte
+
+	for _, rec := range r.recorded() {
+		if rec.Path != path {
+			continue
 		}
 
-		if err := hooks.Verify([]byte(forkRollbackSecret), rec.Signature, body, time.Now(), time.Hour); err != nil {
-			h.t.Fatalf("pre_rollback request %s is not signed with HOOK_SECRET: %v", body, err)
+		if err := hooks.Verify([]byte(forkRollbackSecret), rec.Signature, rec.Body, time.Now(), time.Hour); err != nil {
+			r.h.t.Fatalf("%s request %s is not signed with HOOK_SECRET: %v", path, rec.Body, err)
 		}
 
+		out = append(out, rec.Body)
+	}
+
+	return out
+}
+
+// requests returns the pre_rollback requests received so far, each checked against the HMAC.
+func (r *preRollbackReceiver) requests() []hooks.PreRollbackRequest {
+	h := r.h
+	h.t.Helper()
+
+	var out []hooks.PreRollbackRequest
+
+	for _, body := range r.signedBodies("/pre-rollback") {
 		var req hooks.PreRollbackRequest
 		if err := json.Unmarshal(body, &req); err != nil {
 			h.t.Fatalf("decode pre_rollback body %s: %v", body, err)
@@ -192,6 +238,73 @@ func (r *preRollbackReceiver) requests() []hooks.PreRollbackRequest {
 	}
 
 	return out
+}
+
+// outcomes returns the outcome events received so far for object, each checked against the HMAC,
+// in arrival order (FIFO per object) and without the redeliveries of at-least-once.
+func (r *preRollbackReceiver) outcomes(object string) []hooks.Event {
+	h := r.h
+	h.t.Helper()
+
+	var out []hooks.Event
+
+	seen := map[string]bool{}
+
+	for _, body := range r.signedBodies("/outcome") {
+		var ev hooks.Event
+		if err := json.Unmarshal(body, &ev); err != nil {
+			h.t.Fatalf("decode outcome body %s: %v", body, err)
+		}
+
+		if ev.Schema != hooks.OutcomeSchema || ev.EventID == "" {
+			h.t.Fatalf("outcome event %s has no schema or event_id", body)
+		}
+
+		if ev.Object != object || seen[ev.EventID] {
+			continue
+		}
+
+		seen[ev.EventID] = true
+		out = append(out, ev)
+	}
+
+	return out
+}
+
+// waitOutcome waits for the first outcome event of object after the first after events that
+// matches, and returns it with its index.
+func (r *preRollbackReceiver) waitOutcome(object string, after int, timeout time.Duration, desc string, match func(hooks.Event) bool) (hooks.Event, int) {
+	r.h.t.Helper()
+
+	var (
+		found hooks.Event
+		index int
+	)
+
+	r.h.WaitFor(timeout, "outcome event "+desc, func() bool {
+		events := r.outcomes(object)
+		for i := after; i < len(events); i++ {
+			if match(events[i]) {
+				found, index = events[i], i
+				return true
+			}
+		}
+
+		return false
+	})
+
+	return found, index
+}
+
+// imageIDOf returns the image ID an event reports for service, or "".
+func imageIDOf(ev hooks.Event, service string) string {
+	for _, img := range ev.Images {
+		if img.Service == service {
+			return img.ImageID
+		}
+	}
+
+	return ""
 }
 
 // storeFile returns a file of the daemon's data volume, or "" when it does not exist.
@@ -284,6 +397,10 @@ func forkRollbackBroken(greeting string) map[string]string {
 //  4. unblock puts the failure back to failed, and the next poll retries c2b with a full
 //     recreate, which fails and blocks again;
 //  5. a healthy commit (c3) deploys and removes the failure.
+//
+// Every step also checks its signed outcome event: deployed (c1, with its images), rolled_back
+// (c2, with the images of c1), rollback_blocked (c2b, decision block), unblocked (the action),
+// unblocked (c3) and deployed (c3), in this order.
 func TestForkRollback(t *testing.T) {
 	t.Parallel()
 	requireStandaloneSuite(t)
@@ -297,9 +414,12 @@ func TestForkRollback(t *testing.T) {
 
 	h.EnableAPI(forkRollbackAPIKey)
 	h.SetEnv("HOOK_PRE_ROLLBACK_URL", forkRollbackHookURL)
+	h.SetEnv("HOOK_OUTCOME_URL", forkOutcomeHookURL)
 	h.SetEnv("HOOK_SECRET", forkRollbackSecret)
 	h.Start()
 	rec.start()
+
+	object := "default/" + forkRollbackStack
 
 	// 1. c1 deploys and becomes the last good.
 	h.WaitForLog(deployCompletedLog, 120*time.Second)
@@ -319,6 +439,15 @@ func TestForkRollback(t *testing.T) {
 
 	appC1 := h.ContainerID(forkRollbackStack, "app")
 	c1ImageID, _ := h.containerImageID(appC1)
+
+	// The outbox retries until the receiver, started after the daemon, answers.
+	deployedC1, iDeployedC1 := rec.waitOutcome(object, 0, 90*time.Second, "deployed c1", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeDeployed && ev.Commit == c1
+	})
+	if imageIDOf(deployedC1, "app") != c1ImageID || imageIDOf(deployedC1, "extra") == "" || deployedC1.Trigger != "poll" ||
+		deployedC1.DocoCDVersion == "" || deployedC1.Context != "default" || deployedC1.Project != forkRollbackStack {
+		t.Fatalf("deployed c1 = %+v, want the image ID of c1 %s for app, trigger poll", deployedC1, c1ImageID)
+	}
 
 	// 2. c2 fails after its containers started; pre_rollback proceeds; c1 comes back.
 	mark := h.LogMark()
@@ -368,6 +497,15 @@ func TestForkRollback(t *testing.T) {
 		t.Fatal("the poll after the rollback recreated the containers")
 	}
 
+	rolledBack, iRolledBack := rec.waitOutcome(object, iDeployedC1+1, 60*time.Second, "rolled_back c2", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeRolledBack
+	})
+	if rolledBack.Commit != c2 || rolledBack.LastGoodCommit != c1 || rolledBack.Rollback == nil ||
+		*rolledBack.Rollback != (hooks.RollbackOut{Decision: "proceed", ToCommit: c1}) ||
+		imageIDOf(rolledBack, "app") != c1ImageID || rolledBack.Stage != "deploy" || rolledBack.Error == "" {
+		t.Fatalf("rolled_back = %+v, want c2 rolled back to c1 with the images of c1", rolledBack)
+	}
+
 	// 3. c2b fails too; pre_rollback blocks; the containers of c2b stay, also across a restart.
 	rec.setDecision("block")
 
@@ -379,6 +517,14 @@ func TestForkRollback(t *testing.T) {
 
 	if state, commit := rec.failure(); state != "blocked" || commit != c2b {
 		t.Fatalf("failure = %s/%s, want blocked/%s", state, commit, c2b)
+	}
+
+	blockedEv, iBlocked := rec.waitOutcome(object, iRolledBack+1, 60*time.Second, "rollback_blocked c2b", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeRollbackBlocked
+	})
+	if blockedEv.Commit != c2b || blockedEv.LastGoodCommit != c1 || blockedEv.Rollback == nil || blockedEv.Rollback.Decision != "block" ||
+		blockedEv.Rollback.ToCommit != "" {
+		t.Fatalf("rollback_blocked = %+v, want c2b with decision block", blockedEv)
 	}
 
 	blocked := h.ContainerID(forkRollbackStack, "app")
@@ -406,6 +552,10 @@ func TestForkRollback(t *testing.T) {
 		t.Fatalf("failure after unblock = %s/%s, want failed/%s", state, commit, c2b)
 	}
 
+	_, iUnblocked := rec.waitOutcome(object, iBlocked+1, 60*time.Second, "unblocked by the action", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeUnblocked && ev.Commit == c2b
+	})
+
 	h.WaitForLogAfter("last deployment attempt failed, retrying", mark, 60*time.Second)
 	h.WaitForContainerRecreate(forkRollbackStack, "app", blocked, 120*time.Second)
 	h.WaitForLogLineAfter(mark, 180*time.Second, forkRollbackFinished, `"state":"blocked"`)
@@ -428,4 +578,107 @@ func TestForkRollback(t *testing.T) {
 	}
 
 	h.WaitFor(30*time.Second, "lastgood ref moved to c3", func() bool { return rec.lastGoodRef() == c3.String() })
+
+	// Spec, e2e item 4: the new commit emits unblocked before it is deployed.
+	_, iUnblockedC3 := rec.waitOutcome(object, iUnblocked+1, 60*time.Second, "unblocked by c3", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeUnblocked && ev.Commit == c3.String()
+	})
+	rec.waitOutcome(object, iUnblockedC3+1, 60*time.Second, "deployed c3 after its unblocked", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeDeployed && ev.Commit == c3.String()
+	})
+}
+
+const (
+	forkOutcomeSecretStack = "e2e-fork-outcome-secret" // #nosec G101 -- a stack name, not a credential.
+	forkOutcomeSecretValue = "s3cr3t-e2e"              // #nosec G101 -- test fixture, not a real credential.
+)
+
+// TestForkOutcomeSecretNotLeaked covers the risk the spec names for secrets in error messages: a
+// compose file whose render fails (a required variable is missing) after an external secret was
+// resolved with a known value. The deploy fails, and the value is in none of the daemon log, the
+// commit status, the outcome event failed and the fork store (<data>/fork, failures included).
+//
+// The receiver is also the webhook secret store and, with GIT_SCM_PROVIDER=gitea and
+// GIT_SCM_API_URL on it, the commit status API.
+func TestForkOutcomeSecretNotLeaked(t *testing.T) {
+	t.Parallel()
+	requireStandaloneSuite(t)
+
+	h := NewHarness(t, "fork-outcome-secret")
+	if h.isSwarmMode() {
+		t.Skip("rollback is Compose only: a Swarm target with rollback is denied by the policy")
+	}
+
+	rec := h.newPreRollbackReceiver("proceed")
+	if err := os.WriteFile(filepath.Join(rec.dir, "secret"), []byte(forkOutcomeSecretValue+"\n"), 0o644); err != nil { //nolint:gosec // read by the sidecar
+		t.Fatalf("write secret: %v", err)
+	}
+
+	h.SetEnv("HOOK_OUTCOME_URL", forkOutcomeHookURL)
+	h.SetEnv("HOOK_SECRET", forkRollbackSecret)
+	h.SetEnv("SECRET_PROVIDER", "webhook")
+	h.SetEnv("SECRET_PROVIDER_WEBHOOK_STORES", "stores:\n  e2e:\n    version: v1\n"+
+		"    url: \"http://127.0.0.1:8090/secret/{{ .remote_ref.key }}\"\n    json_path: value\n")
+	h.SetEnv("GIT_COMMIT_STATUS", "true")
+	h.SetEnv("GIT_SCM_PROVIDER", "gitea")
+	h.SetEnv("GIT_SCM_API_URL", "http://127.0.0.1:8090")
+	h.SetEnv("GIT_ACCESS_TOKEN", "e2e-commit-status-token")
+	h.Start()
+	rec.start()
+
+	object := "default/" + forkOutcomeSecretStack
+
+	// Polls before the receiver is up fail to resolve the secret; the first one after it renders.
+	failed, _ := rec.waitOutcome(object, 0, 180*time.Second, "failed on the render error", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeFailed && strings.Contains(ev.Error, "E2E_REQUIRED")
+	})
+	// A first deploy (no containers yet) renders in the deploy stage, a later one in pre-deploy;
+	// from the deploy stage on the failure is also recorded in the fork store, checked below.
+	switch failed.Stage {
+	case "pre-deploy":
+	case "deploy":
+		if f := rec.storeFile("/data/fork/failures/default/" + forkOutcomeSecretStack + ".json"); !strings.Contains(f, "E2E_REQUIRED") {
+			t.Fatalf("failure record %q, want the render error of the deploy stage", f)
+		}
+	default:
+		t.Fatalf("failed = %+v, want the pre-deploy or deploy stage", failed)
+	}
+
+	// The secret was resolved, and the failure commit status of that run was posted.
+	var resolved, statuses int
+
+	h.WaitFor(60*time.Second, "secret resolved and failure commit status posted", func() bool {
+		resolved, statuses = 0, 0
+
+		for _, req := range rec.recorded() {
+			switch {
+			case strings.HasPrefix(req.Path, "/secret/"):
+				resolved++
+			case strings.Contains(req.Path, "/statuses/") &&
+				(bytes.Contains(req.Body, []byte(`"state":"error"`)) || bytes.Contains(req.Body, []byte(`"state":"failure"`))):
+				statuses++
+			}
+		}
+
+		return resolved > 0 && statuses > 0
+	})
+
+	if h.ContainerID(forkOutcomeSecretStack, "app") != "" {
+		t.Fatal("a deploy that does not render must create nothing")
+	}
+
+	for _, req := range rec.recorded() {
+		if bytes.Contains(req.Body, []byte(forkOutcomeSecretValue)) {
+			t.Errorf("request to %s carries the secret: %s", req.Path, req.Body)
+		}
+	}
+
+	if strings.Contains(h.daemonLogs(), forkOutcomeSecretValue) {
+		t.Error("the daemon log carries the secret")
+	}
+
+	grep := "grep -rl " + forkOutcomeSecretValue + " /data/fork 2>/dev/null || true"
+	if leaked := strings.TrimSpace(h.ExecOutput(rec.sidecar.GetContainerID(), "sh", "-c", grep)); leaked != "" {
+		t.Errorf("the fork store carries the secret in %s", leaked)
+	}
 }

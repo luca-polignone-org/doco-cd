@@ -26,7 +26,7 @@ func projectActions(cfg *app.Config) []any {
 }
 
 // unblockProject puts a blocked target back to failed with the same commit (stages.UnblockTarget),
-// so the next poll retries it. 409 when the target is not blocked.
+// so the next poll retries it; UnblockTarget emits unblocked. 409 when the target is not blocked.
 func (h *Handler) unblockProject(w http.ResponseWriter, r *http.Request, jobLog *slog.Logger, jobID, contextName, projectName string) {
 	if !requireMethod(w, jobLog, r, http.MethodPost) {
 		return

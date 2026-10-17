@@ -5,10 +5,13 @@ package e2e
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/moby/moby/client"
+
+	"github.com/kimdre/doco-cd/internal/hooks"
 )
 
 // forkPolicyStack is the stack of the fork-compose-policy scenario.
@@ -37,7 +40,8 @@ func (h *Harness) projectContainerCount(project string) int {
 
 // TestForkComposePolicy covers the fork compose policy (COMPOSE_POLICY_FILE) in two phases on
 // one harness: a first deploy with a privileged service is denied in pre-deploy without creating
-// any container, then the same target with a clean compose file deploys.
+// any container, then the same target with a clean compose file deploys. The denial is one signed
+// policy_denied outcome event with the privileged violation, although two polls denied the commit.
 func TestForkComposePolicy(t *testing.T) {
 	t.Parallel()
 	requireStandaloneSuite(t)
@@ -55,9 +59,14 @@ func TestForkComposePolicy(t *testing.T) {
 		t.Fatalf("write compose policy: %v", err)
 	}
 
+	rec := h.newPreRollbackReceiver("proceed")
+
 	h.BindDaemonFile(policyPath, "/config/compose-policy.yaml")
 	h.SetEnv("COMPOSE_POLICY_FILE", "/config/compose-policy.yaml")
+	h.SetEnv("HOOK_OUTCOME_URL", forkOutcomeHookURL)
+	h.SetEnv("HOOK_SECRET", forkRollbackSecret)
 	h.Start()
+	rec.start()
 
 	// Phase 1: privileged service, denied before any mutation.
 	h.WaitForLog("deployment denied by policy", 120*time.Second)
@@ -83,5 +92,24 @@ func TestForkComposePolicy(t *testing.T) {
 
 	if h.ContainerID(forkPolicyStack, "app") == "" {
 		t.Fatal("app container must run after the clean deploy")
+	}
+
+	// Delivery is FIFO per object: once deployed arrived, every earlier event of the target did.
+	object := "default/" + forkPolicyStack
+	_, iDeployed := rec.waitOutcome(object, 0, 90*time.Second, "deployed after the clean commit", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeDeployed
+	})
+
+	var denials []hooks.Event
+
+	for _, ev := range rec.outcomes(object)[:iDeployed] {
+		if ev.Outcome == hooks.OutcomePolicyDenied {
+			denials = append(denials, ev)
+		}
+	}
+
+	want := []hooks.ViolationOut{{Service: "app", Field: "privileged", Value: "true"}}
+	if len(denials) != 1 || !reflect.DeepEqual(denials[0].Violations, want) || denials[0].Stage != "pre-deploy" {
+		t.Fatalf("policy_denied events = %+v, want one with %+v", denials, want)
 	}
 }

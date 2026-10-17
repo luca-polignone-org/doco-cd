@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"net/url"
 	"path"
 	"strings"
 	"time"
@@ -127,6 +128,10 @@ type Config struct {
 	JWTGroupsClaim                string                 `env:"JWT_GROUPS_CLAIM,notEmpty" envDefault:"groups"`                                                   // JWTGroupsClaim is the claim that carries the groups
 	APIKeyEnabled                 bool                   `env:"API_KEY_ENABLED,notEmpty" envDefault:"true"`                                                      // APIKeyEnabled=false rejects the x-api-key header
 	RBACPolicyFile                string                 `env:"RBAC_POLICY_FILE"`                                                                                // RBACPolicyFile is the path of the RBAC policy CSV (reloaded when its mtime changes)
+	HookPreRollbackURL            string                 `env:"HOOK_PRE_ROLLBACK_URL"`                                                                           // HookPreRollbackURL receives the veto request before a rollback (fork)
+	HookOutcomeURL                string                 `env:"HOOK_OUTCOME_URL"`                                                                                // HookOutcomeURL receives the outcome events from the outbox (fork)
+	HookSecret                    string                 `env:"HOOK_SECRET"`                                                                                     // #nosec G117 -- HookSecret signs the hooks with HMAC-SHA256
+	HookSecretFile                string                 `env:"HOOK_SECRET_FILE,file"`                                                                           // HookSecretFile is the file containing the HookSecret
 }
 
 // GetConfig returns the app Config.
@@ -146,6 +151,7 @@ func GetConfig() (*Config, error) {
 		{EnvName: "SSH_PRIVATE_KEY_PASSPHRASE", EnvValue: &cfg.SSHPrivateKeyPassphrase, FileValue: &cfg.SSHPrivateKeyPassphraseFile, AllowUnset: true},
 		{EnvName: "WEBHOOK_SECRET", EnvValue: &cfg.WebhookSecret, FileValue: &cfg.WebhookSecretFile, AllowUnset: true},
 		{EnvName: "SOURCE_URL_REWRITES", EnvValue: &cfg.SourceURLRewritesYAML, FileValue: &cfg.SourceURLRewritesFile, AllowUnset: true},
+		{EnvName: "HOOK_SECRET", EnvValue: &cfg.HookSecret, FileValue: &cfg.HookSecretFile, AllowUnset: true},
 	}
 
 	err := config.ParseConfigFromEnv(&cfg, &mappings)
@@ -158,6 +164,11 @@ func GetConfig() (*Config, error) {
 	}
 
 	err = cfg.validateForkAuth()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cfg.validateForkHooks()
 	if err != nil {
 		return nil, err
 	}
@@ -433,6 +444,31 @@ func (cfg *Config) validateForkAuth() error {
 
 	if cfg.RBACPolicyFile != "" && !cfg.APIKeyEnabled && cfg.JWTJWKSURL == "" {
 		return errors.New("RBAC_POLICY_FILE with API_KEY_ENABLED=false requires JWT_JWKS_URL")
+	}
+
+	return nil
+}
+
+// validateForkHooks requires a secret whenever a hook URL is set (an unsigned
+// hook cannot be authenticated by the receiver) and restricts the URLs to http(s).
+// The URLs are deliberately not echoed in the errors: they may carry credentials.
+func (cfg *Config) validateForkHooks() error {
+	if (cfg.HookPreRollbackURL != "" || cfg.HookOutcomeURL != "") && cfg.HookSecret == "" {
+		return errors.New("HOOK_PRE_ROLLBACK_URL and HOOK_OUTCOME_URL require HOOK_SECRET or HOOK_SECRET_FILE")
+	}
+
+	for _, h := range []struct{ name, raw string }{
+		{"HOOK_PRE_ROLLBACK_URL", cfg.HookPreRollbackURL},
+		{"HOOK_OUTCOME_URL", cfg.HookOutcomeURL},
+	} {
+		if h.raw == "" {
+			continue
+		}
+
+		u, err := url.Parse(h.raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("%s must be an http or https URL", h.name)
+		}
 	}
 
 	return nil

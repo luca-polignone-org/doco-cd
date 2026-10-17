@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# The cron and a manual dispatch would race on the same branch push.
+concurrency:
+  group: upstream-merge
+  cancel-in-progress: false
+
 jobs:
   merge:
     if: github.repository == 'luca-polignone-org/doco-cd'

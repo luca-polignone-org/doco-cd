@@ -21,6 +21,7 @@ import (
 	"github.com/moby/moby/client"
 	"go.yaml.in/yaml/v4"
 
+	"github.com/kimdre/doco-cd/internal/commitstatus"
 	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
@@ -440,17 +441,42 @@ var forkTargetLocks sync.Map
 // before and around RunStages) -> fork target lock -> lock.LockStack (taken inside DeployStack).
 // The holder of the target lock never waits for a limiter, and nothing takes the target lock
 // while holding LockStack, so the order cannot deadlock.
+//
+// A cancelled context always fails with errForkTargetWait, even when the lock was free or freed at
+// the same moment (select picks at random between ready cases): a cancelled waiter never proceeds.
 func lockForkTarget(ctx context.Context, object string) (func(), error) {
 	v, _ := forkTargetLocks.LoadOrStore(object, make(chan struct{}, 1))
 	ch, _ := v.(chan struct{})
 
 	select {
 	case ch <- struct{}{}:
-		return func() { <-ch }, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("wait for target %s: %w", object, ctx.Err())
+	default:
+		forkTargetWaiting(object)
+
+		select {
+		case ch <- struct{}{}:
+		case <-ctx.Done():
+			return nil, fmt.Errorf("%w for %s: %w", errForkTargetWait, object, ctx.Err())
+		}
 	}
+
+	if err := ctx.Err(); err != nil {
+		<-ch
+
+		return nil, fmt.Errorf("%w for %s: %w", errForkTargetWait, object, err)
+	}
+
+	return func() { <-ch }, nil
 }
+
+// errForkTargetWait marks a job that gave up waiting for the fork target lock. It touched
+// nothing, so handleStageFailure records no failure for it: the record belongs to the job that
+// holds the lock, which may have just written rolled_back or blocked.
+var errForkTargetWait = errors.New("wait for the fork target lock interrupted")
+
+// forkTargetWaiting is called when lockForkTarget has to wait; tests hook it to know a job is
+// queued behind another one.
+var forkTargetWaiting = func(string) {}
 
 // runForkDeployStage is the deploy stage of the deploy stage order. For a target with rollback
 // enabled it takes the fork target lock, held until RunStages returns (releaseForkTarget), so
@@ -467,6 +493,14 @@ func (s *StageManager) runForkDeployStage(ctx context.Context, stageLog *slog.Lo
 		s.forkTargetUnlock = unlock
 
 		if s.rollbackPoisoned(strings.TrimSpace(s.Repository.Revision), stageLog) {
+			// Pre-deploy passed, so this job already posted its per-stack "In Progress" status:
+			// close it as skipped, as the webhook skip path does. Upstream has no notification for
+			// a skip, so the "started" notification has no terminal counterpart to send.
+			if s.inProgressPosted {
+				s.PostCommitStatusWithOutcome(ctx, commitstatus.StateSuccess,
+					"Skipped: "+SkipReasonRolledBack, commitstatus.OutcomeSkipped)
+			}
+
 			return skipDeployment(SkipReasonRolledBack, "use a new commit or the unblock action")
 		}
 	}

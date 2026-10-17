@@ -235,6 +235,14 @@ func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageNa
 		return err
 	}
 
+	// Fork: a job that gave up waiting for the fork target lock deployed nothing, and must not
+	// overwrite the failure record of the job holding the lock.
+	if errors.Is(err, errForkTargetWait) {
+		stageLog.Debug("gave up waiting for the fork target lock", slog.String("reason", err.Error()))
+
+		return err
+	}
+
 	s.recordDeploymentFailure(stageName, err)
 
 	if lifecycle.IsCanceled(err) {

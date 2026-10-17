@@ -3,6 +3,7 @@ package stages
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -933,12 +934,94 @@ func TestLockForkTarget(t *testing.T) {
 
 	unlock()
 
+	// A cancelled context fails even on a free lock, and leaves it free.
+	if _, err = lockForkTarget(ctx, "default/lock-test"); !errors.Is(err, errForkTargetWait) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock with a cancelled context = %v", err)
+	}
+
 	again, err := lockForkTarget(t.Context(), "default/lock-test")
 	if err != nil {
 		t.Fatalf("lock after unlock: %v", err)
 	}
 
 	again()
+}
+
+// A job whose wait for the target lock is cancelled must not overwrite the sticky state the
+// holder wrote: nothing is recorded for it, on disk or in memory.
+func TestCanceledLockWaitKeepsHolderState(t *testing.T) {
+	b, data := newForkFailureManager(t, &deploy.RollbackConfig{Enabled: true})
+	b.Stages = &Stages{Deploy: &DeployStageData{}}
+	b.Repository.Revision = "c2"
+
+	putDiskFailure(t, b, rollback.Failure{Object: "default/web", CommitSHA: "c2", Stage: "deploy", State: rollback.StateBlocked, Decision: "block"})
+
+	unlock, err := lockForkTarget(t.Context(), "default/web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err = b.handleStageFailure(ctx, StageDeploy, b.Log, b.runForkDeployStage(ctx, b.Log))
+	if !errors.Is(err, errForkTargetWait) {
+		t.Fatalf("handleStageFailure() error = %v, want the lock wait error", err)
+	}
+
+	if f, _, _ := rollback.StoreFor(data).GetFailure("default/web"); f.State != rollback.StateBlocked || f.Decision != "block" {
+		t.Fatalf("failure %+v, want the holder's blocked record", f)
+	}
+
+	if _, ok := docker.GetDeploymentFailure("org/repo", "web"); ok {
+		t.Fatal("the cancelled waiter recorded a failure in memory")
+	}
+}
+
+// A job that skips in the deploy stage closes its per-stack "In Progress" status as skipped.
+func TestRunForkDeployStageSkipClosesInProgressStatus(t *testing.T) {
+	var states []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			var body struct {
+				State       string `json:"state"`
+				Description string `json:"description"`
+			}
+
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			states = append(states, body.State+"|"+body.Description)
+		}
+
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "{}")
+	}))
+	t.Cleanup(server.Close)
+
+	sm, _ := newForkFailureManager(t, &deploy.RollbackConfig{Enabled: true})
+	sm.AppConfig.GitCommitStatus = true
+	sm.AppConfig.GitScmProvider = "github"
+	sm.AppConfig.GitScmApiUrl = config.HttpUrl(server.URL)
+	sm.AppConfig.GitAccessToken = "test-token"
+	// Not github.com: the provider then posts to GitScmApiUrl (GitHub Enterprise), the test server.
+	sm.Repository.SourceUrl = "https://git.example.com/owner/repo"
+	sm.Repository.Revision = "deadbeef"
+	sm.inProgressPosted = true
+
+	putDiskFailure(t, sm, rollback.Failure{Object: "default/web", CommitSHA: "deadbeef", Stage: "deploy", State: rollback.StateRolledBack})
+
+	err := sm.runForkDeployStage(t.Context(), sm.Log)
+	sm.releaseForkTarget()
+
+	var skip *SkipError
+	if !errors.As(err, &skip) || skip.Reason != SkipReasonRolledBack {
+		t.Fatalf("runForkDeployStage() error = %v, want the rolled back skip", err)
+	}
+
+	if len(states) != 1 || !strings.HasPrefix(states[0], "success|Skipped: ") {
+		t.Fatalf("posted statuses %q, want one terminal skipped status", states)
+	}
 }
 
 func TestRunForkDeployStage(t *testing.T) {
@@ -1069,16 +1152,22 @@ func TestConcurrentJobWaitsForRollbackAndSkipsPoisonedCommit(t *testing.T) {
 	b.Repository = &RepositoryData{Source: config.SourceTypeGit, Name: a.Repository.Name, Revision: "failed-commit"}
 	b.Stages = &Stages{Deploy: &DeployStageData{}}
 
+	waiting := make(chan struct{})
+
+	forkTargetWaiting = func(object string) {
+		if object == "default/web" {
+			close(waiting)
+		}
+	}
+
+	t.Cleanup(func() { forkTargetWaiting = func(string) {} })
+
 	bErr := make(chan error, 1)
 
 	go func() { bErr <- b.runForkDeployStage(t.Context(), b.Log) }()
 
-	select {
-	case err := <-bErr:
-		t.Fatalf("job B left its deploy stage while A was rolling back: %v", err)
-	default:
-	}
-
+	// B is queued on the target lock while A is still inside its rollback.
+	<-waiting
 	close(release)
 	<-aDone
 

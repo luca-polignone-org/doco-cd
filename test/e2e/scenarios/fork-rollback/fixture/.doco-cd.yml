@@ -1,0 +1,9 @@
+name: e2e-fork-rollback
+working_dir: deploy
+rollback:
+  enabled: true
+  timeout: 2m
+  pre_rollback_timeout: 10s
+environment:
+  # the scenario flips it to 1 to break a deploy after its containers started
+  HOOK_EXIT: "0"

@@ -38,15 +38,9 @@ func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger
 		}
 	}
 
-	latestCommit := strings.TrimSpace(s.Repository.Revision)
-	if s.Repository.Source != config.SourceTypeOCI {
-		latestCommit = s.DeployState.latestCommit
-		if latestCommit == "" {
-			latestCommit, err = s.latestCommitFromMirror()
-			if err != nil {
-				return fmt.Errorf("failed to get latest commit: %w", err)
-			}
-		}
+	latestCommit, err := s.deployedCommit()
+	if err != nil {
+		return fmt.Errorf("failed to get latest commit: %w", err)
 	}
 
 	s.DeployConfig.Internal.ConfigSourceRevision = s.Repository.ConfigRevision
@@ -87,7 +81,23 @@ func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger
 		return fmt.Errorf("failed to deploy stack %s: %w", s.DeployConfig.Name, err)
 	}
 
+	s.forkDeployedCommit = latestCommit
+
 	return nil
+}
+
+// deployedCommit is the commit the deploy stamps on the labels: the published revision
+// for OCI, the resolved one for git.
+func (s *StageManager) deployedCommit() (string, error) {
+	latestCommit := strings.TrimSpace(s.Repository.Revision)
+	if s.Repository.Source != config.SourceTypeOCI {
+		latestCommit = s.DeployState.latestCommit
+		if latestCommit == "" {
+			return s.latestCommitFromMirror()
+		}
+	}
+
+	return latestCommit, nil
 }
 
 func sourceURLForLabels(repository *RepositoryData) string {

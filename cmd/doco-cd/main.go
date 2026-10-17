@@ -25,6 +25,7 @@ import (
 
 	"github.com/kimdre/doco-cd/internal/git/ssh"
 	"github.com/kimdre/doco-cd/internal/graceful"
+	"github.com/kimdre/doco-cd/internal/hooks"
 
 	"github.com/kimdre/doco-cd/internal/reconciliation"
 	"github.com/kimdre/doco-cd/internal/source"
@@ -243,6 +244,12 @@ func run() error {
 	}
 
 	stages.SetRBAC(enforcer)
+
+	// Fork: pre_rollback veto of the rollback flow (internal/stages/fork_rollback.go). Without
+	// HOOK_PRE_ROLLBACK_URL every rollback decides unconfigured, hence blocked.
+	if c.HookPreRollbackURL != "" {
+		stages.SetPreRollback(&hooks.PreRollbackClient{URL: c.HookPreRollbackURL, Signer: hooks.Signer{Secret: []byte(c.HookSecret)}})
+	}
 
 	// Log if proxy is used
 	if c.HttpProxy != (transport.ProxyOptions{}) {

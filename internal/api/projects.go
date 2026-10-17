@@ -215,6 +215,13 @@ func (h *Handler) ProjectActionApiHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// Fork: unblock exists only with HOOK_PRE_ROLLBACK_URL set; otherwise it stays the upstream invalid action.
+	if action == unblockAction && h.appConfig.HookPreRollbackURL != "" {
+		h.unblockProject(w, r, jobLog, jobID, contextName, projectName)
+
+		return
+	}
+
 	serviceName := r.URL.Query().Get("service")
 
 	operation, err := controlplane.ResolveProjectAction(ctx, dockerCli, projectName, action, controlplane.ProjectActionOptions{

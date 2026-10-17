@@ -345,6 +345,13 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	// The commit/hash labels then lie (compose stamps them before hooks and
 	// later stages run), so the skip checks below must not trust them (#1702).
 	lastFailure, retryAfterFailure := s.lastDeploymentFailure()
+
+	// Fork: a commit that ended rolled_back, blocked or rollback_failed is not redeployed, not
+	// even after a restart; a new commit or the unblock action releases it.
+	if s.rollbackPoisoned(strings.TrimSpace(s.Repository.Revision), stageLog) {
+		return skipDeployment(SkipReasonRolledBack, "use a new commit or the unblock action")
+	}
+
 	if retryAfterFailure {
 		stageLog.Warn("last deployment attempt failed, retrying",
 			slog.String("failed_stage", lastFailure.Stage),

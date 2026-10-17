@@ -55,6 +55,8 @@ func (f *File) targetFor(object string) (TargetPolicy, bool) {
 		tp.SecretAllowlist = f.Default.SecretAllowlist
 	}
 
+	tp.Logging = f.Default.Logging
+
 	return tp, true
 }
 
@@ -253,6 +255,8 @@ func checkService(p *types.Project, svc types.ServiceConfig, pc pathChecker, tp 
 			v("networks", name)
 		}
 	}
+
+	out = append(out, checkLogging(svc, tp.Logging)...)
 
 	if svc.CgroupParent != "" {
 		v("cgroup_parent", svc.CgroupParent)

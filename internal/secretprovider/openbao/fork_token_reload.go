@@ -50,10 +50,15 @@ type tokenReload struct {
 	// failure is the last failure logged ("" when the last read went well): the same failure is
 	// logged once, not on every call, and the recovery is logged once.
 	failure string
+	// failedOnStat is true when that failure came from os.Stat: only then does an unchanged
+	// stamp mean the file is back. A read failure keeps the stamp, so the stamp proves nothing.
+	failedOnStat bool
 }
 
 // failLocked logs a reload failure unless it is the one already logged.
-func (r *tokenReload) failLocked(msg string, err error) {
+func (r *tokenReload) failLocked(msg string, err error, onStat bool) {
+	r.failedOnStat = onStat
+
 	key := msg
 	if err != nil {
 		key += ": " + err.Error()
@@ -79,9 +84,10 @@ func (r *tokenReload) recoveredLocked() {
 		return
 	}
 
-	r.failure = ""
+	prev := r.failure
+	r.failure, r.failedOnStat = "", false
 
-	slog.Warn("openbao token file usable again", slog.String("path", r.path))
+	slog.Warn("openbao token file usable again", slog.String("path", r.path), slog.String("previous", prev))
 }
 
 // EnableTokenReload turns on the reload of the token from path.
@@ -109,13 +115,17 @@ func (p *Provider) refreshToken() {
 
 	st, err := os.Stat(r.path)
 	if err != nil {
-		r.failLocked("openbao token file unreadable, keeping the token in use", err)
+		r.failLocked("openbao token file unreadable, keeping the token in use", err, true)
 		return
 	}
 
 	if st.Size() == r.size && st.ModTime().Equal(r.mtime) {
-		// The file in use is back (e.g. it was missing for a while).
-		r.recoveredLocked()
+		// The file in use is back after it was missing for a while; after a read failure the
+		// same stamp says nothing about the content, so stay quiet until a read succeeds.
+		if r.failedOnStat {
+			r.recoveredLocked()
+		}
+
 		return
 	}
 
@@ -140,13 +150,13 @@ func (p *Provider) forceRefresh() {
 func (p *Provider) loadTokenLocked(r *tokenReload, st os.FileInfo) {
 	data, err := os.ReadFile(r.path) // #nosec G304 -- operator-configured token file
 	if err != nil {
-		r.failLocked("openbao token file unreadable, keeping the token in use", err)
+		r.failLocked("openbao token file unreadable, keeping the token in use", err, false)
 		return
 	}
 
 	tok := strings.TrimSpace(string(data))
 	if tok == "" {
-		r.failLocked("openbao token file empty, keeping the token in use", nil)
+		r.failLocked("openbao token file empty, keeping the token in use", nil, false)
 		return
 	}
 

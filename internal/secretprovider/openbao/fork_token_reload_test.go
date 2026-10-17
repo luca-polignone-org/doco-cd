@@ -648,6 +648,10 @@ func TestTokenReloadRecoversWhenTheSameFileComesBack(t *testing.T) {
 		t.Fatalf("want one ERROR for the missing file and one recovery line:\n%s", out)
 	}
 
+	if !strings.Contains(out, "previous=") || !strings.Contains(out, "no such file or directory") {
+		t.Fatalf("the recovery line must name the previous failure:\n%s", out)
+	}
+
 	assertNoTokenInLogs(t, out, "tok-1")
 }
 
@@ -800,4 +804,51 @@ func TestTokenReloadPKICertRetriesOn403(t *testing.T) {
 	if strings.Join(paths, " ") != strings.Join(want, " ") {
 		t.Fatalf("requests = %v, want exactly %v", paths, want)
 	}
+}
+
+// TestTokenReloadUnreadableSameStampNoFalseRecovery: the file turns unreadable without changing
+// its stamp (chmod 000, an I/O error). The 403 makes forceRefresh read it and log one ERROR; the
+// next calls see the same stamp, which proves nothing after a read failure: no "usable again".
+func TestTokenReloadUnreadableSameStampNoFalseRecovery(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads a 0o000 file")
+	}
+
+	srv := &kvServer{}
+	p, path := reloadingProvider(t, srv, "tok-1")
+	logs := captureLogs(t)
+
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = os.Chmod(path, 0o000); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if err = os.Chtimes(path, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	srv.setToken("tok-2")
+
+	for range 3 {
+		if _, err = p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err == nil {
+			t.Fatal("a refused token with an unreadable file must fail")
+		}
+	}
+
+	out := logs.String()
+	if n := strings.Count(out, "level=ERROR"); n != 1 {
+		t.Fatalf("%d ERROR lines, want exactly 1:\n%s", n, out)
+	}
+
+	if n := strings.Count(out, "level=WARN"); n != 0 {
+		t.Fatalf("%d WARN lines, want none: the file is still unreadable:\n%s", n, out)
+	}
+
+	assertNoTokenInLogs(t, out, "tok-1", "tok-2")
 }

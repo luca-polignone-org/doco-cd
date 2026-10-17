@@ -65,7 +65,7 @@ type forkMCPRuns struct {
 func (f *forkMCPRuns) List(int, string, string) []controlplane.Run { return []controlplane.Run{} }
 
 func (f *forkMCPRuns) Get(jobID string) (controlplane.Run, bool) {
-	return controlplane.Run{JobID: jobID}, true
+	return controlplane.Run{JobID: jobID, Trigger: controlplane.RunTriggerPoll, Status: controlplane.RunStatusSucceeded}, true
 }
 
 func (f *forkMCPRuns) ListScheduledJobs(context.Context, string, string) ([]controlplane.ScheduledJobInfo, error) {
@@ -224,11 +224,13 @@ func (rt headerRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 // connectForkMCPClient connects to endpoint sending the header name: value on every request.
+// server.Client() returns the same *http.Client on every call, so each session gets its own
+// client around the server's transport instead of wrapping the shared one: mutating it would
+// stack the headers of earlier sessions onto later ones.
 func connectForkMCPClient(t *testing.T, server *httptest.Server, endpoint, name, value string) *sdkmcp.ClientSession {
 	t.Helper()
 
-	httpClient := server.Client()
-	httpClient.Transport = headerRoundTripper{name: name, value: value, base: httpClient.Transport}
+	httpClient := &http.Client{Transport: headerRoundTripper{name: name, value: value, base: server.Client().Transport}}
 	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "doco-cd-fork-test", Version: "test"}, nil)
 
 	session, err := client.Connect(t.Context(), &sdkmcp.StreamableClientTransport{
@@ -287,25 +289,30 @@ func TestForkMCPPrincipalReachesToolCall(t *testing.T) {
 	server := httptest.NewServer(h)
 	t.Cleanup(server.Close)
 
-	for _, testCase := range []struct {
-		name, header, value, want string
+	// Both sessions are open on the same server before any call, and the calls interleave: each
+	// tool call must see the principal of its own request, never one from an earlier request.
+	sessions := []struct {
+		session *sdkmcp.ClientSession
+		want    string
 	}{
-		{name: "bearer token", header: "Authorization", value: "Bearer team-a", want: "team-a"},
-		{name: "API key", header: restapi.KeyHeader, value: testMCPAPIKey, want: rbac.APIKeySubject},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			session := connectForkMCPClient(t, server, server.URL, testCase.header, testCase.value)
-			callMCPTool(t, session, "probe", map[string]any{})
+		{session: connectForkMCPClient(t, server, server.URL, "Authorization", "Bearer team-a"), want: "team-a"},
+		{session: connectForkMCPClient(t, server, server.URL, restapi.KeyHeader, testMCPAPIKey), want: rbac.APIKeySubject},
+		{session: connectForkMCPClient(t, server, server.URL, "Authorization", "Bearer team-b"), want: "team-b"},
+	}
+
+	for round := range 2 {
+		for _, s := range sessions {
+			callMCPTool(t, s.session, "probe", map[string]any{})
 
 			select {
 			case p := <-seen:
-				if p.Subject != testCase.want {
-					t.Fatalf("principal subject = %q, want %q", p.Subject, testCase.want)
+				if p.Subject != s.want {
+					t.Fatalf("round %d: principal subject = %q, want %q", round, p.Subject, s.want)
 				}
 			case <-time.After(time.Second):
 				t.Fatal("probe tool was not called")
 			}
-		})
+		}
 	}
 }
 

@@ -65,6 +65,7 @@ func TestPreDeploySecretAllowlist(t *testing.T) {
 
 	t.Run("denied reference never reaches the provider", func(t *testing.T) {
 		s, p := newSecretStageManager(t, map[string]string{"DB": "kv:secret:prod/other/db:PASS"})
+
 		verifiedObjects.Store("default/web", true)
 
 		err := s.RunPreDeployStage(context.Background(), s.Log)
@@ -96,6 +97,7 @@ func TestPreDeploySecretAllowlist(t *testing.T) {
 
 func TestCheckForkSecretsNoPolicy(t *testing.T) {
 	prev := composePolicy.Load()
+
 	SetComposePolicy(nil)
 	t.Cleanup(func() { SetComposePolicy(prev) })
 
@@ -228,16 +230,18 @@ func TestEveryResolveIsGated(t *testing.T) {
 	root := filepath.Join("..", "..")
 	found := map[string]int{}
 
+	// fs.WalkDir on os.DirFS keeps every read inside the repository root (no symlink escape).
+	repo := os.DirFS(root)
+
 	for _, dir := range []string{"internal", "cmd"} {
-		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d fs.DirEntry, err error) error {
+		err := fs.WalkDir(repo, dir, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return err
 			}
 
-			rel, _ := filepath.Rel(root, path)
 			if d.IsDir() {
-				if rel == filepath.Join("internal", "secretprovider") {
-					return filepath.SkipDir
+				if path == "internal/secretprovider" {
+					return fs.SkipDir
 				}
 
 				return nil
@@ -247,13 +251,13 @@ func TestEveryResolveIsGated(t *testing.T) {
 				return nil
 			}
 
-			data, err := os.ReadFile(path)
+			data, err := fs.ReadFile(repo, path)
 			if err != nil {
 				return err
 			}
 
 			if n := len(call.FindAllIndex(data, -1)); n > 0 {
-				found[filepath.ToSlash(rel)] = n
+				found[path] = n
 			}
 
 			return nil
@@ -272,7 +276,7 @@ func TestEveryResolveIsGated(t *testing.T) {
 			t.Fatalf("%s: %d secret reads, want 1: gate the new one", file, found[file])
 		}
 
-		data, err := os.ReadFile(filepath.Join(root, file))
+		data, err := fs.ReadFile(repo, file)
 		if err != nil {
 			t.Fatal(err)
 		}

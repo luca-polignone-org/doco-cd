@@ -26,6 +26,7 @@ func TestCheckForkSecretGate(t *testing.T) {
 	refs := map[string]string{"DB": "kv:secret:prod/web/db:PASS"}
 
 	ForkSecretGate = nil
+
 	if err := checkForkSecretGate(context.Background(), cfg, namedProvider{}, refs); err != nil {
 		t.Fatalf("error = %v, want nil without a gate", err)
 	}
@@ -34,7 +35,7 @@ func TestCheckForkSecretGate(t *testing.T) {
 
 	var gotObject, gotProvider string
 
-	ForkSecretGate = func(object, provider string, got map[string]string) error {
+	ForkSecretGate = func(object, provider string, _ map[string]string) error {
 		gotObject, gotProvider = object, provider
 		return errDenied
 	}
@@ -64,6 +65,7 @@ func TestCheckForkSecretGate(t *testing.T) {
 	}
 
 	ForkSecretGate = func(string, string, map[string]string) error { return nil }
+
 	if err := checkForkSecretGate(ctx, cfg, namedProvider{}, refs); err != nil {
 		t.Fatalf("error = %v, want nil when the gate allows", err)
 	}
@@ -75,6 +77,7 @@ func TestWithForkJobGateObject(t *testing.T) {
 
 	// Without the gate the client is not touched: a nil embedded command.Cli would panic.
 	ForkSecretGate = nil
+
 	if ctx := withForkJobGateObject(context.Background(), contextCli{}, "web"); ctx.Value(forkJobObjectKey{}) != nil {
 		t.Fatal("object recorded without a gate")
 	}

@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-const secretRepo = "https://github.com/o/apps"
+const allowlistRepo = "https://github.com/o/apps"
 
 func secretPolicy(t *testing.T, body string) *File {
 	t.Helper()
@@ -20,7 +20,7 @@ func secretPolicy(t *testing.T, body string) *File {
 }
 
 func worklogID() Identity {
-	return Identity{Object: "default/worklog", Repository: secretRepo, Reference: "refs/heads/main", ConfigTarget: "worklog"}
+	return Identity{Object: "default/worklog", Repository: allowlistRepo, Reference: "refs/heads/main", ConfigTarget: "worklog"}
 }
 
 const twoTargets = `version: 1
@@ -40,7 +40,7 @@ targets:
 `
 
 func TestParseSecretAllowlistPresence(t *testing.T) {
-	absent := secretPolicy(t, "version: 1\ntargets:\n  default/w:\n    repository: "+secretRepo+"\n")
+	absent := secretPolicy(t, "version: 1\ntargets:\n  default/w:\n    repository: "+allowlistRepo+"\n")
 	if absent.Default.SecretAllowlist != nil || absent.Targets["default/w"].SecretAllowlist != nil {
 		t.Fatal("an absent key must stay nil")
 	}
@@ -67,11 +67,11 @@ func TestParseSecretAllowlistPresence(t *testing.T) {
 }
 
 func TestCheckSecretsWithoutKey(t *testing.T) {
-	f := secretPolicy(t, "version: 1\ntargets:\n  default/worklog:\n    repository: "+secretRepo+"\n")
+	f := secretPolicy(t, "version: 1\ntargets:\n  default/worklog:\n    repository: "+allowlistRepo+"\n")
 	refs := map[string]string{"A": "kv:secret:prod/gymlog/db:PASS"}
 
 	// The key is absent: a bound target resolves what it names, as upstream.
-	if got := f.CheckSecrets(Identity{Object: "default/worklog", Repository: secretRepo}, "openbao", refs); got != nil {
+	if got := f.CheckSecrets(Identity{Object: "default/worklog", Repository: allowlistRepo}, "openbao", refs); got != nil {
 		t.Fatalf("CheckSecrets() = %v, want nil without the key", got)
 	}
 
@@ -100,33 +100,69 @@ func TestCheckSecrets(t *testing.T) {
 	}{
 		{"allowed", worklogID(), map[string]string{"DB": "kv:secret:prod/worklog/db:PASS"}, nil},
 		{"explicit root namespace", worklogID(), map[string]string{"DB": "kv:root:secret:prod/worklog/db:PASS"}, nil},
-		{"other app", worklogID(), map[string]string{"DB": "kv:secret:prod/gymlog/db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/gymlog/db:PASS"}}},
-		{"prefix by segment", worklogID(), map[string]string{"DB": "kv:secret:prod/worklog-old/db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog-old/db:PASS"}}},
-		{"other namespace", worklogID(), map[string]string{"DB": "kv:team:secret:prod/worklog/db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:team:secret:prod/worklog/db:PASS"}}},
-		{"dot dot", worklogID(), map[string]string{"DB": "kv:secret:prod/worklog/../gymlog:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog/../gymlog:PASS"}}},
-		{"double slash", worklogID(), map[string]string{"DB": "kv:secret:prod/worklog//db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog//db:PASS"}}},
-		{"leading slash", worklogID(), map[string]string{"DB": "kv:secret:/prod/worklog/db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:/prod/worklog/db:PASS"}}},
-		{"bad charset in key", worklogID(), map[string]string{"DB": "kv:secret:prod/worklog/db:PA$S"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog/db:PA$S"}}},
-		{"pki by prefix never", worklogID(), map[string]string{"C": "pki:pki:prod/worklog/x"},
-			[]Violation{{Field: "external_secrets.C", Value: "pki:pki:prod/worklog/x"}}},
-		{"sorted", worklogID(), map[string]string{"B": "kv:secret:x/y:k", "A": "kv:secret:x/z:k"},
-			[]Violation{{Field: "external_secrets.A", Value: "kv:secret:x/z:k"}, {Field: "external_secrets.B", Value: "kv:secret:x/y:k"}}},
-		{"default deny-all", Identity{Object: "default/gymlog", Repository: secretRepo, Reference: "refs/heads/main", ConfigTarget: "gymlog"},
+		{
+			"other app", worklogID(),
 			map[string]string{"DB": "kv:secret:prod/gymlog/db:PASS"},
-			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/gymlog/db:PASS"}}},
-		{"name of another target", Identity{Object: "default/worklog", Repository: secretRepo, Reference: "refs/heads/main", ConfigTarget: "gymlog"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/gymlog/db:PASS"}},
+		},
+		{
+			"prefix by segment", worklogID(),
+			map[string]string{"DB": "kv:secret:prod/worklog-old/db:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog-old/db:PASS"}},
+		},
+		{
+			"other namespace", worklogID(),
+			map[string]string{"DB": "kv:team:secret:prod/worklog/db:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:team:secret:prod/worklog/db:PASS"}},
+		},
+		{
+			"dot-dot segment", worklogID(),
+			map[string]string{"DB": "kv:secret:prod/worklog/../gymlog:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog/../gymlog:PASS"}},
+		},
+		{
+			"double slash", worklogID(),
+			map[string]string{"DB": "kv:secret:prod/worklog//db:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog//db:PASS"}},
+		},
+		{
+			"leading slash", worklogID(),
+			map[string]string{"DB": "kv:secret:/prod/worklog/db:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:/prod/worklog/db:PASS"}},
+		},
+		{
+			"bad charset in key", worklogID(),
+			map[string]string{"DB": "kv:secret:prod/worklog/db:PA$S"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/worklog/db:PA$S"}},
+		},
+		{
+			"pki by prefix never", worklogID(),
+			map[string]string{"C": "pki:pki:prod/worklog/x"},
+			[]Violation{{Field: "external_secrets.C", Value: "pki:pki:prod/worklog/x"}},
+		},
+		{
+			"sorted", worklogID(),
+			map[string]string{"B": "kv:secret:x/y:k", "A": "kv:secret:x/z:k"},
+			[]Violation{{Field: "external_secrets.A", Value: "kv:secret:x/z:k"}, {Field: "external_secrets.B", Value: "kv:secret:x/y:k"}},
+		},
+		{
+			"default deny-all",
+			Identity{Object: "default/gymlog", Repository: allowlistRepo, Reference: "refs/heads/main", ConfigTarget: "gymlog"},
+			map[string]string{"DB": "kv:secret:prod/gymlog/db:PASS"},
+			[]Violation{{Field: "external_secrets.DB", Value: "kv:secret:prod/gymlog/db:PASS"}},
+		},
+		{
+			"name of another target",
+			Identity{Object: "default/worklog", Repository: allowlistRepo, Reference: "refs/heads/main", ConfigTarget: "gymlog"},
 			map[string]string{"DB": "kv:secret:prod/worklog/db:PASS"},
-			[]Violation{{Field: "target", Value: "default/worklog"}}},
-		{"target absent", Identity{Object: "default/unknown", Repository: secretRepo},
+			[]Violation{{Field: "target", Value: "default/worklog"}},
+		},
+		{
+			"target absent",
+			Identity{Object: "default/unknown", Repository: allowlistRepo},
 			map[string]string{"DB": "kv:secret:prod/worklog/db:PASS"},
-			[]Violation{{Field: "target", Value: "default/unknown"}}},
+			[]Violation{{Field: "target", Value: "default/unknown"}},
+		},
 		{"no refs", Identity{Object: "default/unknown"}, nil, nil},
 	}
 
@@ -148,7 +184,7 @@ targets:
       - pki-role:pki:worklog-role:worklog.example.com
       - kv:secret:prod/worklog/
 `)
-	id := Identity{Object: "default/worklog", Repository: secretRepo}
+	id := Identity{Object: "default/worklog", Repository: allowlistRepo}
 
 	if got := f.CheckSecrets(id, "openbao", map[string]string{"C": "pki-role:pki:worklog-role:worklog.example.com"}); got != nil {
 		t.Fatalf("exact pki-role entry must match, got %v", got)
@@ -167,7 +203,7 @@ targets:
     secret_allowlist:
       - "proj:prod:/worklog/"
 `)
-	id := Identity{Object: "default/worklog", Repository: secretRepo}
+	id := Identity{Object: "default/worklog", Repository: allowlistRepo}
 
 	if got := f.CheckSecrets(id, "infisical", map[string]string{"A": "proj:prod:/worklog/db"}); got != nil {
 		t.Fatalf("literal prefix must match, got %v", got)
@@ -186,8 +222,8 @@ func TestParseSecretAllowlistEdgeCases(t *testing.T) {
 
 	for name, body := range map[string]string{
 		"null through alias": "version: 1\ndefault:\n  bind_allowlist: &n null\n  secret_allowlist: *n\n",
-		"aliased key, null":  "version: 1\ndefault:\n  bind_allowlist: []\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: " + secretRepo + "\n    *k : null\n",
-		"null in a target":   "version: 1\ntargets:\n  default/w:\n    repository: " + secretRepo + "\n    secret_allowlist: null\n",
+		"aliased key, null":  "version: 1\ndefault:\n  bind_allowlist: []\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: " + allowlistRepo + "\n    *k : null\n",
+		"null in a target":   "version: 1\ntargets:\n  default/w:\n    repository: " + allowlistRepo + "\n    secret_allowlist: null\n",
 		"kv too many fields": "version: 1\ndefault:\n  secret_allowlist: [\"kv:a:b:c:d\"]\n",
 		"kv bad namespace":   "version: 1\ndefault:\n  secret_allowlist: [\"kv:t$:secret:prod/\"]\n",
 		"kv only slash":      "version: 1\ndefault:\n  secret_allowlist: [\"kv:secret:/\"]\n",
@@ -204,7 +240,7 @@ func TestParseSecretAllowlistEdgeCases(t *testing.T) {
 	}
 
 	// An aliased key with a list is a normal secret_allowlist.
-	aliased := secretPolicy(t, "version: 1\ndefault:\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: "+secretRepo+"\n    *k : [\"kv:secret:y/\"]\n")
+	aliased := secretPolicy(t, "version: 1\ndefault:\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: "+allowlistRepo+"\n    *k : [\"kv:secret:y/\"]\n")
 	if got := aliased.Targets["default/w"].SecretAllowlist; got == nil || !reflect.DeepEqual(*got, []string{"kv:secret:y/"}) {
 		t.Fatalf("aliased key entries = %v, want [kv:secret:y/]", got)
 	}
@@ -224,7 +260,7 @@ targets:
       - pki-role:pki:worklog-role:worklog.example.com
       - kv:team:secret:prod/worklog
 `)
-	id := Identity{Object: "default/worklog", Repository: secretRepo}
+	id := Identity{Object: "default/worklog", Repository: allowlistRepo}
 
 	for name, tc := range map[string]struct {
 		ref     string

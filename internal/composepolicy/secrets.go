@@ -31,7 +31,7 @@ var errSecretEntry = errors.New("invalid secret reference")
 func rejectNullSecretAllowlist(data []byte) error {
 	var root yaml.Node
 	if err := yaml.NewDecoder(bytes.NewReader(data)).Decode(&root); err != nil {
-		return nil // Parse reports the decode error itself
+		return nil //nolint:nilerr // Parse decodes the same bytes and reports this error itself
 	}
 
 	var walk func(n *yaml.Node) error

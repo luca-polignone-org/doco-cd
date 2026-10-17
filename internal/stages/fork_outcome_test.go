@@ -483,11 +483,16 @@ func TestEmitUnblocked(t *testing.T) {
 	}
 }
 
-// An enqueue error is logged and never reaches the caller.
+// An enqueue error is logged and never reaches the caller. The outbox directory is replaced by a
+// regular file, so writing the event under it fails with ENOTDIR whatever the uid.
 func TestEmitOutcomeEnqueueError(t *testing.T) {
 	dir := startTestOutbox(t)
 
 	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(dir, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 

@@ -221,34 +221,41 @@ func dropped(reason string) float64 {
 	return testutil.ToFloat64(outcomeDropped.WithLabelValues(reason))
 }
 
-func gathered(t *testing.T, name string) bool {
+// useTestRegistry points the registration at a fresh registry with a fresh Once. On cleanup
+// it restores the default registerer and leaves the Once spent, so later NewOutbox calls in
+// the same process (other tests, -count=N) never register on the default registry, where an
+// earlier run may already have registered the collectors.
+func useTestRegistry(t *testing.T) *prometheus.Registry {
 	t.Helper()
 
-	families, err := prometheus.DefaultGatherer.Gather()
-	if err != nil {
-		t.Fatalf("gather: %v", err)
-	}
+	reg := prometheus.NewRegistry()
+	registerer, registerMetricsOnce = reg, &sync.Once{}
 
-	for _, f := range families {
-		if f.GetName() == name {
-			return true
-		}
-	}
+	t.Cleanup(func() {
+		registerer, registerMetricsOnce = prometheus.DefaultRegisterer, &sync.Once{}
+		registerMetricsOnce.Do(func() {})
+	})
 
-	return false
+	return reg
 }
 
-// This test must stay the first one of the package to call NewOutbox: it checks that the
-// metrics are not registered before.
 func TestOutboxMetricsRegisteredByNewOutbox(t *testing.T) {
-	if gathered(t, "doco_cd_outcome_queue_depth") {
-		t.Fatal("outcome metrics are registered before NewOutbox")
+	reg := useTestRegistry(t)
+
+	families, err := reg.Gather()
+	if err != nil || len(families) != 0 {
+		t.Fatalf("fresh registry not empty before NewOutbox: %d families, %v", len(families), err)
 	}
 
 	newTestOutbox(t, t.TempDir(), "http://127.0.0.1:1", nil)
 
-	if !gathered(t, "doco_cd_outcome_queue_depth") {
-		t.Error("doco_cd_outcome_queue_depth is not registered after NewOutbox")
+	for name, c := range map[string]prometheus.Collector{
+		"queue_depth": outcomeQueueDepth, "delivered_total": outcomeDelivered, "dropped_total": outcomeDropped,
+	} {
+		var already prometheus.AlreadyRegisteredError
+		if err := reg.Register(c); !errors.As(err, &already) {
+			t.Errorf("%s is not registered after NewOutbox (Register returned %v)", name, err)
+		}
 	}
 
 	// A second outbox must not register them again (MustRegister would panic).
@@ -724,14 +731,19 @@ func TestOutboxCorruptFilesGoToDead(t *testing.T) {
 	writeEntry(t, dir, entry{Version: 1, Event: testEvent("good", "default/app"), Object: "default/app", FirstEnqueued: outboxT0})
 	writeEntry(t, dir, entry{Version: 2, Event: testEvent("future", "default/app"), Object: "default/app"})
 
-	for name, content := range map[string]string{"garbage.json": "{not json", "noid.json": `{"version":1}`, "notes.txt": "x"} {
+	for name, content := range map[string]string{
+		"garbage.json": "{not json", "noid.json": `{"version":1}`, "notes.txt": "x",
+		".tmp-123": `{"version":1,"ev`, ".tmp-456.json": `{"version":1}`,
+	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if err := os.Mkdir(filepath.Join(dir, "subdir.json"), 0o700); err != nil {
-		t.Fatal(err)
+	for _, sub := range []string{"subdir.json", ".tmp-dir"} {
+		if err := os.Mkdir(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	before := dropped("corrupt")
@@ -750,6 +762,16 @@ func TestOutboxCorruptFilesGoToDead(t *testing.T) {
 
 	if !exists(filepath.Join(dir, "notes.txt")) || !exists(filepath.Join(dir, "subdir.json")) {
 		t.Error("files that are not events must be left alone")
+	}
+
+	if !exists(filepath.Join(dir, ".tmp-dir")) {
+		t.Error("a directory named .tmp-* is not a temporary file and must be left alone")
+	}
+
+	for _, name := range []string{".tmp-123", ".tmp-456.json"} {
+		if exists(filepath.Join(dir, name)) || exists(filepath.Join(dir, "dead", name)) {
+			t.Errorf("leftover temporary %s was not deleted", name)
+		}
 	}
 
 	if d := dropped("corrupt") - before; d != 3 {

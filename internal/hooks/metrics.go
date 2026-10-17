@@ -30,11 +30,15 @@ var (
 		Help:      "Outcome events dropped by reason.",
 	}, []string{"reason"})
 
-	registerMetricsOnce sync.Once
+	// registerer is where NewOutbox registers the collectors; tests swap it for a fresh
+	// registry so that they do not depend on what earlier tests left in the default one.
+	registerer prometheus.Registerer = prometheus.DefaultRegisterer
+	// registerMetricsOnce makes a second NewOutbox a no-op instead of a MustRegister panic.
+	registerMetricsOnce = &sync.Once{}
 )
 
 func registerMetrics() {
 	registerMetricsOnce.Do(func() {
-		prometheus.MustRegister(outcomeQueueDepth, outcomeDelivered, outcomeDropped)
+		registerer.MustRegister(outcomeQueueDepth, outcomeDelivered, outcomeDropped)
 	})
 }

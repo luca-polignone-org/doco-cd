@@ -147,7 +147,9 @@ func (o *Outbox) deadPath(name string) string {
 }
 
 // load queues again the events left by a previous run; an unreadable file goes to dead/
-// and does not stop the others.
+// and does not stop the others. Leftover AtomicWriteFile temporaries (.tmp-*) are partial
+// writes interrupted by a crash, never a complete event, and are deleted: load runs before
+// any Enqueue or worker, so none of them belongs to a write in progress.
 func (o *Outbox) load() error {
 	items, err := readDir(o.cfg.Dir)
 	if err != nil {
@@ -155,11 +157,20 @@ func (o *Outbox) load() error {
 	}
 
 	for _, it := range items {
-		if it.IsDir() || !strings.HasSuffix(it.Name(), ".json") {
+		if it.IsDir() {
 			continue
 		}
 
 		full := filepath.Join(o.cfg.Dir, it.Name())
+
+		if strings.HasPrefix(it.Name(), ".tmp-") {
+			_ = os.Remove(full)
+			continue
+		}
+
+		if !strings.HasSuffix(it.Name(), ".json") {
+			continue
+		}
 
 		var e entry
 

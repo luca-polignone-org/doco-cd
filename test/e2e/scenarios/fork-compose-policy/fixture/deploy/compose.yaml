@@ -1,0 +1,6 @@
+services:
+  app:
+    image: alpine:3.22
+    command: ["sleep", "600"]
+    # v1 is denied by the compose policy on purpose, the scenario removes this line
+    privileged: true

@@ -57,6 +57,7 @@ type Harness struct {
 	volumes      []string
 	extraStacks  []string
 	env          map[string]string
+	extraBinds   []string // fork: extra "host:container" binds of the daemon, see BindDaemonFile
 
 	// preCommitHook runs after the fixture is copied into the worktree but
 	// before the initial commit, for scenarios that need to inject a value
@@ -459,6 +460,8 @@ func (h *Harness) startDaemon(pollConfigPath string) {
 				if h.contextConfigDir != "" {
 					hc.Binds = append(hc.Binds, h.contextConfigDir+":/root/.docker:ro")
 				}
+
+				hc.Binds = append(hc.Binds, h.extraBinds...)
 			},
 			WaitingFor: wait.ForExec([]string{"/healthcheck"}).
 				WithStartupTimeout(60 * time.Second).

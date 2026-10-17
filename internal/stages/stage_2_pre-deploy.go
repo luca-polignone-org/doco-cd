@@ -811,6 +811,11 @@ func (s *StageManager) loadComposeProjectHash(ctx context.Context) (string, erro
 		return "", fmt.Errorf("failed to load compose project: %w", err)
 	}
 
+	// Fork: the policies apply to the resolved project, before any mutation.
+	if err = s.checkForkPolicies(ctx); err != nil {
+		return "", err
+	}
+
 	// pki-role external secrets issue a fresh certificate on every resolution.
 	// Hash their references instead of the resolved values to avoid redeploying
 	// solely because an unchanged role issued a fresh certificate.

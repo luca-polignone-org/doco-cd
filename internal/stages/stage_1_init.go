@@ -69,6 +69,9 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		s.Stages.Init.FinishedAt = time.Now()
 	}()
 
+	// Fork: the loaders below consume these lists, the compose policy checks them as declared.
+	s.forkDeclared = declaredFilesOf(s.DeployConfig)
+
 	if s.JobTrigger == JobTriggerWebhook {
 		// Skip deployment if the webhook event does not match the filter
 		if s.DeployConfig.WebhookEventFilter != "" {

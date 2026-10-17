@@ -25,7 +25,7 @@ var secretSegment = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 
 var errSecretEntry = errors.New("invalid secret reference")
 
-// rejectNullSecretAllowlist refuses secret_allowlist: null or ~ (also through an alias) anywhere
+// rejectNullSecretAllowlist refuses secret_allowlist: null or ~ (key or value also through an alias) anywhere
 // in the file: decoded into *[]string it would read as an absent key, turning a deny-all into no
 // check at all.
 func rejectNullSecretAllowlist(data []byte) error {
@@ -39,10 +39,7 @@ func rejectNullSecretAllowlist(data []byte) error {
 	walk = func(n *yaml.Node) error {
 		if n.Kind == yaml.MappingNode {
 			for i := 0; i+1 < len(n.Content); i += 2 {
-				k, v := n.Content[i], n.Content[i+1]
-				for v.Kind == yaml.AliasNode && v.Alias != nil {
-					v = v.Alias
-				}
+				k, v := resolveAlias(n.Content[i]), resolveAlias(n.Content[i+1])
 
 				if k.Value == "secret_allowlist" && v.Kind == yaml.ScalarNode && v.ShortTag() == "!!null" {
 					return errors.New("compose policy: secret_allowlist must be a list, null is ambiguous")
@@ -60,6 +57,16 @@ func rejectNullSecretAllowlist(data []byte) error {
 	}
 
 	return walk(&root)
+}
+
+// resolveAlias follows a chain of YAML aliases to the node it names: both the key and the value
+// of secret_allowlist may be aliases (&k secret_allowlist ... *k : null).
+func resolveAlias(n *yaml.Node) *yaml.Node {
+	for n.Kind == yaml.AliasNode && n.Alias != nil {
+		n = n.Alias
+	}
+
+	return n
 }
 
 // openbaoRef is an OpenBao reference split as upstream does (openbao.parseReference).

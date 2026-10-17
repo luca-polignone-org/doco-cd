@@ -186,6 +186,7 @@ func TestParseSecretAllowlistEdgeCases(t *testing.T) {
 
 	for name, body := range map[string]string{
 		"null through alias": "version: 1\ndefault:\n  bind_allowlist: &n null\n  secret_allowlist: *n\n",
+		"aliased key, null":  "version: 1\ndefault:\n  bind_allowlist: []\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: " + secretRepo + "\n    *k : null\n",
 		"null in a target":   "version: 1\ntargets:\n  default/w:\n    repository: " + secretRepo + "\n    secret_allowlist: null\n",
 		"kv too many fields": "version: 1\ndefault:\n  secret_allowlist: [\"kv:a:b:c:d\"]\n",
 		"kv bad namespace":   "version: 1\ndefault:\n  secret_allowlist: [\"kv:t$:secret:prod/\"]\n",
@@ -200,6 +201,12 @@ func TestParseSecretAllowlistEdgeCases(t *testing.T) {
 				t.Fatalf("Parse() error = %v, want a secret_allowlist error", err)
 			}
 		})
+	}
+
+	// An aliased key with a list is a normal secret_allowlist.
+	aliased := secretPolicy(t, "version: 1\ndefault:\n  &k secret_allowlist: [\"kv:secret:x/\"]\ntargets:\n  default/w:\n    repository: "+secretRepo+"\n    *k : [\"kv:secret:y/\"]\n")
+	if got := aliased.Targets["default/w"].SecretAllowlist; got == nil || !reflect.DeepEqual(*got, []string{"kv:secret:y/"}) {
+		t.Fatalf("aliased key entries = %v, want [kv:secret:y/]", got)
 	}
 
 	f := secretPolicy(t, "version: 1\ndefault:\n  secret_allowlist: [\"  kv:secret:prod/  \", \"pki:ns:pki:x.example.com\", \"other:literal\"]\n")

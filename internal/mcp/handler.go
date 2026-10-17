@@ -18,6 +18,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/rbac"
 	"github.com/kimdre/doco-cd/internal/restapi"
 	"github.com/kimdre/doco-cd/internal/syncwindow"
 )
@@ -35,7 +36,7 @@ type RunOperations interface {
 // Dependencies contains the runtime services and HTTP settings required by Handler.
 type Dependencies struct {
 	Version              string `validate:"required"`
-	APISecret            string `validate:"required"`
+	APISecret            string `validate:"required_without=Auth"`
 	MaxPayloadSize       int64  `validate:"min=1"`
 	TrustedProxyHeader   string `default:"X-Forwarded-For"`
 	TrustedProxyNetworks []netip.Prefix
@@ -45,11 +46,20 @@ type Dependencies struct {
 	Runs                 RunOperations           `validate:"required,nostructlevel"`
 	// SyncWindows is the sync-window policy. Nil means no windows.
 	SyncWindows *syncwindow.Policy `validate:"-"`
+	// Fork: Auth authenticates every request; nil means the upstream x-api-key check on APISecret.
+	Auth *restapi.Authenticator `validate:"-"`
+	// Fork: RBAC authorizes every tool call; nil disables authorization (upstream behavior).
+	RBAC *rbac.Enforcer `validate:"-"`
+	// Fork: PollConfig is the operator's poll configuration, the only targets trigger_poll may
+	// run when RBAC is enabled.
+	PollConfig []poll.Config `validate:"-"`
 }
 
 // Handler serves the stateless MCP HTTP transport and owns all MCP tools.
 type Handler struct {
-	apiSecret            string
+	auth                 *restapi.Authenticator
+	rbac                 *rbac.Enforcer
+	pollConfig           []poll.Config
 	trustedProxyHeader   string
 	trustedProxyNetworks []netip.Prefix
 	log                  *logger.Logger
@@ -87,8 +97,15 @@ func NewHandler(dependencies Dependencies) (*Handler, error) {
 
 // newHandler registers MCP tools and builds the authenticated stateless HTTP transport.
 func newHandler(dependencies Dependencies) *Handler {
+	auth := dependencies.Auth
+	if auth == nil {
+		auth = &restapi.Authenticator{APISecret: dependencies.APISecret, APIKeyEnabled: true}
+	}
+
 	h := &Handler{
-		apiSecret:            dependencies.APISecret,
+		auth:                 auth,
+		rbac:                 dependencies.RBAC,
+		pollConfig:           dependencies.PollConfig,
 		trustedProxyHeader:   strings.TrimSpace(dependencies.TrustedProxyHeader),
 		trustedProxyNetworks: append([]netip.Prefix(nil), dependencies.TrustedProxyNetworks...),
 		log: &logger.Logger{
@@ -108,6 +125,12 @@ func newHandler(dependencies Dependencies) *Handler {
 	)
 
 	h.registerTools(server)
+
+	// Fork: with RBAC a registered tool that toolPermissions does not classify is refused.
+	if h.rbac.Enabled() {
+		server.AddReceivingMiddleware(denyUnclassifiedTools)
+	}
+
 	h.transport = sdkmcp.NewStreamableHTTPHandler(func(*http.Request) *sdkmcp.Server {
 		return server
 	}, &sdkmcp.StreamableHTTPOptions{
@@ -139,14 +162,17 @@ func (h *Handler) registerTools(server *sdkmcp.Server) {
 
 // ServeHTTP authenticates a request before forwarding it to the MCP transport.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !restapi.ValidateApiKey(r, h.apiSecret) {
+	principal, err := h.auth.Authenticate(r)
+	if err != nil {
 		h.log.Error(restapi.ErrInvalidApiKey.Error(), slog.String("ip", h.requestIP(r)))
 		http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 
 		return
 	}
 
-	h.transport.ServeHTTP(w, r)
+	// Fork: the principal travels in the context down to the tool calls, which authorize one
+	// by one; the transport is stateless and every POST carries its own credentials.
+	h.transport.ServeHTTP(w, r.WithContext(rbac.WithPrincipal(r.Context(), principal)))
 }
 
 // requestIP resolves the client address while honoring configured trusted proxies.

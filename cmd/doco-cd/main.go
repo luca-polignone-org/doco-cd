@@ -656,6 +656,9 @@ func run() error {
 			Contexts:             contexts,
 			Runs:                 controlPlaneRuns,
 			SyncWindows:          c.SyncWindows,
+			Auth:                 authenticator,
+			RBAC:                 enforcer,
+			PollConfig:           c.PollConfig,
 		})
 		if err != nil {
 			log.Critical("failed to create MCP handler", logger.ErrAttr(err))

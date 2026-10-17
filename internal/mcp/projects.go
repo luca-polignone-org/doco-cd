@@ -11,6 +11,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker"
 )
@@ -147,6 +148,10 @@ func (h *Handler) listProjects(
 		return nil, listProjectsOutput{}, fmt.Errorf("failed to get projects: %w", err)
 	}
 
+	projects = filterAllowedObjects(ctx, h, "projects", projects, func(p composeapi.Stack) string {
+		return deploy.ObjectName(contextClient.Name, p.Name)
+	})
+
 	if len(projects) == 0 {
 		return nil, listProjectsOutput{}, errors.New("no projects found")
 	}
@@ -167,6 +172,10 @@ func (h *Handler) getProject(
 
 	contextClient, err := h.resolveDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, getProjectOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "projects", "get", deploy.ObjectName(contextClient.Name, projectName)); err != nil {
 		return nil, getProjectOutput{}, err
 	}
 
@@ -198,6 +207,10 @@ func (h *Handler) controlProject(
 
 	contextClient, err := h.resolveDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, controlProjectOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "projects", "action/"+input.Action, deploy.ObjectName(contextClient.Name, projectName)); err != nil {
 		return nil, controlProjectOutput{}, err
 	}
 
@@ -235,6 +248,10 @@ func (h *Handler) destroyProject(
 
 	contextClient, err := h.resolveDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, destroyProjectOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "projects", "delete", deploy.ObjectName(contextClient.Name, projectName)); err != nil {
 		return nil, destroyProjectOutput{}, err
 	}
 

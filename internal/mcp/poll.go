@@ -61,6 +61,13 @@ func (h *Handler) triggerPoll(
 		}
 	}
 
+	// Fork: with RBAC only the operator's poll targets run; ctx already carries the principal,
+	// which TriggerPoll hands to the run so that pre-deploy checks targets/sync.
+	configs, err := h.restrictPollConfigs(configs)
+	if err != nil {
+		return nil, triggerPollOutput{}, err
+	}
+
 	jobID, err := h.controlPlaneRuns.TriggerPoll(ctx, configs, wait, h.log.Logger)
 	result, status := triggerRunToolResult(wait, err)
 

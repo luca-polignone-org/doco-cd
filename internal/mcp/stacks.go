@@ -10,6 +10,7 @@ import (
 	dockerswarmtypes "github.com/moby/moby/api/types/swarm"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 )
@@ -118,6 +119,8 @@ func (h *Handler) listStacks(
 		return nil, listStacksOutput{}, fmt.Errorf("failed to get stacks: %w", err)
 	}
 
+	filterAllowedStacks(ctx, h, contextClient.Name, stacks)
+
 	if len(stacks) == 0 {
 		return nil, listStacksOutput{}, errors.New("no stacks found")
 	}
@@ -138,6 +141,10 @@ func (h *Handler) getStack(
 
 	contextClient, err := h.resolveSwarmDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, getStackOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "stacks", "get", deploy.ObjectName(contextClient.Name, stackName)); err != nil {
 		return nil, getStackOutput{}, err
 	}
 
@@ -175,6 +182,10 @@ func (h *Handler) controlStack(
 
 	contextClient, err := h.resolveSwarmDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, controlStackOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "stacks", "action/"+input.Action, deploy.ObjectName(contextClient.Name, stackName)); err != nil {
 		return nil, controlStackOutput{}, err
 	}
 
@@ -223,6 +234,10 @@ func (h *Handler) removeStack(
 
 	contextClient, err := h.resolveSwarmDockerContext(ctx, input.Context)
 	if err != nil {
+		return nil, removeStackOutput{}, err
+	}
+
+	if err := h.authorizeTool(ctx, "stacks", "delete", deploy.ObjectName(contextClient.Name, stackName)); err != nil {
 		return nil, removeStackOutput{}, err
 	}
 

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -170,8 +171,46 @@ func TestUnblockOnContent(t *testing.T) {
 		sm.DeployConfig.Rollback.UnblockOn = ""
 
 		other := commitAndRefresh(t, r, sm, "other app", otherApp)
-		if got, _ := poisonedWithLog(t, sm, other); got {
+
+		// A mirror that does not exist: any git call would fail and log it.
+		sm.Repository.MirrorDir = filepath.Join(t.TempDir(), "gone")
+
+		got, log := poisonedWithLog(t, sm, other)
+		if got {
 			t.Fatal("commit mode must release on any new commit")
+		}
+
+		if strings.Contains(log, "content key") || strings.Contains(log, "cannot compute") {
+			t.Fatalf("commit mode must not compute a content key, log: %s", log)
+		}
+
+		if f := diskFailure(t, sm); f.State != rollback.StateFailed {
+			t.Fatalf("failure on disk %+v, want failed", f)
+		}
+	})
+
+	t.Run("a raw version 1 record releases on a new commit", func(t *testing.T) {
+		r := newRollbackRepo(t)
+		sm, _ := newContentTarget(t, r)
+
+		path := filepath.Join(sm.AppConfig.DataMountPath, "fork", "failures", "default", "web.json")
+		v1 := `{"version":1,"object":"default/web","commit_sha":"` + r.commits["good"] + `","stage":"deploy","state":"rolled_back"}`
+
+		if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if got, _ := poisonedWithLog(t, sm, r.commits["good"]); !got {
+			t.Fatal("the v1 record must keep its state on its own commit")
+		}
+
+		other := commitAndRefresh(t, r, sm, "other app", otherApp)
+		if got, _ := poisonedWithLog(t, sm, other); got {
+			t.Fatal("a v1 record has no key: a new commit must release it")
+		}
+
+		if f := diskFailure(t, sm); f.State != rollback.StateFailed || f.CommitSHA != r.commits["good"] {
+			t.Fatalf("failure on disk %+v, want failed", f)
 		}
 	})
 }
@@ -200,29 +239,36 @@ func TestForkContentKeyErrors(t *testing.T) {
 func TestFailureRecordsCarryContentKey(t *testing.T) {
 	r := newRollbackRepo(t)
 	sm, _ := newContentTarget(t, r)
-	sm.Repository.Revision = r.commits["good"]
+	// The run revision differs from the commit the record describes: the key is the record's.
+	sm.Repository.Revision = r.commits["privileged"]
+	good := r.commits["good"]
 
-	want, _ := sm.forkContentKey(r.commits["good"])
-	if got := sm.forkContentKeyOrEmpty(); got != want || got == "" {
+	want, _ := sm.forkContentKey(good)
+	if got := sm.forkContentKeyOrEmpty(good); got != want || got == "" {
 		t.Fatalf("forkContentKeyOrEmpty() = %q, want %q", got, want)
 	}
 
-	sm.persistForkFailure(docker.DeploymentFailure{CommitSHA: r.commits["good"], Stage: "deploy"}, rollback.StateBlocked, "")
+	sm.persistForkFailure(docker.DeploymentFailure{CommitSHA: good, Stage: "deploy"}, rollback.StateBlocked, "")
 
 	if f := diskFailure(t, sm); f.ContentKey != want {
 		t.Fatalf("persisted failure key = %q, want %q", f.ContentKey, want)
 	}
 
 	sm.DeployConfig.Rollback.UnblockOn = ""
-	if got := sm.forkContentKeyOrEmpty(); got != "" {
+	if got := sm.forkContentKeyOrEmpty(good); got != "" {
 		t.Fatalf("commit mode records no key, got %q", got)
 	}
 
 	sm.DeployConfig.Rollback.UnblockOn = deploy.UnblockOnContent
 	sm.Repository.MirrorDir = filepath.Join(t.TempDir(), "gone")
+	logs := captureLog(sm)
 
-	if got := sm.forkContentKeyOrEmpty(); got != "" {
+	if got := sm.forkContentKeyOrEmpty(good); got != "" {
 		t.Fatalf("a key that cannot be computed is not recorded, got %q", got)
+	}
+
+	if !strings.Contains(logs.String(), "rollback content key not recorded") || !strings.Contains(logs.String(), "object=default/web") {
+		t.Fatalf("the warning must name the object: %s", logs.String())
 	}
 }
 
@@ -242,12 +288,14 @@ func mergeFiles(a, b map[string]string) map[string]string {
 func TestRunForkRollbackRecordsContentKey(t *testing.T) {
 	r := newRollbackRepo(t)
 	sm, _ := newContentTarget(t, r)
+	failed := r.commits["privileged"]
+	// The run revision differs from the commit of the failure: the key is the failure's.
 	sm.Repository.Revision = r.commits["good"]
 
 	startPreRollback(t, "proceed")
 	stubDeployLastGood(t, nil)
 
-	want, err := sm.forkContentKey(r.commits["good"])
+	want, err := sm.forkContentKey(failed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,10 +304,13 @@ func TestRunForkRollbackRecordsContentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recordMemoryFailure(sm, StageDeploy)
+	docker.RecordDeploymentFailure(sm.Repository.Name, sm.DeployConfig.Name, docker.DeploymentFailure{
+		Repository: sm.Repository.Name, Stack: sm.DeployConfig.Name, CommitSHA: failed,
+		Stage: string(StageDeploy), Error: "e", FailedAt: time.Unix(40, 0).UTC(),
+	})
 	sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
-	if f := diskFailure(t, sm); f.ContentKey != want {
+	if f := diskFailure(t, sm); f.ContentKey != want || f.CommitSHA != failed {
 		t.Fatalf("rollback failure key = %q, want %q", f.ContentKey, want)
 	}
 }
@@ -280,6 +331,25 @@ func TestPersistForkFailureStoreError(t *testing.T) {
 	sm.persistForkFailure(docker.DeploymentFailure{CommitSHA: r.commits["good"], Stage: "deploy"}, rollback.StateBlocked, "")
 
 	if !strings.Contains(logs.String(), "failed to persist deployment failure") {
+		t.Fatalf("a store error must be logged: %s", logs.String())
+	}
+}
+
+func TestDeleteForkFailureStoreError(t *testing.T) {
+	r := newRollbackRepo(t)
+	sm, _ := newContentTarget(t, r)
+
+	notADir := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(notADir, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sm.AppConfig.DataMountPath = notADir
+	logs := captureLog(sm)
+
+	sm.deleteForkFailure()
+
+	if !strings.Contains(logs.String(), "failed to delete deployment failure") {
 		t.Fatalf("a store error must be logged: %s", logs.String())
 	}
 }

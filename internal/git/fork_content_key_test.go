@@ -77,6 +77,10 @@ func TestTreeHashAt(t *testing.T) {
 		t.Fatalf("root tree = %q, %v", root, err)
 	}
 
+	if empty, err := TreeHashAt(gitDir, c1, ""); err != nil || empty != root {
+		t.Fatalf("empty dir tree = %q, %v; want the root %q", empty, err, root)
+	}
+
 	if _, err = TreeHashAt(gitDir, c1, "missing"); err == nil {
 		t.Fatal("a missing directory must be an error")
 	}

@@ -48,16 +48,19 @@ func (s *StageManager) forkContentKey(revision string) (string, error) {
 	return "tree:" + tree + ";config:" + plumbing.ComputeHash(plumbing.BlobObject, data).String(), nil
 }
 
-// forkContentKeyOrEmpty is the key a failure record carries: empty in commit mode, and empty (with a
-// warning) when it cannot be computed, in which case the record releases on a new commit as before.
-func (s *StageManager) forkContentKeyOrEmpty() string {
+// forkContentKeyOrEmpty is the key a failure record of commit carries, computed from the commit the
+// record describes: empty in commit mode, and empty (with a warning) when it cannot be computed, in
+// which case the record releases on a new commit as before.
+func (s *StageManager) forkContentKeyOrEmpty(commit string) string {
 	if !s.DeployConfig.Rollback.UnblocksOnContent() {
 		return ""
 	}
 
-	key, err := s.forkContentKey(s.Repository.Revision)
+	key, err := s.forkContentKey(commit)
 	if err != nil {
-		s.Log.Warn("rollback content key not recorded, the failure releases on a new commit", slog.Any("error", err))
+		s.Log.Warn("rollback content key not recorded, the failure releases on a new commit",
+			slog.String("object", s.DeployConfig.Object()), slog.Any("error", err))
+
 		return ""
 	}
 

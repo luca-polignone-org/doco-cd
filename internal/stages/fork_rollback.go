@@ -54,7 +54,7 @@ func (s *StageManager) persistForkFailure(f docker.DeploymentFailure, state roll
 	err := store.PutFailure(rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: f.Repository, Stack: f.Stack,
 		CommitSHA: f.CommitSHA, Stage: f.Stage, Error: truncateRunes(s.redactSecrets(f.Error), 2000),
-		FailedAt: f.FailedAt, State: state, Decision: decision, ContentKey: s.forkContentKeyOrEmpty(),
+		FailedAt: f.FailedAt, State: state, Decision: decision, ContentKey: s.forkContentKeyOrEmpty(f.CommitSHA),
 	})
 	if err != nil {
 		s.Log.Error("failed to persist deployment failure", slog.String("object", s.DeployConfig.Object()), slog.Any("error", err))
@@ -376,7 +376,7 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName,
 	f := rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: mem.Repository, Stack: mem.Stack,
 		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(s.redactSecrets(cause.Error()), 2000),
-		FailedAt: mem.FailedAt, State: rollback.StateFailed, ContentKey: s.forkContentKeyOrEmpty(),
+		FailedAt: mem.FailedAt, State: rollback.StateFailed, ContentKey: s.forkContentKeyOrEmpty(mem.CommitSHA),
 	}
 
 	log := s.Log.With(slog.String("object", f.Object), slog.String("failed_commit", f.CommitSHA))

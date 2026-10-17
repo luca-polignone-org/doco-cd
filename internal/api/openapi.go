@@ -838,7 +838,7 @@ func createRouteCatalog(h *Handler, mounts Mounts, builder *schemaBuilder) ([]Ro
 			Operations: []Operation{
 				operation(http.MethodPost, "runComposeProjectAction", "Run a Compose project action", []string{"Projects"}, openapi3.Parameters{
 					pathParameter("projectName", "Compose project name."),
-					pathParameter("action", "Lifecycle action.", "start", "stop", "restart", "recreate"),
+					pathParameter("action", "Lifecycle action.", projectActions(h.appConfig)...),
 					contextParameter(),
 					timeout,
 					queryStringParameter("service", "Optional service name for recreate action."),

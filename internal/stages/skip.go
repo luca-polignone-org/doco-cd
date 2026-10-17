@@ -17,6 +17,8 @@ const (
 	SkipReasonStale          = "a newer commit is already deployed"
 	SkipReasonSelfUpdate     = "self-update to this commit failed before"
 	SkipReasonNothingDestroy = "nothing to destroy"
+	// SkipReasonRolledBack is the fork's poison skip, see rollbackPoisoned.
+	SkipReasonRolledBack = "a previous deployment of this commit was rolled back or blocked"
 )
 
 // maxSkippedStacksInSummary bounds the stacks listed in a skipped run summary.

@@ -250,18 +250,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		// GitStore locks its own mirror internally, so concurrent stacks
 		// resolving different references (or the same one) no longer need a
 		// wrapping lock here to stay correct.
-		gitStore, gitStoreErr := store.NewGitStore(store.GitStoreOptions{
-			Log:                     stageLog,
-			CloneURL:                s.Repository.SourceUrl,
-			BaseDir:                 s.Repository.PathInternal,
-			SSHPrivateKey:           s.AppConfig.SSHPrivateKey,
-			SSHPrivateKeyPassphrase: s.AppConfig.SSHPrivateKeyPassphrase,
-			AccessToken:             s.AppConfig.GitAccessToken,
-			SkipTLSVerify:           s.AppConfig.SkipTLSVerification,
-			ProxyOptions:            s.AppConfig.HttpProxy,
-			CloneSubmodules:         s.AppConfig.GitCloneSubmodules,
-			Depth:                   s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth),
-		})
+		gitStore, gitStoreErr := s.newGitStore(stageLog, s.Repository.PathInternal)
 		if gitStoreErr != nil {
 			return fmt.Errorf("failed to initialize git store: %w", gitStoreErr)
 		}
@@ -378,6 +367,23 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 	}
 
 	return nil
+}
+
+// newGitStore builds the per-revision store of this stack's repository under baseDir. The
+// rollback (fork_rollback.go) builds the same store to republish the last good commit.
+func (s *StageManager) newGitStore(stageLog *slog.Logger, baseDir string) (*store.GitStore, error) {
+	return store.NewGitStore(store.GitStoreOptions{
+		Log:                     stageLog,
+		CloneURL:                s.Repository.SourceUrl,
+		BaseDir:                 baseDir,
+		SSHPrivateKey:           s.AppConfig.SSHPrivateKey,
+		SSHPrivateKeyPassphrase: s.AppConfig.SSHPrivateKeyPassphrase,
+		AccessToken:             s.AppConfig.GitAccessToken,
+		SkipTLSVerify:           s.AppConfig.SkipTLSVerification,
+		ProxyOptions:            s.AppConfig.HttpProxy,
+		CloneSubmodules:         s.AppConfig.GitCloneSubmodules,
+		Depth:                   s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth),
+	})
 }
 
 // resolvedReferenceMatches treats a webhook's fully qualified branch reference

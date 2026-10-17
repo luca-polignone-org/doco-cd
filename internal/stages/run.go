@@ -240,6 +240,9 @@ func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageNa
 		return err
 	}
 
+	// Fork: rollback to the last good deploy, behind the pre_rollback veto.
+	s.runForkRollback(ctx, stageName)
+
 	notifiedErr := s.NotifyFailure(err)
 
 	if shouldPostFailureCommitStatus(s.DeployConfig.Destroy.Enabled) {

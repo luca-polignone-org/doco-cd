@@ -69,10 +69,16 @@ func (c *PreRollbackClient) Decide(ctx context.Context, in PreRollbackRequest, t
 
 	c.Signer.Sign(req, body)
 
-	client := c.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
+	// Never follow redirects: a 307/308 would re-POST the signed body (it may carry
+	// env values in "error") to another host, and a 301/302/303 would turn into an
+	// unsigned GET whose answer would be trusted. Any 3xx comes back as the last
+	// response and maps to http_error. The caller's client is copied, not mutated.
+	client := http.Client{}
+	if c.HTTPClient != nil {
+		client = *c.HTTPClient
 	}
+
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	resp, err := client.Do(req)
 	if err != nil {

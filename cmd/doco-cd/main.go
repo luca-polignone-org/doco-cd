@@ -632,7 +632,7 @@ func run() error {
 		Webhook: http.HandlerFunc(h.WebhookHandler),
 	}
 
-	if c.McpEnabled && c.ApiSecret != "" {
+	if c.McpEnabled && (c.ApiSecret != "" || c.JWTJWKSURL != "") {
 		mcpHandler, err := mcp.NewHandler(mcp.Dependencies{
 			Version:              app.Version,
 			APISecret:            c.ApiSecret,

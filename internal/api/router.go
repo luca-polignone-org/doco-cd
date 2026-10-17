@@ -101,7 +101,7 @@ func RegisterRoutes(mux *http.ServeMux, h *Handler, mounts Mounts) ([]string, er
 		}
 	}
 
-	if h.appConfig.ApiSecret == "" {
+	if h.appConfig.ApiSecret == "" && h.appConfig.JWTJWKSURL == "" {
 		h.log.Info("api endpoints disabled, no api secret configured")
 	}
 

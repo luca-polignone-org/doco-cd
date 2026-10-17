@@ -154,10 +154,22 @@ func match(pattern, value string) bool {
 	return ok
 }
 
+func hasEmptySegment(object string) bool {
+	for _, seg := range strings.Split(object, "/") {
+		if seg == "" {
+			return true
+		}
+	}
+
+	return false
+}
+
 // Allowed reports whether the principal may perform action on object of resource.
 func (p *Policy) Allowed(pr Principal, resource, action, object string) bool {
-	// Empty values never match: "noi/*" must not match "noi/".
-	if resource == "" || action == "" || object == "" {
+	// Empty values never match, and neither does an object with an empty segment:
+	// path.Match("noi/*", "noi/") is true, but "noi/" is not a valid
+	// <context>/<project> object.
+	if resource == "" || action == "" || hasEmptySegment(object) {
 		return false
 	}
 

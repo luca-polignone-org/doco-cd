@@ -123,6 +123,7 @@ func TestAllowedEmptyValues(t *testing.T) {
 	runAllowed(t, p, []allowedCase{
 		{alice, "projects", "get", "noi/web", true},
 		{alice, "projects", "get", "noi/", false},
+		{alice, "projects", "get", "/web", false},
 		{alice, "projects", "get", "", false},
 		{alice, "projects", "", "noi/web", false},
 		{alice, "", "get", "noi/web", false},

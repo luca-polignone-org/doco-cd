@@ -1,0 +1,9 @@
+services:
+  app:
+    image: alpine:3.22
+    command: ["sleep", "600"]
+    # v1 is denied by the logging rule on purpose: only default.logging of the policy is allowed
+    logging:
+      driver: json-file
+      options:
+        max-size: 1m

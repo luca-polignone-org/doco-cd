@@ -2,6 +2,7 @@ package composepolicy
 
 import (
 	"errors"
+	"fmt"
 	"maps"
 	"sort"
 	"strings"
@@ -24,6 +25,31 @@ type LoggingPolicy struct {
 }
 
 var errLoggingInTarget = errors.New("logging is only allowed in default")
+
+// validateLoggingPolicy refuses a default.logging that no service could ever match: an empty or
+// padded driver, or a padded option key (services are compared verbatim, and compose does not trim
+// either). Option values are compared verbatim too, so a padded value is matchable and is kept.
+func validateLoggingPolicy(lp *LoggingPolicy) error {
+	if lp == nil {
+		return nil
+	}
+
+	if strings.TrimSpace(lp.Driver) == "" {
+		return errors.New("logging.driver is required")
+	}
+
+	if lp.Driver != strings.TrimSpace(lp.Driver) {
+		return fmt.Errorf("logging.driver %q has leading or trailing whitespace", lp.Driver)
+	}
+
+	for k := range lp.Options {
+		if k != strings.TrimSpace(k) || k == "" {
+			return fmt.Errorf("logging.options key %q is empty or has leading or trailing whitespace", k)
+		}
+	}
+
+	return nil
+}
 
 // normalizedJournalField is the journal field name the journald log driver derives from a label
 // name. It is a verbatim copy of sanitizeKeyMod (moby daemon/logger/journald/journald.go): per
@@ -53,7 +79,12 @@ func checkLogging(svc types.ServiceConfig, want *LoggingPolicy) []Violation {
 	var out []Violation
 
 	if l := svc.Logging; l != nil && (want == nil || l.Driver != want.Driver || !maps.Equal(nonNil(l.Options), nonNil(want.Options))) {
-		out = append(out, Violation{Service: svc.Name, Field: "logging", Value: l.Driver})
+		driver := l.Driver
+		if driver == "" {
+			driver = "(daemon default)"
+		}
+
+		out = append(out, Violation{Service: svc.Name, Field: "logging", Value: driver})
 	}
 
 	keys := make([]string, 0, len(svc.Labels))

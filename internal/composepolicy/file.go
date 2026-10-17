@@ -96,8 +96,8 @@ func Parse(data []byte) (*File, error) {
 		return nil, fmt.Errorf("compose policy default: %w", err)
 	}
 
-	if f.Default.Logging != nil && strings.TrimSpace(f.Default.Logging.Driver) == "" {
-		return nil, errors.New("compose policy default: logging.driver is required")
+	if err := validateLoggingPolicy(f.Default.Logging); err != nil {
+		return nil, fmt.Errorf("compose policy default: %w", err)
 	}
 
 	for object, tp := range f.Targets {
@@ -110,6 +110,8 @@ func Parse(data []byte) (*File, error) {
 			return nil, fmt.Errorf("compose policy target %q: must be <context>/<project>", object)
 		}
 
+		// "logging: ~" on a target decodes to nil and is accepted: it is harmless, because targetFor
+		// always replaces a target's Logging with default.logging.
 		if tp.Logging != nil {
 			return nil, fmt.Errorf("compose policy target %q: %w", object, errLoggingInTarget)
 		}

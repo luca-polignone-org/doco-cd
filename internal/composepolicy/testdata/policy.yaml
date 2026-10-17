@@ -1,0 +1,9 @@
+version: 1
+default:
+  bind_allowlist: ["/srv/shared"]
+targets:
+  "noi/poli-gate":
+    repository: https://github.com/luca-polignone-org/poli-os-apps
+    reference: main
+    bind_allowlist: ["/srv/poli-gate/data/"]
+    cap_add_allowlist: [cap_net_admin]

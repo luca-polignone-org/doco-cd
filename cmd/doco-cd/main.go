@@ -18,6 +18,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/git"
@@ -50,6 +51,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/profiling"
 	"github.com/kimdre/doco-cd/internal/prometheus"
 	"github.com/kimdre/doco-cd/internal/selfupdate"
+	"github.com/kimdre/doco-cd/internal/stages"
 )
 
 // GetProxyUrlRedacted takes a proxy URL string and redacts the password if it exists.
@@ -219,6 +221,18 @@ func run() error {
 	log.Info("starting application", slog.String("version", app.Version), slog.String("log_level", c.LogLevel))
 
 	prometheus.AppInfo.WithLabelValues(app.Version, c.LogLevel, time.Now().Format(time.RFC3339)).Set(1)
+
+	// Fork: compose policy, checked in pre-deploy (internal/stages/fork_policy.go).
+	if c.ComposePolicyFile != "" {
+		holder, err := composepolicy.NewHolder(c.ComposePolicyFile, log.Logger)
+		if err != nil {
+			log.Critical("failed to load compose policy", logger.ErrAttr(err))
+
+			return err
+		}
+
+		stages.SetComposePolicy(holder)
+	}
 
 	// Log if proxy is used
 	if c.HttpProxy != (transport.ProxyOptions{}) {

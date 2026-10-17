@@ -316,6 +316,11 @@ func loadComposeScheduledProjectAll(
 	secretProvider secretprovider.SecretProvider,
 	opts ScheduledComposeOptions,
 ) (*types.Project, *deploy.Config, error) {
+	// Fork: the compose policy gate runs before any file is read.
+	if err := checkForkJobGate(dockerCli, ref.Project); err != nil {
+		return nil, nil, err
+	}
+
 	if ref.WorkingDir == "" {
 		return nil, nil, fmt.Errorf("%w: missing %q label",
 			ErrComposeScheduledMetadataUnavailable,

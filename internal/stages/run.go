@@ -64,7 +64,7 @@ func (s *StageManager) GetDeployStageOrder() StageOrder {
 		},
 		Funcs: map[StageName]StageFunc{
 			StageInit:       func(ctx context.Context, stageLog *slog.Logger) error { return s.RunInitStage(ctx, stageLog) },
-			StagePreDeploy:  func(ctx context.Context, stageLog *slog.Logger) error { return s.RunPreDeployStage(ctx, stageLog) },
+			StagePreDeploy:  s.runForkPreDeployStage, // Fork: RunPreDeployStage plus forkPolicyGate
 			StageDeploy:     func(ctx context.Context, stageLog *slog.Logger) error { return s.RunDeployStage(ctx, stageLog) },
 			StagePostDeploy: func(ctx context.Context, stageLog *slog.Logger) error { return s.RunPostDeployStage(ctx, stageLog) },
 			StageCleanup:    func(ctx context.Context, stageLog *slog.Logger) error { return s.RunCleanupStage(ctx, stageLog) },

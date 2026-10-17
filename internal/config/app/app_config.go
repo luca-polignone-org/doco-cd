@@ -120,6 +120,7 @@ type Config struct {
 	SourceGCInterval              time.Duration          `env:"SOURCE_GC_INTERVAL,notEmpty" envDefault:"1h" validate:"min=1m"`                                   // SourceGCInterval is how often the source garbage collector looks for evictable source stores (the first eviction pass runs one interval after startup)
 	SelfUpdateEnabled             bool                   `env:"SELF_UPDATE_ENABLED,notEmpty" envDefault:"false"`                                                 // SelfUpdateEnabled lets doco-cd deploy the stack that contains its own container. Without it such a deployment is refused instead of killing this process mid-deploy.
 	SelfUpdateStrategy            string                 `env:"SELF_UPDATE_STRATEGY,notEmpty" envDefault:"auto" validate:"oneof=auto scale_out applier"`         // SelfUpdateStrategy is how doco-cd replaces its own container: scale_out starts a second container and hands over, applier delegates to a throwaway clone, auto picks scale_out unless the compose file rules it out
+	ComposePolicyFile             string                 `env:"COMPOSE_POLICY_FILE"`                                                                             // ComposePolicyFile is the path of the fork compose policy (reloaded when its mtime changes); empty disables the policy
 }
 
 // GetConfig returns the app Config.

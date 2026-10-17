@@ -309,6 +309,9 @@ type StageManager struct {
 	// notifications, so a deployment computes it once rather than per message.
 	shortCommitMu sync.Mutex
 	shortCommit   memoizedShortSHA
+	// forkDeclared are the file lists of the deploy config as declared, before the init stage
+	// consumes them: the compose policy needs them.
+	forkDeclared declaredFiles
 }
 
 // memoizedShortSHA pairs a full commit SHA with its shortest unique prefix.

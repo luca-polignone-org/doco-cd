@@ -7,8 +7,8 @@ import (
 	"github.com/kimdre/doco-cd/internal/rollback"
 )
 
-// forkStore restituisce il failure store solo se il target ha il rollback abilitato:
-// senza, il fork non scrive niente sotto <data>/fork/ (spec, «Configurazione»).
+// forkStore returns the failure store only if the target has rollback enabled:
+// otherwise the fork writes nothing under <data>/fork/ (spec, "Configuration").
 func (s *StageManager) forkStore() *rollback.Store {
 	if !s.DeployConfig.RollbackEnabled() || s.AppConfig == nil {
 		return nil
@@ -33,8 +33,8 @@ func (s *StageManager) persistForkFailure(f docker.DeploymentFailure, state roll
 	}
 }
 
-// loadForkFailure legge la failure dal disco. Un file illeggibile vale come failure
-// blocked: mai un deploy alla cieca sopra uno stato che non si sa leggere.
+// loadForkFailure reads the failure from disk. An unreadable file counts as a
+// blocked failure: never a blind deploy on top of a state that cannot be read.
 func (s *StageManager) loadForkFailure() (rollback.Failure, bool) {
 	store := s.forkStore()
 	if store == nil {

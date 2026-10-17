@@ -88,8 +88,8 @@ func TestRollbackEffectiveTimeouts(t *testing.T) {
 	}
 }
 
-// Senza la chiave, l'hash della config non cambia rispetto a upstream:
-// un upgrade al fork non deve rideployare nessuno.
+// Without the key, the config hash is unchanged from upstream:
+// upgrading to the fork must not redeploy anyone.
 func TestRollbackAbsentKeepsHash(t *testing.T) {
 	c := &Config{Name: "x"}
 
@@ -120,7 +120,7 @@ func TestRollbackAbsentKeepsHash(t *testing.T) {
 	}
 }
 
-// Una config YAML senza la chiave lascia Rollback a nil dopo i default.
+// A YAML config without the key leaves Rollback nil after defaults.
 func TestRollbackAbsentStaysNilAfterDefaults(t *testing.T) {
 	var c Config
 	if err := yaml.Unmarshal([]byte("name: x"), &c); err != nil {

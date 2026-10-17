@@ -26,11 +26,11 @@ func newForkFailureManager(t *testing.T, rb *deploy.RollbackConfig) (*StageManag
 	return sm, data
 }
 
-// Con rollback abilitato la failure sopravvive alla memoria del processo: si
-// registra, si svuota la mappa in memoria (simula un restart) e la si ritrova.
-// Senza rollback non si scrive niente sotto <data>/fork/.
+// With rollback enabled the failure outlives process memory: it is
+// recorded, the in-memory map is cleared (simulating a restart) and it is found again.
+// Without rollback nothing is written under <data>/fork/.
 func TestFailurePersistedOnlyWithRollback(t *testing.T) {
-	// Il failure store in memoria è globale e la chiave è (org/repo, web): niente t.Parallel().
+	// The in-memory failure store is global and the key is (org/repo, web): no t.Parallel().
 	t.Run("rollback disabled writes nothing", func(t *testing.T) {
 		sm, data := newForkFailureManager(t, nil)
 

@@ -295,8 +295,8 @@ func (s *StageManager) recordDeploymentFailure(stageName StageName, cause error)
 
 	docker.RecordDeploymentFailure(s.Repository.Name, s.DeployConfig.Name, failure)
 
-	// Fork: con rollback abilitato la failure va anche su disco, con stato failed;
-	// il flusso di rollback (fork_rollback.go) la aggiorna poi a rolled_back o blocked.
+	// Fork: with rollback enabled the failure also goes to disk, with state failed;
+	// the rollback flow (fork_rollback.go) then updates it to rolled_back or blocked.
 	s.persistForkFailure(failure, rollback.StateFailed, "")
 }
 
@@ -307,7 +307,7 @@ func (s *StageManager) lastDeploymentFailure() (docker.DeploymentFailure, bool) 
 		return failure, true
 	}
 
-	// Fork: dopo un restart la memoria è vuota, il disco no.
+	// Fork: after a restart memory is empty, disk is not.
 	if f, ok := s.loadForkFailure(); ok {
 		failure := docker.DeploymentFailure{
 			Repository: f.Repository, Stack: f.Stack, CommitSHA: f.CommitSHA,

@@ -8,16 +8,17 @@ import (
 	"testing"
 )
 
-// swap sostituisce *target con value per la durata del test e ripristina il valore originale.
+// swap replaces *target with value for the duration of the test and restores the original.
 func swap[T any](t *testing.T, target *T, value T) {
 	t.Helper()
 
 	old := *target
 	*target = value
+
 	t.Cleanup(func() { *target = old })
 }
 
-// failingTemp è un file temporaneo reale in cui una singola operazione può fallire.
+// failingTemp is a real temporary file where a single operation can fail.
 type failingTemp struct {
 	*os.File
 	writeErr, chmodErr, syncErr, closeErr error
@@ -48,7 +49,7 @@ func (f *failingTemp) Sync() error {
 }
 
 func (f *failingTemp) Close() error {
-	// Chiude sempre il file reale, così il test non lascia descrittori aperti.
+	// Always close the real file, so the test leaves no open descriptors behind.
 	err := f.File.Close()
 	if f.closeErr != nil {
 		return f.closeErr
@@ -57,7 +58,7 @@ func (f *failingTemp) Close() error {
 	return err
 }
 
-// failingDir è una directory reale in cui il Sync può fallire.
+// failingDir is a real directory where Sync can fail.
 type failingDir struct {
 	*os.File
 	syncErr error
@@ -71,7 +72,7 @@ func (d *failingDir) Sync() error {
 	return d.File.Sync()
 }
 
-// injectTempFile fa creare a AtomicWriteFile un file temporaneo reale modificato da mutate.
+// injectTempFile makes AtomicWriteFile create a real temporary file altered by mutate.
 func injectTempFile(t *testing.T, mutate func(*failingTemp)) {
 	t.Helper()
 
@@ -162,7 +163,7 @@ func TestAtomicWriteFileErrors(t *testing.T) {
 }
 
 func TestAtomicWriteFileRenameOntoDirectory(t *testing.T) {
-	// rename(2) di un file su una directory non vuota fallisce con EISDIR.
+	// rename(2) of a file onto a non-empty directory fails with EISDIR.
 	path := filepath.Join(t.TempDir(), "x")
 	if err := os.Mkdir(path, PermPrivateDir); err != nil {
 		t.Fatal(err)
@@ -181,7 +182,7 @@ func TestAtomicWriteFileRenameOntoDirectory(t *testing.T) {
 
 func TestAtomicWriteFileCreateTempReadOnlyDir(t *testing.T) {
 	if os.Geteuid() == 0 {
-		t.Skip("root ignora i permessi di directory: il CreateTemp non fallisce")
+		t.Skip("root ignores directory permissions: CreateTemp does not fail")
 	}
 
 	dir := t.TempDir()
@@ -189,7 +190,7 @@ func TestAtomicWriteFileCreateTempReadOnlyDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// t.TempDir pulisce dopo questo Cleanup (LIFO): la directory deve essere di nuovo scrivibile.
+	// t.TempDir cleans up after this Cleanup (LIFO): the directory must be writable again.
 	t.Cleanup(func() { _ = os.Chmod(dir, PermPrivateDir) })
 
 	if err := AtomicWriteFile(filepath.Join(dir, "x"), []byte("x"), PermPrivateFile); err == nil {

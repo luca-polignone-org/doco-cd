@@ -7,12 +7,12 @@ import (
 )
 
 const (
-	PermPrivateDir  = 0o700 // directory leggibile solo dal processo
-	PermPrivateFile = 0o600 // file leggibile solo dal processo
+	PermPrivateDir  = 0o700 // directory readable only by the process
+	PermPrivateFile = 0o600 // file readable only by the process
 )
 
-// tempFile è il sottoinsieme di *os.File usato da AtomicWriteFile; un'interfaccia
-// permette ai test di iniettare errori nelle singole operazioni.
+// tempFile is the subset of *os.File used by AtomicWriteFile; an interface
+// lets tests inject errors into individual operations.
 type tempFile interface {
 	Name() string
 	Write(p []byte) (int, error)
@@ -21,14 +21,14 @@ type tempFile interface {
 	Close() error
 }
 
-// dirFile è il sottoinsieme di *os.File usato per il fsync della directory.
+// dirFile is the subset of *os.File used to fsync the directory.
 type dirFile interface {
 	Sync() error
 	Close() error
 }
 
-// Seam di test: in produzione puntano alle funzioni di os, i test li sostituiscono
-// per iniettare errori che il filesystem reale non produce in modo deterministico.
+// Test seams: in production they point to the os functions, tests replace them
+// to inject errors the real filesystem does not produce deterministically.
 var (
 	createTempFile = func(dir, pattern string) (tempFile, error) {
 		f, err := os.CreateTemp(dir, pattern)
@@ -49,9 +49,9 @@ var (
 	}
 )
 
-// AtomicWriteFile scrive data in path passando da un file temporaneo nella stessa
-// directory: write, fsync, rename, fsync della directory. Un crash a metà lascia il
-// file precedente intatto, mai uno scritto a metà. È lo schema di selfupdate.Store.
+// AtomicWriteFile writes data to path via a temporary file in the same
+// directory: write, fsync, rename, fsync of the directory. A crash midway leaves the
+// previous file intact, never a partially written one. Same scheme as selfupdate.Store.
 func AtomicWriteFile(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, PermPrivateDir); err != nil {

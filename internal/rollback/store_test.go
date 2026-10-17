@@ -9,6 +9,7 @@ import (
 
 func TestStoreRoundTrip(t *testing.T) {
 	data := t.TempDir()
+
 	s := StoreFor(data)
 	if s != StoreFor(data) {
 		t.Fatal("StoreFor must return the shared instance")
@@ -18,8 +19,10 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatalf("unexpected root %q", s.Root())
 	}
 
-	f := Failure{Object: "noi/poli gate", CommitSHA: "abc", Stage: "deploy", Error: "boom",
-		FailedAt: time.Unix(10, 0).UTC(), State: StateRolledBack}
+	f := Failure{
+		Object: "noi/poli gate", CommitSHA: "abc", Stage: "deploy", Error: "boom",
+		FailedAt: time.Unix(10, 0).UTC(), State: StateRolledBack,
+	}
 	if err := s.PutFailure(f); err != nil {
 		t.Fatal(err)
 	}
@@ -51,8 +54,8 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
-// Un file illeggibile non è «nessuna failure»: è un errore, che il chiamante
-// tratta come blocked (spec, «Store»).
+// An unreadable file is not "no failure": it is an error, which the caller
+// treats as blocked (spec, "Store").
 func TestStoreCorruptFile(t *testing.T) {
 	data := t.TempDir()
 	s := StoreFor(data)
@@ -65,6 +68,7 @@ func TestStoreCorruptFile(t *testing.T) {
 	}
 
 	_ = os.WriteFile(path, []byte(`{"version":99}`), 0o600)
+
 	if _, _, err := s.GetFailure("default/x"); err == nil {
 		t.Fatal("expected error on unknown version")
 	}
@@ -87,7 +91,7 @@ func TestStoreBadObject(t *testing.T) {
 	}
 }
 
-// Anno fuori da [0, 9999]: time.Time non si serializza in JSON.
+// Year outside [0, 9999]: time.Time does not serialize to JSON.
 func TestStorePutEncodeError(t *testing.T) {
 	s := StoreFor(t.TempDir())
 
@@ -97,7 +101,7 @@ func TestStorePutEncodeError(t *testing.T) {
 	}
 }
 
-// Se <data>/fork è un file, la directory non si può creare.
+// If <data>/fork is a file, the directory cannot be created.
 func TestStorePutWriteError(t *testing.T) {
 	data := t.TempDir()
 	if err := os.WriteFile(filepath.Join(data, "fork"), []byte("x"), 0o600); err != nil {
@@ -109,8 +113,8 @@ func TestStorePutWriteError(t *testing.T) {
 	}
 }
 
-// Un errore di lettura diverso da not-exist (qui: il path è una directory) non
-// vale «nessuna failure».
+// A read error other than not-exist (here: the path is a directory) does not
+// mean "no failure".
 func TestStoreGetReadError(t *testing.T) {
 	data := t.TempDir()
 	s := StoreFor(data)
@@ -124,8 +128,8 @@ func TestStoreGetReadError(t *testing.T) {
 	}
 }
 
-// Una directory non vuota al posto del file fa fallire os.Remove con un errore
-// diverso da not-exist.
+// A non-empty directory in place of the file makes os.Remove fail with an error
+// other than not-exist.
 func TestStoreDeleteError(t *testing.T) {
 	data := t.TempDir()
 	s := StoreFor(data)

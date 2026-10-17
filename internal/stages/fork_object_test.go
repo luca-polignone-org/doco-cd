@@ -7,7 +7,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/docker"
 )
 
-// L'oggetto del fork deve usare lo stesso nome di context che upstream mostra.
+// The fork's object must use the same context name that upstream shows.
 func TestObjectNameMatchesDockerDisplayName(t *testing.T) {
 	if got, want := deploy.ObjectName("", "x"), docker.DisplayContextName("")+"/x"; got != want {
 		t.Fatalf("%q != %q", got, want)

@@ -2,13 +2,13 @@ package deploy
 
 import "strings"
 
-// defaultContextName è il nome che upstream mostra per il context Docker vuoto
-// (docker.DefaultContextName); il pacchetto docker importa deploy, quindi qui è ripetuto
-// e un test in internal/stages verifica che coincidano.
+// defaultContextName is the name upstream shows for the empty Docker context
+// (docker.DefaultContextName); package docker imports deploy, so it is repeated here
+// and a test in internal/stages checks that the two match.
 const defaultContextName = "default"
 
-// ObjectName è l'identità di un target per RBAC, compose policy, hook e store:
-// <context>/<project>, con il context vuoto scritto "default".
+// ObjectName is the identity of a target for RBAC, compose policy, hooks and the store:
+// <context>/<project>, with the empty context written as "default".
 func ObjectName(contextName, project string) string {
 	c := strings.TrimSpace(contextName)
 	if c == "" || strings.EqualFold(c, defaultContextName) {
@@ -18,7 +18,7 @@ func ObjectName(contextName, project string) string {
 	return c + "/" + strings.TrimSpace(project)
 }
 
-// Object restituisce l'oggetto del target descritto dalla config.
+// Object returns the object of the target described by the config.
 func (c *Config) Object() string {
 	return ObjectName(c.Context, c.Name)
 }

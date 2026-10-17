@@ -12,18 +12,18 @@ import (
 )
 
 const (
-	// DefaultRollbackTimeout è il timeout del rollback quando la chiave manca o è zero.
+	// DefaultRollbackTimeout is the rollback timeout when the key is missing or zero.
 	DefaultRollbackTimeout = 5 * time.Minute
-	// DefaultPreRollbackTimeout è l'attesa di pre_rollback quando la chiave manca o è zero.
+	// DefaultPreRollbackTimeout is the pre_rollback wait when the key is missing or zero.
 	DefaultPreRollbackTimeout = 30 * time.Second
 )
 
-// RollbackConfig accende il rollback locale all'ultimo deploy buono (fork Portico).
-// Si scrive come bool o come oggetto, come destroy.
+// RollbackConfig enables local rollback to the last good deploy (Portico fork).
+// It is written as a bool or as an object, like destroy.
 type RollbackConfig struct {
-	Enabled            bool              `yaml:"enabled" json:"enabled" default:"false"`           // Enabled abilita rollback e failure store su disco per questo target
-	Timeout            duration.Duration `yaml:"timeout" json:"timeout"`                           // Timeout del rollback: Create/Start più wait healthy (default 5m)
-	PreRollbackTimeout duration.Duration `yaml:"pre_rollback_timeout" json:"pre_rollback_timeout"` // PreRollbackTimeout è l'attesa massima della risposta di pre_rollback (default 30s)
+	Enabled            bool              `yaml:"enabled" json:"enabled" default:"false"`           // Enabled turns on rollback and the on-disk failure store for this target
+	Timeout            duration.Duration `yaml:"timeout" json:"timeout"`                           // Timeout of the rollback: Create/Start plus wait healthy (default 5m)
+	PreRollbackTimeout duration.Duration `yaml:"pre_rollback_timeout" json:"pre_rollback_timeout"` // PreRollbackTimeout is the maximum wait for the pre_rollback response (default 30s)
 }
 
 var errInvalidRollback = errors.New("invalid rollback value: expected bool or object")
@@ -74,12 +74,12 @@ func (c *RollbackConfig) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// RollbackEnabled dice se il target ha il rollback abilitato.
+// RollbackEnabled reports whether the target has rollback enabled.
 func (c *Config) RollbackEnabled() bool {
 	return c != nil && c.Rollback != nil && c.Rollback.Enabled
 }
 
-// EffectiveTimeout restituisce il timeout del rollback, con il default se zero.
+// EffectiveTimeout returns the rollback timeout, falling back to the default if zero.
 func (c *RollbackConfig) EffectiveTimeout() time.Duration {
 	if c == nil || c.Timeout == 0 {
 		return DefaultRollbackTimeout
@@ -88,7 +88,7 @@ func (c *RollbackConfig) EffectiveTimeout() time.Duration {
 	return c.Timeout.Duration()
 }
 
-// EffectivePreRollbackTimeout restituisce l'attesa di pre_rollback, con il default se zero.
+// EffectivePreRollbackTimeout returns the pre_rollback wait, falling back to the default if zero.
 func (c *RollbackConfig) EffectivePreRollbackTimeout() time.Duration {
 	if c == nil || c.PreRollbackTimeout == 0 {
 		return DefaultPreRollbackTimeout

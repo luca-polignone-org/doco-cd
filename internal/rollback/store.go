@@ -14,11 +14,11 @@ import (
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
-// Il failure store del fork tiene su disco l'esito dell'ultimo deploy fallito di un
-// target con rollback abilitato. Upstream lo tiene solo in memoria
-// (internal/docker/failure_state.go) e lo perde al restart; qui serve che sopravviva,
-// perché uno stato rolled_back o blocked deve impedire di rideployare il commit
-// fallito anche dopo un riavvio.
+// The fork's failure store keeps the outcome of the last failed deploy of a
+// target with rollback enabled on disk. Upstream keeps it in memory only
+// (internal/docker/failure_state.go) and loses it on restart; here it must survive,
+// because a rolled_back or blocked state must prevent redeploying the failed commit
+// even after a restart.
 
 type State string
 
@@ -54,8 +54,8 @@ var (
 	stores   = map[string]*Store{}
 )
 
-// StoreFor restituisce lo store condiviso della directory dati: un'istanza per path,
-// così il mutex serializza davvero le scritture dello stesso processo.
+// StoreFor returns the store shared for the data directory: one instance per path,
+// so the mutex really serializes writes within the same process.
 func StoreFor(dataMountPath string) *Store {
 	root := filepath.Join(filepath.Clean(dataMountPath), "fork")
 
@@ -82,7 +82,7 @@ func splitObject(object string) (string, string, error) {
 		return "", "", fmt.Errorf("%w: %q", errBadObject, object)
 	}
 
-	// url.PathEscape non codifica "." e "..": come componenti di path uscirebbero dallo store.
+	// url.PathEscape does not encode "." and "..": as path components they would escape the store.
 	for _, part := range []string{ctx, project} {
 		if part == "." || part == ".." {
 			return "", "", fmt.Errorf("%w: %q", errBadObject, object)
@@ -126,7 +126,7 @@ func (s *Store) GetFailure(object string) (Failure, bool, error) {
 		return Failure{}, false, err
 	}
 
-	data, err := os.ReadFile(path) // #nosec G304 -- path costruito da PathEscape sotto root
+	data, err := os.ReadFile(path) // #nosec G304 -- path built from PathEscape under root
 	if errors.Is(err, os.ErrNotExist) {
 		return Failure{}, false, nil
 	}
@@ -163,7 +163,7 @@ func (s *Store) DeleteFailure(object string) error {
 	return nil
 }
 
-// Blocks dice se la failure impedisce di rideployare il commit fallito.
+// Blocks reports whether the failure prevents redeploying the failed commit.
 func (s *Store) Blocks(f Failure) bool {
 	return f.State != StateFailed
 }

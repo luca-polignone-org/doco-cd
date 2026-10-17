@@ -76,6 +76,8 @@ const (
 	sendOK sendResult = iota
 	sendRetry
 	sendPoison
+	// sendAborted means the outbox's own ctx ended: a shutdown, not an endpoint failure.
+	sendAborted
 )
 
 // NewOutbox creates Dir (and Dir/dead), loads the events left by a previous run and
@@ -87,10 +89,15 @@ func NewOutbox(cfg OutboxConfig) (*Outbox, error) {
 
 	// Never follow redirects, for the same reason as PreRollbackClient: a 307/308 would
 	// re-POST the signed body to another host. A 3xx comes back as the response and is
-	// poison. The caller's client is copied, not mutated.
-	client := http.Client{Timeout: 30 * time.Second}
+	// poison. The caller's client is copied, not mutated. A zero timeout would let a hanging
+	// endpoint stall the single worker forever, so it becomes 30s.
+	client := http.Client{}
 	if cfg.HTTPClient != nil {
 		client = *cfg.HTTPClient
+	}
+
+	if client.Timeout == 0 {
+		client.Timeout = 30 * time.Second
 	}
 
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
@@ -179,7 +186,8 @@ func (o *Outbox) load() error {
 			err = json.Unmarshal(data, &e)
 		}
 
-		if err != nil || e.Version != outboxVersion || e.Event.EventID == "" {
+		// The name must be the event_id: otherwise settling it would act on another path.
+		if err != nil || e.Version != outboxVersion || e.Event.EventID == "" || it.Name() != e.Event.EventID+".json" {
 			o.cfg.Log.Warn("unreadable outbox event moved to dead", slog.String("file", it.Name()))
 			_ = os.Rename(full, o.deadPath(it.Name()))
 
@@ -210,8 +218,13 @@ func (o *Outbox) write(e *entry) error {
 }
 
 // Enqueue writes the event to disk, queues it and enforces MaxEvents. The event is in the
-// outbox only if Enqueue returns nil.
+// outbox only if Enqueue returns nil. The event_id names the file, so it must be a plain
+// file name: not empty, without a path separator, and not a .tmp- name that load deletes.
 func (o *Outbox) Enqueue(ev Event) error {
+	if id := ev.EventID; id == "" || filepath.Base(id) != id || strings.HasPrefix(id, ".tmp-") {
+		return fmt.Errorf("enqueue outcome event: invalid event_id %q", id)
+	}
+
 	now := o.cfg.Now()
 	e := &entry{Version: outboxVersion, Event: ev, Object: ev.Object, NextAttempt: now, FirstEnqueued: now}
 
@@ -316,7 +329,11 @@ func (o *Outbox) deliverOnce(ctx context.Context) (time.Duration, bool) {
 	sort.Slice(ready, func(i, j int) bool { return ready[i].FirstEnqueued.Before(ready[j].FirstEnqueued) })
 
 	for _, e := range ready {
-		res, status := o.send(ctx, e)
+		// Once ctx is done the round stops sending; the remaining heads are only released.
+		res, status := sendAborted, 0
+		if ctx.Err() == nil {
+			res, status = o.send(ctx, e)
+		}
 
 		o.mu.Lock()
 		o.settleLocked(e, res, status, o.cfg.Now())
@@ -357,6 +374,10 @@ func (o *Outbox) send(ctx context.Context, e *entry) (sendResult, int) {
 
 	resp, err := o.cfg.HTTPClient.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return sendAborted, 0
+		}
+
 		return sendRetry, 0
 	}
 
@@ -372,7 +393,9 @@ func (o *Outbox) send(ctx context.Context, e *entry) (sendResult, int) {
 	}
 }
 
-// settleLocked applies the result of an attempt to e.
+// settleLocked applies the result of an attempt to e. An aborted attempt only releases the
+// in-flight mark: it is not counted, persisted or checked for expiry, so a shutdown never
+// moves an event to dead/.
 func (o *Outbox) settleLocked(e *entry, res sendResult, status int, now time.Time) {
 	e.inFlight = false
 
@@ -384,6 +407,8 @@ func (o *Outbox) settleLocked(e *entry, res sendResult, status int, now time.Tim
 	}
 
 	switch res {
+	case sendAborted:
+		// Nothing to do: the event stays as it was on disk.
 	case sendOK:
 		_ = os.Remove(o.path(e))
 		o.removeLocked(e.Object, idx)

@@ -734,6 +734,8 @@ func TestOutboxCorruptFilesGoToDead(t *testing.T) {
 	for name, content := range map[string]string{
 		"garbage.json": "{not json", "noid.json": `{"version":1}`, "notes.txt": "x",
 		".tmp-123": `{"version":1,"ev`, ".tmp-456.json": `{"version":1}`,
+		// A well-formed event whose file name is not its event_id.
+		"renamed.json": `{"version":1,"event":{"event_id":"inside","object":"default/app"},"object":"default/app"}`,
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {
 			t.Fatal(err)
@@ -754,7 +756,7 @@ func TestOutboxCorruptFilesGoToDead(t *testing.T) {
 		t.Errorf("loaded %d events, want only the good one", o.count)
 	}
 
-	for _, name := range []string{"garbage.json", "noid.json", "future.json"} {
+	for _, name := range []string{"garbage.json", "noid.json", "future.json", "renamed.json"} {
 		if !exists(filepath.Join(dir, "dead", name)) || exists(filepath.Join(dir, name)) {
 			t.Errorf("%s was not moved to dead/", name)
 		}
@@ -774,8 +776,8 @@ func TestOutboxCorruptFilesGoToDead(t *testing.T) {
 		}
 	}
 
-	if d := dropped("corrupt") - before; d != 3 {
-		t.Errorf("dropped_total{reason=corrupt} delta = %v, want 3", d)
+	if d := dropped("corrupt") - before; d != 4 {
+		t.Errorf("dropped_total{reason=corrupt} delta = %v, want 4", d)
 	}
 }
 
@@ -842,6 +844,43 @@ func TestNewOutboxDefaults(t *testing.T) {
 	if o.cfg.HTTPClient == nil || o.cfg.HTTPClient.Timeout != 30*time.Second || o.cfg.HTTPClient.CheckRedirect == nil {
 		t.Error("default client must have a 30s timeout and refuse redirects")
 	}
+
+	o, err = NewOutbox(OutboxConfig{Dir: t.TempDir(), URL: "http://x", HTTPClient: &http.Client{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if o.cfg.HTTPClient.Timeout != 30*time.Second {
+		t.Errorf("an injected client without timeout must get 30s, got %v", o.cfg.HTTPClient.Timeout)
+	}
+}
+
+func TestOutboxEnqueueRejectsInvalidEventID(t *testing.T) {
+	dir := t.TempDir()
+	o := newTestOutbox(t, dir, "http://unused", nil)
+
+	for _, id := range []string{"", "a/b", "../escape", "/abs", ".tmp-x"} {
+		if err := o.Enqueue(testEvent(id, "default/app")); err == nil {
+			t.Errorf("Enqueue accepted event_id %q", id)
+		}
+	}
+
+	items, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(items) != 1 || items[0].Name() != "dead" {
+		t.Errorf("Enqueue wrote files for invalid event_ids: %v", items)
+	}
+
+	if o.count != 0 {
+		t.Errorf("count = %d, want 0", o.count)
+	}
+
+	if exists(filepath.Join(filepath.Dir(dir), "escape.json")) {
+		t.Error("an event_id escaped the outbox directory")
+	}
 }
 
 func TestOutboxEnqueueWriteError(t *testing.T) {
@@ -887,6 +926,82 @@ func TestOutboxRetryWriteErrorIsLogged(t *testing.T) {
 
 	if o.count != 1 {
 		t.Errorf("count = %d, want 1: the event stays queued in memory", o.count)
+	}
+}
+
+// A shutdown during a round is not an endpoint failure: the in-flight send and the heads
+// not yet sent are released untouched, even when they are past MaxAge.
+func TestOutboxShutdownDuringRoundIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var hits atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		cancel() // the shutdown arrives while this send is in flight
+
+		select {
+		case <-r.Context().Done():
+		case <-time.After(10 * time.Second):
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	o := newTestOutbox(t, dir, srv.URL, func(c *OutboxConfig) { c.MaxAge = time.Hour })
+
+	mustEnqueue(t, o, testEvent("a1", "default/a"))
+	o.clock.Advance(time.Second)
+	mustEnqueue(t, o, testEvent("b1", "default/b"))
+
+	files := map[string][]byte{}
+
+	for _, id := range []string{"a1", "b1"} {
+		data, err := os.ReadFile(filepath.Join(dir, id+".json")) // #nosec G304
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		files[id] = data
+	}
+
+	// Both are past MaxAge: a failure counted now would move them to dead/ as expired.
+	o.clock.Advance(2 * time.Hour)
+
+	beforeRetry, beforeOK := delivered("retry"), delivered("ok")
+	beforeExpired, beforePoison := dropped("expired"), dropped("poison")
+
+	o.deliverOnce(ctx)
+
+	if n := hits.Load(); n != 1 {
+		t.Errorf("got %d sends, want 1: the round must stop once ctx is done", n)
+	}
+
+	for id, want := range files {
+		got, err := os.ReadFile(filepath.Join(dir, id+".json")) // #nosec G304
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s changed on disk after a shutdown (err %v)", id, err)
+		}
+	}
+
+	if deadItems, _ := os.ReadDir(filepath.Join(dir, "dead")); len(deadItems) != 0 {
+		t.Errorf("dead/ is not empty after a shutdown: %v", deadItems)
+	}
+
+	if delivered("retry") != beforeRetry || delivered("ok") != beforeOK ||
+		dropped("expired") != beforeExpired || dropped("poison") != beforePoison {
+		t.Error("a shutdown changed the outbox metrics")
+	}
+
+	if o.count != 2 {
+		t.Errorf("count = %d, want 2", o.count)
+	}
+
+	for obj, q := range o.queues {
+		if q[0].inFlight || q[0].Attempts != 0 {
+			t.Errorf("%s: inFlight=%v attempts=%d, want released and uncounted", obj, q[0].inFlight, q[0].Attempts)
+		}
 	}
 }
 

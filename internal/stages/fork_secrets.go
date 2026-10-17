@@ -59,3 +59,23 @@ func (s *StageManager) checkForkSecretsAs(id composepolicy.Identity, encoded map
 
 	return &PolicyDeniedError{Object: id.Object, Violations: violations}
 }
+
+// forkSecretGate is docker.ForkSecretGate: the allowlist of the object in the policy in force. The
+// identity was verified by the last pre-deploy of the object, which is what forkJobGate requires
+// before a job may run at all.
+func forkSecretGate(object, provider string, refs map[string]string) error {
+	f := composePolicy.Load().Current()
+	if f == nil {
+		return nil
+	}
+
+	// An object missing from targets gets the target violation from CheckSecrets itself.
+	tp := f.Targets[object]
+
+	id := composepolicy.Identity{Object: object, Repository: tp.Repository, Reference: tp.Reference, ConfigTarget: tp.ConfigTarget}
+	if v := f.CheckSecrets(id, provider, refs); len(v) > 0 {
+		return &PolicyDeniedError{Object: object, Violations: v}
+	}
+
+	return nil
+}

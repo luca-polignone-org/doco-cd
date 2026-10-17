@@ -2,6 +2,7 @@ package stages
 
 import (
 	"context"
+	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 )
@@ -139,6 +141,62 @@ func TestLastGoodSecretAllowlist(t *testing.T) {
 	// The rollback checks with record=false: a denied last good does not change the job gate verdict.
 	if v, _ := verifiedObjects.Load("default/web"); v != true {
 		t.Fatalf("job gate verdict = %v, want true: the rollback must not record a denial", v)
+	}
+}
+
+func TestForkSecretGate(t *testing.T) {
+	setForkComposePolicy(t, secretAllowlistPolicy("default/web"))
+	verifiedObjects.Clear()
+	t.Cleanup(func() { verifiedObjects.Clear() })
+
+	if docker.ForkSecretGate == nil {
+		t.Fatal("SetComposePolicy must install docker.ForkSecretGate")
+	}
+
+	if err := forkSecretGate("default/web", "openbao", map[string]string{"DB": "kv:secret:prod/web/db:PASS"}); err != nil {
+		t.Fatalf("allowed reference: error = %v", err)
+	}
+
+	err := forkSecretGate("default/web", "openbao", map[string]string{"DB": "kv:secret:prod/other/db:PASS"})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("denied reference: error = %v, want ErrPolicyDenied", err)
+	}
+
+	if v, ok := verifiedObjects.Load("default/web"); ok {
+		t.Fatalf("job gate verdict = %v, want none: the secret gate does not record", v)
+	}
+
+	// An object missing from targets gets the target violation (errata 7).
+	err = forkSecretGate("default/api", "openbao", map[string]string{"DB": "kv:secret:prod/web/db:PASS"})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("object not in targets: error = %v, want ErrPolicyDenied", err)
+	}
+
+	SetComposePolicy(nil)
+
+	if docker.ForkSecretGate != nil {
+		t.Fatal("SetComposePolicy(nil) must remove docker.ForkSecretGate")
+	}
+
+	if err := forkSecretGate("default/web", "openbao", map[string]string{"DB": "kv:secret:prod/other/db:PASS"}); err != nil {
+		t.Fatalf("no policy: error = %v, want nil", err)
+	}
+}
+
+// TestForkSecretGateDeclaredReference: the identity built from the target itself must pass the
+// identity check when the target declares a full reference.
+func TestForkSecretGateDeclaredReference(t *testing.T) {
+	policy := "version: 1\ntargets:\n  \"default/web\":\n    repository: " + forkPolicyRepo +
+		"\n    reference: refs/heads/main\n    secret_allowlist:\n      - kv:secret:prod/web/\n"
+	setForkComposePolicy(t, policy)
+
+	if err := forkSecretGate("default/web", "openbao", map[string]string{"DB": "kv:secret:prod/web/db:PASS"}); err != nil {
+		t.Fatalf("allowed reference with declared reference: error = %v", err)
+	}
+
+	err := forkSecretGate("default/web", "openbao", map[string]string{"DB": "kv:secret:prod/other/db:PASS"})
+	if !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("denied reference: error = %v, want ErrPolicyDenied", err)
 	}
 }
 

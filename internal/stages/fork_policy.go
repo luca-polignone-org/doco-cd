@@ -34,15 +34,18 @@ var (
 	rbacEnforcer    atomic.Pointer[rbac.Enforcer]
 )
 
-// SetComposePolicy registers the compose policy of the process and the job gate; nil disables
-// both. It is called at startup, before any scheduler reads docker.ForkJobGate.
+// SetComposePolicy registers the compose policy of the process, the job gate and the secret gate;
+// nil disables all three. It is called at startup, before any scheduler reads docker.ForkJobGate
+// or docker.ForkSecretGate.
 func SetComposePolicy(h *composepolicy.Holder) {
 	composePolicy.Store(h)
 
 	if h != nil {
 		docker.ForkJobGate = forkJobGate
+		docker.ForkSecretGate = forkSecretGate
 	} else {
 		docker.ForkJobGate = nil
+		docker.ForkSecretGate = nil
 	}
 }
 

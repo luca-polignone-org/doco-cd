@@ -321,6 +321,12 @@ func loadComposeScheduledProjectAll(
 		return nil, nil, err
 	}
 
+	if dockerCli != nil {
+		ctx = withForkJobObject(ctx, deploy.ObjectName(dockerCli.CurrentContext(), ref.Project))
+	} else {
+		ctx = withForkJobObject(ctx, deploy.ObjectName("", ref.Project))
+	}
+
 	if ref.WorkingDir == "" {
 		return nil, nil, fmt.Errorf("%w: missing %q label",
 			ErrComposeScheduledMetadataUnavailable,
@@ -852,6 +858,11 @@ func prepareComposeScheduledDeployConfig(
 	encodedSecrets, err := secrettypes.EncodeExternalSecretRefs(interpolatedRefs)
 	if err != nil {
 		return fmt.Errorf("encode external secrets for scheduled service %s: %w", deployConfig.Name, err)
+	}
+
+	// Fork: the secret allowlist of the compose policy, before any secret is read.
+	if err := checkForkSecretGate(ctx, deployConfig, secretProvider, encodedSecrets); err != nil {
+		return fmt.Errorf("external secrets for scheduled service %s: %w", deployConfig.Name, err)
 	}
 
 	resolvedSecrets, err := secretProvider.ResolveSecretReferences(ctx, encodedSecrets)

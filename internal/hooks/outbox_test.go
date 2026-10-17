@@ -937,16 +937,22 @@ func TestOutboxShutdownDuringRoundIsNotAFailure(t *testing.T) {
 
 	var hits atomic.Int32
 
+	// The handler holds the send in flight until the test ends. The server does not always
+	// notice the client abort, so it is released explicitly; cleanups run last-in first-out,
+	// so release is closed before srv.Close waits for the handler.
+	release := make(chan struct{})
+
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		cancel() // the shutdown arrives while this send is in flight
 
 		select {
 		case <-r.Context().Done():
-		case <-time.After(10 * time.Second):
+		case <-release:
 		}
 	}))
 	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
 
 	dir := t.TempDir()
 	o := newTestOutbox(t, dir, srv.URL, func(c *OutboxConfig) { c.MaxAge = time.Hour })

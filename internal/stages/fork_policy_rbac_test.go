@@ -86,6 +86,9 @@ type countingSecretProvider struct {
 
 var errForkTestSecrets = errors.New("fork test: secret resolution reached")
 
+// Name is called by the secret allowlist check before every resolution.
+func (p *countingSecretProvider) Name() string { return "fork-test" }
+
 func (p *countingSecretProvider) ResolveSecretReferences(context.Context, map[string]string) (secrettypes.ResolvedSecrets, error) {
 	p.resolved++
 

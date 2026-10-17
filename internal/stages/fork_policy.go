@@ -1,7 +1,6 @@
 package stages
 
 import (
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -129,15 +128,8 @@ func (s *StageManager) evaluateForkPolicies(object string) error {
 	}
 
 	violations := f.Check(composepolicy.Input{
-		Project: s.Docker.Project,
-		Identity: composepolicy.Identity{
-			Object: object,
-			// The repository that declares name and context is the one holding the deploy config.
-			Repository:   cmp.Or(s.Repository.ConfigSourceUrl, s.Repository.SourceUrl),
-			Reference:    s.Repository.ResolvedReference,
-			ConfigTarget: s.DeployConfig.Internal.ConfigTarget,
-			Swarm:        s.Docker.SwarmMode,
-		},
+		Project:        s.Docker.Project,
+		Identity:       s.forkIdentity(object),
 		Paths:          s.policyPaths(),
 		DeployEnvFiles: s.externalPaths(s.forkDeclared.EnvFiles, true),
 		SecretsFiles:   s.externalPaths(s.forkDeclared.ExternalSecretsFiles, false),

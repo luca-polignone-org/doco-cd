@@ -845,6 +845,12 @@ func (s *StageManager) loadLastGoodFiles(ctx context.Context, cfg *deploy.Config
 		return fmt.Errorf("failed to encode external secret references: %w", err)
 	}
 
+	// Fork: the last good resolves its own secrets, so the allowlist in force is checked here too.
+	// A denial makes the rollback fail (rollback_failed), as any violation of the last good does.
+	if err := s.checkForkSecretsAs(s.lastGoodIdentity(cfg), encoded, false); err != nil {
+		return err
+	}
+
 	resolved, err := s.SecretProvider.ResolveSecretReferences(ctx, encoded)
 	if err != nil {
 		return fmt.Errorf("failed to resolve external secrets: %w", err)
@@ -902,13 +908,8 @@ func (s *StageManager) checkLastGoodPolicy(cfg *deploy.Config, project *types.Pr
 	}
 
 	violations := f.Check(composepolicy.Input{
-		Project: project,
-		Identity: composepolicy.Identity{
-			Object:       cfg.Object(),
-			Repository:   cmp.Or(s.Repository.ConfigSourceUrl, s.Repository.SourceUrl),
-			Reference:    s.Repository.ResolvedReference,
-			ConfigTarget: s.DeployConfig.Internal.ConfigTarget,
-		},
+		Project:        project,
+		Identity:       s.lastGoodIdentity(cfg),
 		Paths:          view.policyPaths(),
 		DeployEnvFiles: view.externalPaths(declared.EnvFiles, true),
 		SecretsFiles:   view.externalPaths(declared.ExternalSecretsFiles, false),

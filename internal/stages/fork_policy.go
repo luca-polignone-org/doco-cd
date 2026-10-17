@@ -15,6 +15,8 @@ import (
 	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/rbac"
 )
 
@@ -219,7 +221,27 @@ func (s *StageManager) checkTargetSync(ctx context.Context, object string) error
 		return nil
 	}
 
-	return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{{Field: "rbac", Value: "targets/sync"}}}
+	return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{targetSyncViolation}}
+}
+
+var targetSyncViolation = composepolicy.Violation{Field: "rbac", Value: "targets/sync"}
+
+// isTargetSyncDenial reports whether err is a denial whose only violation is targets/sync. Such
+// a denial is about the caller, not the target: handleStageFailure emits policy_denied for it
+// (the enforcer already wrote the audit line) but neither sends the failure notification nor
+// marks the target owner's commit as failed.
+func isTargetSyncDenial(err error) bool {
+	var denied *PolicyDeniedError
+
+	return errors.As(err, &denied) && len(denied.Violations) == 1 && denied.Violations[0] == targetSyncViolation
+}
+
+// callerDenied logs a targets/sync denial and returns it marked as notified, so the poll and
+// webhook handlers do not send a job-level notification for it either.
+func callerDenied(stageLog *slog.Logger, err error) error {
+	stageLog.Warn("deployment denied to the caller", logger.ErrAttr(err))
+
+	return notification.MarkNotified(err)
 }
 
 // runForkPreDeployStage is the pre-deploy stage of the deploy stage order: targets/sync, then

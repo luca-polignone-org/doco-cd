@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -139,4 +141,44 @@ func containsKey(doc, key string) bool {
 	_, ok := m[key]
 
 	return ok
+}
+
+// The timeouts come from the app repository: both decoders cap them, and refuse negative ones.
+func TestRollbackTimeoutCeiling(t *testing.T) {
+	accepted := []string{
+		"{enabled: true, timeout: 30m, pre_rollback_timeout: 5m}",
+		"{enabled: true, timeout: 0s, pre_rollback_timeout: 0s}",
+	}
+
+	for _, doc := range accepted {
+		var c RollbackConfig
+		if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("yaml %s: %v", doc, err)
+		}
+	}
+
+	refused := map[string]string{
+		"{timeout: 31m}":              "timeout must be between 0 and 30m0s",
+		"{timeout: -1s}":              "timeout must be between 0 and 30m0s",
+		"{pre_rollback_timeout: 6m}":  "pre_rollback_timeout must be between 0 and 5m0s",
+		"{pre_rollback_timeout: -1s}": "pre_rollback_timeout must be between 0 and 5m0s",
+	}
+
+	for doc, want := range refused {
+		var c RollbackConfig
+
+		err := yaml.Unmarshal([]byte(doc), &c)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("yaml %s: error = %v, want %q", doc, err, want)
+		}
+	}
+
+	var c RollbackConfig
+	if err := json.Unmarshal([]byte(`{"enabled":true,"timeout":"30m","pre_rollback_timeout":"5m"}`), &c); err != nil {
+		t.Fatalf("json at the ceiling: %v", err)
+	}
+
+	if err := json.Unmarshal([]byte(`{"timeout":"1h"}`), &c); !errors.Is(err, errInvalidRollbackTimeout) {
+		t.Fatalf("json over the ceiling: error = %v", err)
+	}
 }

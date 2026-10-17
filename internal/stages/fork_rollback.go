@@ -54,7 +54,7 @@ func (s *StageManager) persistForkFailure(f docker.DeploymentFailure, state roll
 	err := store.PutFailure(rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: f.Repository, Stack: f.Stack,
 		CommitSHA: f.CommitSHA, Stage: f.Stage, Error: truncateRunes(s.redactSecrets(f.Error), 2000),
-		FailedAt: f.FailedAt, State: state, Decision: decision,
+		FailedAt: f.FailedAt, State: state, Decision: decision, ContentKey: s.forkContentKeyOrEmpty(),
 	})
 	if err != nil {
 		s.Log.Error("failed to persist deployment failure", slog.String("object", s.DeployConfig.Object()), slog.Any("error", err))
@@ -376,7 +376,7 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName,
 	f := rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: mem.Repository, Stack: mem.Stack,
 		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(s.redactSecrets(cause.Error()), 2000),
-		FailedAt: mem.FailedAt, State: rollback.StateFailed,
+		FailedAt: mem.FailedAt, State: rollback.StateFailed, ContentKey: s.forkContentKeyOrEmpty(),
 	}
 
 	log := s.Log.With(slog.String("object", f.Object), slog.String("failed_commit", f.CommitSHA))
@@ -407,7 +407,8 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName,
 // rolled_back, blocked or rollback_failed: pre-deploy then skips it, on every source and with or
 // without containers. On a new commit the failure goes back to failed with its own commit, so
 // the upstream retry stays the usual one and the success of the new commit clears it. The reset
-// emits unblocked, before the new commit is deployed.
+// emits unblocked, before the new commit is deployed. With rollback.unblock_on: content a new
+// commit whose content key equals the recorded one stays poisoned (sameForkContent).
 func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, stageLog *slog.Logger) bool {
 	f, ok := s.loadForkFailure()
 	if !ok || f.State == rollback.StateFailed {
@@ -415,6 +416,15 @@ func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, st
 	}
 
 	if strings.TrimSpace(f.CommitSHA) != revision {
+		if s.sameForkContent(f, revision, stageLog) {
+			stageLog.Warn("new commit with the content of the rolled back or blocked one, skipping",
+				slog.String("commit", revision), slog.String("failed_commit", f.CommitSHA), slog.String("state", string(f.State)))
+
+			s.verifyPoisonedTarget(ctx, f.State, stageLog)
+
+			return true
+		}
+
 		f.State, f.Decision = rollback.StateFailed, ""
 		if err := s.forkStore().PutFailure(f); err != nil {
 			stageLog.Error("failed to reset rollback state", slog.Any("error", err))

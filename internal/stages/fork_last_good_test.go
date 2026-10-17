@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/image"
 	"github.com/moby/moby/client"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/kimdre/doco-cd/internal/common/types/duration"
 	"github.com/kimdre/doco-cd/internal/config"
@@ -114,18 +116,15 @@ func assertNoSecretUnder(t *testing.T, root string, secrets ...string) {
 	}
 }
 
-// initLastGoodRepo creates a git repository with one commit; go-git opens it as a mirror.
-func initLastGoodRepo(t *testing.T) (string, string) {
+// initLastGoodRepo creates a git repository with two commits on its branch and returns the
+// first one and the tip; go-git opens the repository as a mirror.
+func initLastGoodRepo(t *testing.T) (dir, first, tip string) {
 	t.Helper()
 
-	dir := t.TempDir()
+	dir = t.TempDir()
 
 	repo, err := gogit.PlainInit(dir, false)
 	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte("services: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -134,16 +133,42 @@ func initLastGoodRepo(t *testing.T) (string, string) {
 		t.Fatal(err)
 	}
 
-	if _, err := wt.Add("compose.yaml"); err != nil {
-		t.Fatal(err)
+	commits := make([]string, 0, 2)
+
+	for _, content := range []string{"services: {}\n", "services: {app: {image: nginx}}\n"} {
+		if err := os.WriteFile(filepath.Join(dir, "compose.yaml"), []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := wt.Add("compose.yaml"); err != nil {
+			t.Fatal(err)
+		}
+
+		hash, err := wt.Commit("commit", &gogit.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@example.com", When: time.Now()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		commits = append(commits, hash.String())
 	}
 
-	hash, err := wt.Commit("initial", &gogit.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@example.com", When: time.Now()}})
+	return dir, commits[0], commits[1]
+}
+
+func lastGoodRefOf(t *testing.T, mirror string) string {
+	t.Helper()
+
+	repo, err := gogit.PlainOpen(mirror)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	return dir, hash.String()
+	ref, err := repo.Reference("refs/doco-cd/lastgood/default/web", false)
+	if err != nil {
+		return ""
+	}
+
+	return ref.Hash().String()
 }
 
 func TestRecordLastGoodWritesNothingWithoutRollback(t *testing.T) {
@@ -158,11 +183,17 @@ func TestRecordLastGoodWritesNothingWithoutRollback(t *testing.T) {
 	assertNoForkDir(t, data)
 }
 
-func TestRecordLastGoodNeverOnDestroy(t *testing.T) {
+func TestRecordLastGoodNeverOnDestroyOrSwarm(t *testing.T) {
 	t.Parallel()
 
 	sm, data := newLastGoodManager(t, &deploy.RollbackConfig{Enabled: true}, &lastGoodClient{})
 	sm.DeployConfig.Destroy.Enabled = true
+
+	sm.recordLastGood(t.Context())
+	assertNoForkDir(t, data)
+
+	sm, data = newLastGoodManager(t, &deploy.RollbackConfig{Enabled: true}, &lastGoodClient{})
+	sm.Docker.SwarmMode = true
 
 	sm.recordLastGood(t.Context())
 	assertNoForkDir(t, data)
@@ -203,35 +234,81 @@ func TestRecordLastGoodOCI(t *testing.T) {
 	assertNoSecretUnder(t, filepath.Join(data, "fork"), "s3cr3t", "tok3n")
 }
 
-func TestRecordLastGoodPinsGitCommit(t *testing.T) {
+// The recorded commit is the deployed one, never the mirror tip, which moved after the deploy.
+func TestRecordLastGoodPinsDeployedCommitNotMirrorTip(t *testing.T) {
 	t.Parallel()
 
-	mirror, commit := initLastGoodRepo(t)
+	for name, stamped := range map[string]bool{"published revision": false, "commit stamped by the deploy stage": true} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			mirror, deployed, tip := initLastGoodRepo(t)
+
+			sm, data := newLastGoodManager(t, &deploy.RollbackConfig{Enabled: true}, &lastGoodClient{})
+			sm.Repository.Source = config.SourceTypeGit
+			sm.Repository.MirrorDir = mirror
+			sm.DeployState.latestCommit = ""
+
+			sm.Repository.Revision = " " + deployed + " "
+			if stamped {
+				sm.Repository.Revision = tip
+				sm.forkDeployedCommit = deployed
+			}
+
+			sm.recordLastGood(t.Context())
+
+			lg, ok, err := rollback.StoreFor(data).GetLastGood("default/web")
+			if err != nil || !ok || lg.CommitSHA != deployed {
+				t.Fatalf("last good = %+v ok=%v err=%v, want commit %s (tip %s)", lg, ok, err, deployed, tip)
+			}
+
+			if lg.Images == nil || len(lg.Images) != 0 {
+				t.Fatalf("images = %#v, want an empty list", lg.Images)
+			}
+
+			if got := lastGoodRefOf(t, mirror); got != deployed {
+				t.Fatalf("last good ref = %q, want %s", got, deployed)
+			}
+		})
+	}
+}
+
+// A failed pin is logged; the store already holds the last good, whose commit is still in the
+// mirror.
+func TestRecordLastGoodPinFailureKeepsRecord(t *testing.T) {
+	t.Parallel()
+
+	sm, data := newLastGoodManager(t, &deploy.RollbackConfig{Enabled: true}, &lastGoodClient{})
+	sm.Repository.Source = config.SourceTypeGit
+	sm.Repository.MirrorDir = filepath.Join(t.TempDir(), "missing")
+	sm.forkDeployedCommit = strings.Repeat("ab", 20)
+
+	sm.recordLastGood(t.Context())
+
+	if lg, ok, err := rollback.StoreFor(data).GetLastGood("default/web"); err != nil || !ok || lg.CommitSHA != sm.forkDeployedCommit {
+		t.Fatalf("last good = %+v ok=%v err=%v", lg, ok, err)
+	}
+}
+
+// A failed store write leaves the mirror ref where it was: the JSON and the ref never disagree.
+func TestRecordLastGoodStoreFailureDoesNotMoveRef(t *testing.T) {
+	t.Parallel()
+
+	mirror, deployed, _ := initLastGoodRepo(t)
 
 	sm, data := newLastGoodManager(t, &deploy.RollbackConfig{Enabled: true}, &lastGoodClient{})
 	sm.Repository.Source = config.SourceTypeGit
 	sm.Repository.MirrorDir = mirror
-	sm.DeployState.latestCommit = commit
+	sm.forkDeployedCommit = deployed
 
-	sm.recordLastGood(t.Context())
-
-	lg, ok, err := rollback.StoreFor(data).GetLastGood("default/web")
-	if err != nil || !ok || lg.CommitSHA != commit {
-		t.Fatalf("last good not recorded: %+v ok=%v err=%v", lg, ok, err)
-	}
-
-	if lg.Images == nil || len(lg.Images) != 0 {
-		t.Fatalf("images = %#v, want an empty list", lg.Images)
-	}
-
-	repo, err := gogit.PlainOpen(mirror)
-	if err != nil {
+	if err := os.WriteFile(filepath.Join(data, "fork"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	ref, err := repo.Reference("refs/doco-cd/lastgood/default/web", false)
-	if err != nil || ref.Hash().String() != commit {
-		t.Fatalf("last good ref = %v err=%v, want %s", ref, err, commit)
+	sm.recordLastGood(t.Context())
+
+	if got := lastGoodRefOf(t, mirror); got != "" {
+		t.Fatalf("last good ref = %q, want none", got)
 	}
 }
 
@@ -241,20 +318,14 @@ func TestRecordLastGoodFailuresAreNotFatal(t *testing.T) {
 
 	cases := map[string]func(t *testing.T, sm *StageManager, data string){
 		"deployed commit": func(_ *testing.T, sm *StageManager, _ string) {
-			sm.Repository.Source = config.SourceTypeGit
-			sm.Repository.MirrorDir = ""
-			sm.DeployState.latestCommit = ""
+			sm.Repository.Revision = " "
+			sm.forkDeployedCommit = ""
 		},
 		"images": func(_ *testing.T, sm *StageManager, _ string) {
 			sm.Docker.Cmd = destroyOwnershipTestCli{apiClient: &lastGoodClient{listErr: errors.New("daemon down")}}
 		},
 		"deploy config": func(_ *testing.T, sm *StageManager, _ string) {
 			sm.DeployConfig.Timeout = duration.Duration(1500 * time.Millisecond)
-		},
-		"pin": func(t *testing.T, sm *StageManager, _ string) {
-			sm.Repository.Source = config.SourceTypeGit
-			sm.Repository.MirrorDir = filepath.Join(t.TempDir(), "missing")
-			sm.DeployState.latestCommit = strings.Repeat("ab", 20)
 		},
 		"store": func(t *testing.T, _ *StageManager, data string) {
 			if err := os.WriteFile(filepath.Join(data, "fork"), []byte("x"), 0o600); err != nil {
@@ -295,7 +366,7 @@ func TestDeployConfigForLastGood(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, secret := range []string{"s3cr3t", "tok3n", "x-access-token"} {
+	for _, secret := range []string{"s3cr3t", "tok3n", "x-access-token", "internal:"} {
 		if bytes.Contains(data, []byte(secret)) {
 			t.Errorf("deploy config contains %q:\n%s", secret, data)
 		}
@@ -318,6 +389,97 @@ func TestDeployConfigForLastGood(t *testing.T) {
 	}
 }
 
+const lastGoodRoundTripConfig = `
+name: web
+reference: main
+repository_url: https://github.com/org/repo.git
+environment:
+  PUBLIC: visible-value
+env_files: [x.env]
+external_secrets:
+  LEGACY: 138e3a97-ed58-431c-b366-b35500663411
+  HOOK:
+    store_ref: bitwarden-login
+    remote_ref:
+      key: abc
+      property: password
+destroy:
+  enabled: false
+  remove_volumes: false
+rollback:
+  enabled: true
+  timeout: 2m
+reconciliation:
+  enabled: false
+  events: [die]
+  restart_timeout: 30s
+auto_discovery:
+  enabled: true
+  depth: 2
+  remove_images: false
+timeout: 90s
+`
+
+// The stored YAML reads back into the same deploy config, external secret references included.
+func TestDeployConfigForLastGoodRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	var orig deploy.Config
+	if err := yaml.Unmarshal([]byte(lastGoodRoundTripConfig), &orig); err != nil {
+		t.Fatal(err)
+	}
+
+	orig.Internal.Environment = map[string]string{"SECRET": "s3cr3t"}
+
+	data, err := deployConfigForLastGood(&orig, declaredFiles{EnvFiles: []string{".env", "x.env"}, ExternalSecretsFiles: []string{"secrets.yaml"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got deploy.Config
+	if err := yaml.Unmarshal(data, &got); err != nil {
+		t.Fatalf("stored deploy config does not read back: %v\n%s", err, data)
+	}
+
+	want := orig
+	want.Internal = deploy.Config{}.Internal
+	want.EnvFiles = []string{".env", "x.env"}
+	want.ExternalSecretsFiles = []string{"secrets.yaml"}
+
+	if len(want.ExternalSecrets) != 2 || !reflect.DeepEqual(got.ExternalSecrets, want.ExternalSecrets) {
+		t.Fatalf("external secrets = %+v, want %+v", got.ExternalSecrets, want.ExternalSecrets)
+	}
+
+	for name, pair := range map[string][2]any{
+		"destroy":        {got.Destroy, want.Destroy},
+		"rollback":       {got.Rollback, want.Rollback},
+		"reconciliation": {got.Reconciliation, want.Reconciliation},
+		"auto_discovery": {got.AutoDiscovery, want.AutoDiscovery},
+		"timeout":        {got.Timeout, want.Timeout},
+		"environment":    {got.Environment, want.Environment},
+	} {
+		if !reflect.DeepEqual(pair[0], pair[1]) {
+			t.Errorf("%s = %+v, want %+v", name, pair[0], pair[1])
+		}
+	}
+
+	// The hash covers every field; it only tells nil and empty collections apart, which YAML
+	// does not.
+	gotHash, err := got.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	wantHash, err := want.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotHash != wantHash {
+		t.Fatalf("round trip changed the deploy config:\n%s", data)
+	}
+}
+
 func TestWithoutUserinfo(t *testing.T) {
 	t.Parallel()
 
@@ -327,8 +489,10 @@ func TestWithoutUserinfo(t *testing.T) {
 		"ssh://git@example.com/org/repo.git":          "ssh://example.com/org/repo.git",
 		"https://example.com/org/repo.git":            "https://example.com/org/repo.git",
 		"ghcr.io/org/app:1.0":                         "ghcr.io/org/app:1.0",
-		"git@github.com:org/repo.git":                 "git@github.com:org/repo.git",
-		"https://user:token@example.com/%zz":          "",
+		"ghcr.io/org/app@sha256:abc":                  "ghcr.io/org/app@sha256:abc",
+		"git@github.com:org/repo.git":                 "github.com:org/repo.git",
+		"user:token@host:org/repo":                    "host:org/repo",
+		"https://user:token@example.com/%zz":          redactedURL,
 		"":                                            "",
 	} {
 		if got := withoutUserinfo(in); got != want {

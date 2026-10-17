@@ -312,6 +312,9 @@ type StageManager struct {
 	// forkDeclared are the file lists of the deploy config as declared, before the init stage
 	// consumes them: the compose policy needs them.
 	forkDeclared declaredFiles
+	// forkDeployedCommit is the commit the deploy stage stamped on a successful deploy: the last
+	// good records it instead of re-reading a branch tip that may have moved since.
+	forkDeployedCommit string
 }
 
 // memoizedShortSHA pairs a full commit SHA with its shortest unique prefix.

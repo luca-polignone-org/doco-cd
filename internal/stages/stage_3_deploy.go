@@ -81,6 +81,8 @@ func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger
 		return fmt.Errorf("failed to deploy stack %s: %w", s.DeployConfig.Name, err)
 	}
 
+	s.forkDeployedCommit = latestCommit
+
 	return nil
 }
 

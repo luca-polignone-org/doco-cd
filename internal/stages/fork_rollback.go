@@ -83,10 +83,11 @@ func truncateRunes(v string, n int) string {
 	return v
 }
 
-// recordLastGood makes a successful deploy the target's last good. A destroy never does, and
-// without rollback enabled nothing is written. A failure is logged and never fails the deploy.
+// recordLastGood makes a successful deploy the target's last good. A destroy never does, nor a
+// Swarm deploy (rollback is Compose only), and without rollback enabled nothing is written. A
+// failure is logged and never fails the deploy.
 func (s *StageManager) recordLastGood(ctx context.Context) {
-	if s.DeployConfig.Destroy.Enabled {
+	if s.DeployConfig.Destroy.Enabled || s.Docker.SwarmMode {
 		return
 	}
 
@@ -98,9 +99,15 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 	object := s.DeployConfig.Object()
 	log := s.Log.With(slog.String("object", object))
 
-	commit, err := s.deployedCommit()
-	if err != nil {
-		log.Error("failed to resolve deployed commit for last good", slog.Any("error", err))
+	// The commit the deploy stage stamped, else the immutable published revision; never the
+	// mirror's branch tip, which may have moved during the deploy.
+	commit := s.forkDeployedCommit
+	if commit == "" {
+		commit = strings.TrimSpace(s.Repository.Revision)
+	}
+
+	if commit == "" {
+		log.Error("failed to resolve deployed commit for last good")
 		return
 	}
 
@@ -116,15 +123,10 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 		return
 	}
 
-	// The ref goes before the state: a last good pointing at an unprotected commit could
-	// lose it on the next force push.
-	if s.Repository.Source != config.SourceTypeOCI && s.Repository.MirrorDir != "" {
-		if err = gitInternal.PinLastGood(s.Repository.MirrorDir, object, commit); err != nil {
-			log.Error("failed to pin last good commit", slog.Any("error", err))
-			return
-		}
-	}
-
+	// The state goes before the ref. The JSON is what the rollback reads; the ref only keeps
+	// its commit reachable across a force push, and mirror compaction never drops objects, so
+	// a failed pin leaves a commit that is still in the mirror. The reverse order would leave
+	// the ref on a commit the JSON does not name when the store write fails.
 	err = store.PutLastGood(rollback.LastGood{
 		Object: object, CommitSHA: commit, SourceURL: withoutUserinfo(s.Repository.SourceUrl),
 		ProjectHash: s.Docker.ProjectHash, DeployConfig: cfg, Images: images,
@@ -132,12 +134,38 @@ func (s *StageManager) recordLastGood(ctx context.Context) {
 	})
 	if err != nil {
 		log.Error("failed to record last good deployment", slog.Any("error", err))
+		return
+	}
+
+	if s.Repository.Source != config.SourceTypeOCI && s.Repository.MirrorDir != "" {
+		if err = gitInternal.PinLastGood(s.Repository.MirrorDir, object, commit); err != nil {
+			log.Error("failed to pin last good commit", slog.Any("error", err))
+		}
 	}
 }
 
-// deployConfigForLastGood serializes the deploy config with the internal struct zeroed. It is
+// lastGoodDocument encodes the deploy config and its external secret references in one pass,
+// so that the references can be spliced into the config in their canonical form.
+type lastGoodDocument struct {
+	Config          *deploy.Config `yaml:"config"`
+	ExternalSecrets map[string]any `yaml:"external_secrets"`
+}
+
+// structuredSecretRef is the YAML form secrettypes.ExternalSecretRef reads back for a
+// structured (webhook) reference.
+type structuredSecretRef struct {
+	StoreRef  string         `yaml:"store_ref"`
+	RemoteRef map[string]any `yaml:"remote_ref,omitempty"`
+}
+
+// deployConfigForLastGood serializes the deploy config with the internal struct dropped. It is
 // mandatory, not a precaution: Internal.Environment holds the resolved secrets and has no
 // yaml:"-". Credentials embedded in repository_url are dropped as well.
+//
+// ExternalSecretRef has no MarshalYAML, so the default encoding (legacyref, storeref, ...) would
+// not read back; changing the type would change deploy.Config.Hash(). The references are
+// written here in the form its UnmarshalYAML reads: a scalar for a legacy reference,
+// store_ref/remote_ref for a structured one.
 func deployConfigForLastGood(c *deploy.Config, declared declaredFiles) ([]byte, error) {
 	copyCfg := *c
 	copyCfg.Internal = deploy.Config{}.Internal
@@ -147,25 +175,64 @@ func deployConfigForLastGood(c *deploy.Config, declared declaredFiles) ([]byte, 
 	copyCfg.EnvFiles = slices.Clone(declared.EnvFiles)
 	copyCfg.ExternalSecretsFiles = slices.Clone(declared.ExternalSecretsFiles)
 
-	data, err := yaml.Marshal(&copyCfg)
-	if err != nil {
+	refs := make(map[string]any, len(c.ExternalSecrets))
+	for name, ref := range c.ExternalSecrets {
+		if ref.LegacyRef != "" {
+			refs[name] = ref.LegacyRef
+			continue
+		}
+
+		refs[name] = structuredSecretRef{StoreRef: ref.StoreRef, RemoteRef: ref.RemoteRef}
+	}
+
+	var doc yaml.Node
+	if err := doc.Encode(lastGoodDocument{Config: &copyCfg, ExternalSecrets: refs}); err != nil {
 		return nil, fmt.Errorf("encode deploy config: %w", err)
 	}
 
-	return data, nil
+	cfgNode, refsNode := doc.Content[1], doc.Content[3]
+	content := make([]*yaml.Node, 0, len(cfgNode.Content))
+
+	for i := 0; i+1 < len(cfgNode.Content); i += 2 {
+		key, value := cfgNode.Content[i], cfgNode.Content[i+1]
+
+		switch key.Value {
+		case "internal":
+			continue
+		case "external_secrets":
+			value = refsNode
+		}
+
+		content = append(content, key, value)
+	}
+
+	cfgNode.Content = content
+
+	return yaml.Marshal(cfgNode)
 }
 
-// withoutUserinfo drops the user and password of a URL, where an access token can be embedded
-// (https://user:token@host/...). A value that does not parse as a URL is kept only if it has no
-// scheme, like the scp-like git@host:org/repo form, whose user is never a secret.
+// redactedURL replaces a source URL whose credentials cannot be told apart from the rest.
+// It is never empty, so it cannot read as "same repository" as an unset URL.
+const redactedURL = "<redacted>"
+
+// withoutUserinfo drops the user and password of a source URL, where an access token can be
+// embedded. With a scheme (https://user:token@host/...) the URL is parsed and its userinfo
+// dropped; one that does not parse is redacted. Without "://" (scp-like user@host:org/repo,
+// or an OCI reference) everything up to the last "@" before the first "/" is dropped, so an
+// OCI digest (registry/app@sha256:...) is kept.
 func withoutUserinfo(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		if strings.Contains(raw, "://") {
-			return ""
+	if !strings.Contains(raw, "://") {
+		head, _, _ := strings.Cut(raw, "/")
+		if i := strings.LastIndex(head, "@"); i >= 0 {
+			return raw[i+1:]
 		}
 
 		return raw
+	}
+
+	u, err := url.Parse(raw)
+	if err != nil {
+		return redactedURL
 	}
 
 	if u.User == nil {

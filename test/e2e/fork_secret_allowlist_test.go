@@ -31,6 +31,8 @@ const (
 	// forkOpenBaoAddr is on the daemon's own loopback: the dev server shares its network namespace.
 	forkOpenBaoAddr      = "http://127.0.0.1:8200"
 	forkOpenBaoRootToken = "e2e-fork-bao-root" // #nosec G101 -- test fixture, not a real credential.
+	// forkOpenBaoAuditLog is the file audit device of the dev server, inside the sidecar.
+	forkOpenBaoAuditLog = "/tmp/audit.log"
 
 	forkSecretAllowed      = "allowed-value"                          // #nosec G101 -- test fixture, not a real credential.
 	forkSecretOther        = "other-value"                            // #nosec G101 -- test fixture, not a real credential.
@@ -39,11 +41,19 @@ const (
 )
 
 // startOpenBaoSidecar runs an OpenBao dev server in the daemon's network namespace, listening on
-// the daemon's 127.0.0.1:8200 with forkOpenBaoRootToken as its root token. Call after Start. The
+// the daemon's 127.0.0.1:8200 with forkOpenBaoRootToken as its root token, and a config that
+// allows creating audit devices through the API. Call after Start. The
 // entrypoint script is skipped: it only adds a config directory and drops privileges, neither of
 // which a dev server needs.
 func (h *Harness) startOpenBaoSidecar() testcontainers.Container {
 	h.t.Helper()
+
+	// OpenBao 2.x refuses to create audit devices through the API unless the server config allows
+	// it (CVE-2025-6000); the test enables the file device with bao audit enable.
+	confPath := filepath.Join(h.workDir, "openbao.hcl")
+	if err := os.WriteFile(confPath, []byte("unsafe_allow_api_audit_creation = true\n"), 0o644); err != nil { //nolint:gosec // read by the sidecar
+		h.t.Fatalf("write OpenBao config: %v", err)
+	}
 
 	daemonID := h.daemon.GetContainerID()
 
@@ -56,9 +66,11 @@ func (h *Harness) startOpenBaoSidecar() testcontainers.Container {
 				"server", "-dev",
 				"-dev-root-token-id=" + forkOpenBaoRootToken,
 				"-dev-listen-address=127.0.0.1:8200",
+				"-config=/openbao/e2e.hcl",
 			},
 			HostConfigModifier: func(hc *container.HostConfig) {
 				hc.NetworkMode = container.NetworkMode("container:" + daemonID)
+				hc.Binds = append(hc.Binds, confPath+":/openbao/e2e.hcl:ro")
 			},
 			WaitingFor: wait.ForExec([]string{"bao", "status", "-address=" + forkOpenBaoAddr}).
 				WithStartupTimeout(60 * time.Second).
@@ -98,6 +110,22 @@ func (h *Harness) baoExec(sidecar testcontainers.Container, token string, args .
 	}
 
 	return strings.TrimSpace(stdout.String())
+}
+
+// openBaoAuditLines returns the lines of the OpenBao audit log that contain path. The log itself
+// is never printed: a failure shows only the matching lines.
+func (h *Harness) openBaoAuditLines(sidecar testcontainers.Container, path string) []string {
+	h.t.Helper()
+
+	var out []string
+
+	for line := range strings.Lines(h.ExecOutput(sidecar.GetContainerID(), "cat", forkOpenBaoAuditLog)) {
+		if strings.Contains(line, path) {
+			out = append(out, strings.TrimSpace(line))
+		}
+	}
+
+	return out
 }
 
 // containerEnv returns the environment of a container, as KEY=value entries.
@@ -171,10 +199,16 @@ func TestForkSecretAllowlist(t *testing.T) {
 	h.baoExec(bao, forkOpenBaoRootToken, "kv", "put", "secret/prod/e2e-fork-secret/db", "PASS="+forkSecretAllowed)
 	h.baoExec(bao, forkOpenBaoRootToken, "kv", "put", "secret/prod/other/db", "PASS="+forkSecretOther)
 
+	// Enabled after the writes above, so every request in the audit log comes from the daemon or
+	// from the token rotation of phase 3.
+	h.baoExec(bao, forkOpenBaoRootToken, "audit", "enable", "file", "file_path="+forkOpenBaoAuditLog)
+
 	object := "default/" + forkSecretStack
 
-	// 1. A reference outside the allowlist: denied before any secret is read.
-	h.WaitForLog("deployment denied by policy", 120*time.Second)
+	// 1. A reference outside the allowlist: denied before any secret is read. The denial is
+	// awaited after the audit device is on, so the audit check below covers at least one.
+	auditMark := h.LogMark()
+	h.WaitForLogAfter("deployment denied by policy", auditMark, 120*time.Second)
 
 	if !h.daemonHasLog("external_secrets.DB=" + forkSecretForbiddenRef) {
 		t.Fatal("daemon log must name the external_secrets.DB violation")
@@ -213,6 +247,17 @@ func TestForkSecretAllowlist(t *testing.T) {
 		t.Fatal("app container must have DB set to the resolved secret")
 	}
 
+	// OpenBao never saw a request for the forbidden secret. The audit log hashes values with
+	// HMAC but keeps paths in clear text: the allowed read of phase 2 is the positive control
+	// that the check can see a path at all.
+	if allowed := h.openBaoAuditLines(bao, "prod/e2e-fork-secret/db"); len(allowed) == 0 {
+		t.Fatal("the OpenBao audit log has no request for the allowed secret: the audit check would be vacuous")
+	}
+
+	if forbidden := h.openBaoAuditLines(bao, "prod/other/db"); len(forbidden) > 0 {
+		t.Fatalf("OpenBao received requests for the forbidden secret:\n%s", strings.Join(forbidden, "\n"))
+	}
+
 	// 3. The token file is rewritten by rename, as a bao agent does, and the old token revoked.
 	// The new token is an orphan: a child of the root token would be revoked with it.
 	newToken := h.baoExec(bao, forkOpenBaoRootToken, "token", "create", "-orphan", "-policy=root", "-field=token")
@@ -230,6 +275,10 @@ func TestForkSecretAllowlist(t *testing.T) {
 	}
 
 	h.baoExec(bao, newToken, "token", "revoke", forkOpenBaoRootToken)
+
+	// The reload takes the stat path deterministically: the file was rewritten before the push,
+	// and the new token has a different size from forkOpenBaoRootToken. The fallback on a 403
+	// (forceRefresh and one retry) is covered by the unit tests of the reload (PR #9).
 
 	mark = h.LogMark()
 	h.ReplaceInWorktree("deploy/compose.yaml", "    command:", "    labels:\n      e2e.token: rotated\n    command:")

@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -120,8 +121,19 @@ func TestForkUnblockOnContent(t *testing.T) {
 		h.writeWorktree(map[string]string{"other/README": message + "\n"})
 		c := h.RepoPush(message).String()
 
-		h.WaitForLogLineAfter(mark, 90*time.Second, forkUnblockSameContent, c)
-		h.WaitForLogOccurrencesAfter(forkUnblockSameContent, mark, 2, 90*time.Second)
+		// Only the lines of c count: right after a restart the first poll may still skip the
+		// previous commit after the mark.
+		h.WaitFor(90*time.Second, "two polls skip "+c+" on the same content", func() bool {
+			n := 0
+
+			for line := range strings.Lines(h.logsSince(mark)) {
+				if containsAll(line, []string{forkUnblockSameContent, c}) {
+					n++
+				}
+			}
+
+			return n >= 2
+		})
 
 		if n := len(rec.outcomes(object)); n != before {
 			t.Fatalf("%s: %d new outcome events for %s, want none", message, n-before, object)

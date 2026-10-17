@@ -35,7 +35,7 @@ type RunOperations interface {
 // Dependencies contains the runtime services and HTTP settings required by Handler.
 type Dependencies struct {
 	Version              string `validate:"required"`
-	APISecret            string
+	APISecret            string `validate:"required"`
 	MaxPayloadSize       int64  `validate:"min=1"`
 	TrustedProxyHeader   string `default:"X-Forwarded-For"`
 	TrustedProxyNetworks []netip.Prefix

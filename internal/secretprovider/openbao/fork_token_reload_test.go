@@ -1,8 +1,11 @@
 package openbao
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,22 +49,77 @@ func (s *kvServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(`{"data":{"data":{"PASS":"v"},"metadata":{"version":1}}}`))
 }
 
+// stampSeq makes every writeToken mtime distinct and increasing, even for two tokens of the same
+// size on a filesystem with coarse timestamps.
+var stampSeq atomic.Int64
+
 func writeToken(t *testing.T, path, tok string) {
 	t.Helper()
 
+	if err := writeTokenFile(path, tok); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeTokenFile is writeToken without the testing.T, for goroutines that are not the test's.
+func writeTokenFile(path, tok string) error {
 	// The agent writes the sink with a rename: so does the test, so a reader never sees half a file.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(tok+"\n"), 0o600); err != nil {
-		t.Fatal(err)
+		return err
 	}
 
 	if err := os.Rename(tmp, path); err != nil {
-		t.Fatal(err)
+		return err
 	}
 
-	// mtime granularity: make sure the stamp changes even on fast filesystems.
-	future := time.Now().Add(time.Duration(len(tok)) * time.Second)
-	_ = os.Chtimes(path, future, future)
+	stamp := time.Now().Add(time.Duration(stampSeq.Add(1)) * time.Hour)
+
+	return os.Chtimes(path, stamp, stamp)
+}
+
+// lockedBuffer is a bytes.Buffer safe for the concurrent writes of a slog handler.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}
+
+// captureLogs sends the default slog logger to a buffer until the test ends.
+func captureLogs(t *testing.T) *lockedBuffer {
+	t.Helper()
+
+	buf := &lockedBuffer{}
+	prev := slog.Default()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	return buf
+}
+
+// assertNoTokenInLogs fails if any token value reached the logs.
+func assertNoTokenInLogs(t *testing.T, logs string, tokens ...string) {
+	t.Helper()
+
+	for _, tok := range tokens {
+		if strings.Contains(logs, tok) {
+			t.Fatalf("the logs carry the token %q:\n%s", tok, logs)
+		}
+	}
 }
 
 func reloadingProvider(t *testing.T, srv *kvServer, tok string) (*Provider, string) {
@@ -148,19 +206,63 @@ func TestTokenReloadNoRetryOnIssue(t *testing.T) {
 func TestTokenReloadEmptyFileKeepsToken(t *testing.T) {
 	srv := &kvServer{}
 	p, path := reloadingProvider(t, srv, "tok-1")
+	logs := captureLogs(t)
 
 	writeToken(t, path, "")
 
-	if _, err := p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err != nil {
-		t.Fatalf("an empty file must keep the token in use: %v", err)
+	for range 3 {
+		if _, err := p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err != nil {
+			t.Fatalf("an empty file must keep the token in use: %v", err)
+		}
 	}
+
+	out := logs.String()
+	if n := strings.Count(out, "level=ERROR"); n != 1 {
+		t.Fatalf("%d ERROR lines after 3 calls on an empty file, want exactly 1:\n%s", n, out)
+	}
+
+	if !strings.Contains(out, "openbao token file empty, keeping the token in use") {
+		t.Fatalf("missing the empty-file message:\n%s", out)
+	}
+
+	// The agent writes a token again: one recovery line, no new ERROR.
+	writeToken(t, path, "tok-2")
+	srv.setToken("tok-2")
+
+	for range 2 {
+		if _, err := p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err != nil {
+			t.Fatalf("GetSecret() after the file is written again: %v", err)
+		}
+	}
+
+	out = logs.String()
+	if n := strings.Count(out, "level=WARN"); n != 1 || !strings.Contains(out, "openbao token file usable again") {
+		t.Fatalf("want exactly one recovery line:\n%s", out)
+	}
+
+	if n := strings.Count(out, "level=ERROR"); n != 1 {
+		t.Fatalf("%d ERROR lines after the recovery, want still 1:\n%s", n, out)
+	}
+
+	assertNoTokenInLogs(t, out, "tok-1", "tok-2")
 }
 
 func TestTokenReloadConcurrent(t *testing.T) {
 	srv := &kvServer{}
 	p, path := reloadingProvider(t, srv, "tok-1")
 
-	var wg sync.WaitGroup
+	var (
+		wg   sync.WaitGroup
+		mu   sync.Mutex
+		errs []error
+	)
+
+	record := func(err error) {
+		mu.Lock()
+
+		errs = append(errs, err)
+		mu.Unlock()
+	}
 
 	for i := range 20 {
 		wg.Add(1)
@@ -169,15 +271,28 @@ func TestTokenReloadConcurrent(t *testing.T) {
 			defer wg.Done()
 
 			if i == 10 {
-				writeToken(t, path, "tok-2")
+				if err := writeTokenFile(path, "tok-2"); err != nil {
+					record(fmt.Errorf("write token file: %w", err))
+				}
+
 				srv.setToken("tok-2")
 			}
 
-			_, _ = p.ResolveSecretReferences(context.Background(), map[string]string{"A": "kv:secret:prod/web/db:PASS"})
+			if _, err := p.ResolveSecretReferences(context.Background(), map[string]string{"A": "kv:secret:prod/web/db:PASS"}); err != nil {
+				record(err)
+			}
 		}()
 	}
 
 	wg.Wait()
+
+	// A request may still lose the race (the file has tok-2, the server still wants tok-1, or
+	// the opposite) and end in a 403 after its one retry; anything else is a bug.
+	for _, err := range errs {
+		if !isForbidden(err) {
+			t.Errorf("concurrent resolution failed with something other than a 403: %v", err)
+		}
+	}
 
 	if _, err := p.ResolveSecretReferences(context.Background(), map[string]string{"A": "kv:secret:prod/web/db:PASS"}); err != nil {
 		t.Fatalf("after the race the new token must be in use: %v", err)
@@ -449,6 +564,7 @@ func TestEnableTokenReloadMissingFile(t *testing.T) {
 func TestTokenReloadUnreadableFileKeepsToken(t *testing.T) {
 	srv := &kvServer{}
 	p, path := reloadingProvider(t, srv, "tok-1")
+	logs := captureLogs(t)
 
 	// stat fails: the file is gone.
 	if err := os.Remove(path); err != nil {
@@ -482,6 +598,57 @@ func TestTokenReloadUnreadableFileKeepsToken(t *testing.T) {
 	if _, err := p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err == nil {
 		t.Fatal("a refused token with a missing file must fail")
 	}
+
+	out := logs.String()
+	for _, want := range []string{"no such file or directory", "is a directory", "openbao token file unreadable, keeping the token in use"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in the logs:\n%s", want, out)
+		}
+	}
+
+	assertNoTokenInLogs(t, out, "tok-1", "tok-2")
+}
+
+func TestTokenReloadRecoversWhenTheSameFileComesBack(t *testing.T) {
+	srv := &kvServer{}
+	p, path := reloadingProvider(t, srv, "tok-1")
+	logs := captureLogs(t)
+
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hidden := path + ".hidden"
+	if err = os.Rename(path, hidden); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		if _, err = p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err != nil {
+			t.Fatalf("a missing file must keep the token in use: %v", err)
+		}
+	}
+
+	// The same file, same stamp, comes back: nothing to reload, but the failure is over.
+	if err = os.Rename(hidden, path); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = os.Chtimes(path, st.ModTime(), st.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = p.GetSecret(context.Background(), "kv:secret:prod/web/db:PASS"); err != nil {
+		t.Fatal(err)
+	}
+
+	out := logs.String()
+	if strings.Count(out, "level=ERROR") != 1 || strings.Count(out, "level=WARN") != 1 {
+		t.Fatalf("want one ERROR for the missing file and one recovery line:\n%s", out)
+	}
+
+	assertNoTokenInLogs(t, out, "tok-1")
 }
 
 func TestForceRefreshWithoutReload(_ *testing.T) {
@@ -510,7 +677,7 @@ func TestGetConfigTokenReload(t *testing.T) {
 		}
 	})
 
-	t.Run("on with env token", func(t *testing.T) {
+	t.Run("on without file", func(t *testing.T) {
 		t.Setenv("SECRET_PROVIDER_SITE_URL", "http://bao:8200")
 		t.Setenv("SECRET_PROVIDER_ACCESS_TOKEN", "tok-env")
 		t.Setenv("SECRET_PROVIDER_ACCESS_TOKEN_FILE", "")
@@ -536,4 +703,101 @@ func TestGetConfigTokenReload(t *testing.T) {
 			t.Fatal("GetConfig() without the reload key must be upstream")
 		}
 	})
+}
+
+// TestTokenReloadPKICertRetriesOn403 covers the second read of the pki branch of GetSecret: the
+// serial lookup passes with the old token, the token changes right after it, and only the
+// certificate read gets the 403 and its one retry.
+func TestTokenReloadPKICertRetriesOn403(t *testing.T) {
+	srv := &kvServer{}
+	path := filepath.Join(t.TempDir(), "token")
+
+	var (
+		mu         sync.Mutex
+		paths      []string
+		handlerErr error
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		srv.requests.Add(1)
+
+		srv.mu.Lock()
+		ok := r.Header.Get("X-Vault-Token") == srv.token
+		srv.mu.Unlock()
+
+		mu.Lock()
+
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+
+		if !ok {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"errors":["permission denied"]}`))
+
+			return
+		}
+
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/v1/pki/certs/detailed"):
+			_, _ = w.Write([]byte(`{"data":{"keys":["0a"],"key_info":{"0a":{"common_name":"web.example.com"}}}}`))
+
+			// The agent rewrites the sink in place, same size and same mtime, right after the
+			// serial lookup: refreshToken cannot see it, only the 403 can.
+			st, err := os.Stat(path)
+			if err == nil {
+				err = os.WriteFile(path, []byte("tok-2\n"), 0o600)
+			}
+
+			if err == nil {
+				err = os.Chtimes(path, st.ModTime(), st.ModTime())
+			}
+
+			if err != nil {
+				mu.Lock()
+				handlerErr = err
+				mu.Unlock()
+			}
+
+			srv.setToken("tok-2")
+		case strings.HasSuffix(r.URL.Path, "/v1/pki/cert/0a"):
+			_, _ = w.Write([]byte(`{"data":{"certificate":"CERT-PEM"}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	writeToken(t, path, "tok-1")
+	srv.setToken("tok-1")
+
+	p, err := NewProvider(context.Background(), ts.URL, "tok-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err = p.EnableTokenReload(path); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := p.GetSecret(context.Background(), "pki:pki:web.example.com")
+	if err != nil {
+		t.Fatalf("GetSecret(): %v", err)
+	}
+
+	if got != "CERT-PEM" {
+		t.Fatalf("GetSecret() = %q, want CERT-PEM", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if handlerErr != nil {
+		t.Fatal(handlerErr)
+	}
+
+	// serial lookup (200), certificate read (403), certificate read again with tok-2 (200).
+	want := []string{"/v1/pki/certs/detailed", "/v1/pki/cert/0a", "/v1/pki/cert/0a"}
+	if strings.Join(paths, " ") != strings.Join(want, " ") {
+		t.Fatalf("requests = %v, want exactly %v", paths, want)
+	}
 }

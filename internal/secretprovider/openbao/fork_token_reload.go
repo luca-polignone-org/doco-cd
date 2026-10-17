@@ -32,6 +32,8 @@ func (c *Config) ValidateTokenReload(tokenFromEnv bool) error {
 		return errors.Join(errTokenReload, errors.New("SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD needs SECRET_PROVIDER_ACCESS_TOKEN_FILE"))
 	}
 
+	// Defensive: GetConfig never gets here with both variables set, because ParseConfigFromEnv
+	// returns ErrBothSecretsSet first. The check keeps the rule true for any other caller.
 	if tokenFromEnv {
 		return errors.Join(errTokenReload, errors.New("SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD cannot be used with SECRET_PROVIDER_ACCESS_TOKEN"))
 	}
@@ -44,6 +46,42 @@ type tokenReload struct {
 	path  string
 	size  int64
 	mtime time.Time
+
+	// failure is the last failure logged ("" when the last read went well): the same failure is
+	// logged once, not on every call, and the recovery is logged once.
+	failure string
+}
+
+// failLocked logs a reload failure unless it is the one already logged.
+func (r *tokenReload) failLocked(msg string, err error) {
+	key := msg
+	if err != nil {
+		key += ": " + err.Error()
+	}
+
+	if key == r.failure {
+		return
+	}
+
+	r.failure = key
+
+	attrs := []any{slog.String("path", r.path)}
+	if err != nil {
+		attrs = append(attrs, slog.Any("error", err))
+	}
+
+	slog.Error(msg, attrs...)
+}
+
+// recoveredLocked logs once that the file is usable again after a failure.
+func (r *tokenReload) recoveredLocked() {
+	if r.failure == "" {
+		return
+	}
+
+	r.failure = ""
+
+	slog.Warn("openbao token file usable again", slog.String("path", r.path))
 }
 
 // EnableTokenReload turns on the reload of the token from path.
@@ -71,11 +109,13 @@ func (p *Provider) refreshToken() {
 
 	st, err := os.Stat(r.path)
 	if err != nil {
-		slog.Error("openbao token file unreadable, keeping the token in use", slog.String("path", r.path), slog.Any("error", err))
+		r.failLocked("openbao token file unreadable, keeping the token in use", err)
 		return
 	}
 
 	if st.Size() == r.size && st.ModTime().Equal(r.mtime) {
+		// The file in use is back (e.g. it was missing for a while).
+		r.recoveredLocked()
 		return
 	}
 
@@ -100,17 +140,18 @@ func (p *Provider) forceRefresh() {
 func (p *Provider) loadTokenLocked(r *tokenReload, st os.FileInfo) {
 	data, err := os.ReadFile(r.path) // #nosec G304 -- operator-configured token file
 	if err != nil {
-		slog.Error("openbao token file unreadable, keeping the token in use", slog.String("path", r.path), slog.Any("error", err))
+		r.failLocked("openbao token file unreadable, keeping the token in use", err)
 		return
 	}
 
 	tok := strings.TrimSpace(string(data))
 	if tok == "" {
-		slog.Error("openbao token file empty, keeping the token in use", slog.String("path", r.path))
+		r.failLocked("openbao token file empty, keeping the token in use", nil)
 		return
 	}
 
 	r.size, r.mtime = st.Size(), st.ModTime()
+	r.recoveredLocked()
 
 	// WithNamespace copies the client struct (c2 := *c) without its lock, so a SetToken running at
 	// the same time is a data race: tokenMu orders the swap against every nsClient/nsIssuer.

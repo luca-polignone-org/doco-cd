@@ -51,7 +51,7 @@ func (h *Handler) ProjectApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if !h.authorize(w, jobLog, jobID, principal, "projects", "get", object) {
+		if !h.authorize(w, jobID, principal, "projects", "get", object) {
 			return
 		}
 
@@ -71,7 +71,7 @@ func (h *Handler) ProjectApiHandler(w http.ResponseWriter, r *http.Request) {
 
 		restapi.JSONResponse(w, containers, jobID, http.StatusOK)
 	case http.MethodDelete:
-		if !h.authorize(w, jobLog, jobID, principal, "projects", "delete", object) {
+		if !h.authorize(w, jobID, principal, "projects", "delete", object) {
 			return
 		}
 
@@ -211,7 +211,7 @@ func (h *Handler) ProjectActionApiHandler(w http.ResponseWriter, r *http.Request
 
 	action := r.PathValue("action")
 
-	if !h.authorize(w, jobLog, jobID, principal, "projects", "action/"+action, deploy.ObjectName(contextName, projectName)) {
+	if !h.authorize(w, jobID, principal, "projects", "action/"+action, deploy.ObjectName(contextName, projectName)) {
 		return
 	}
 

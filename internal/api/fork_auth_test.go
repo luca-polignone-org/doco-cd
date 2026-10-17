@@ -402,15 +402,26 @@ func TestForkAuthRoutes(t *testing.T) {
 				requireForbidden(t, rr, body, "object outside the permission")
 			}
 
-			for name, mux := range map[string]*http.ServeMux{"rbac": allowMux, "upstream": upstreamMux} {
-				rr, body = serveFork(t, mux, tc.method, tc.path, tc.body, false)
+			// The 401 with RBAC must be the upstream one: same status, headers and body, except
+			// the per-request job_id.
+			wantRR, wantBody := serveFork(t, upstreamMux, tc.method, tc.path, tc.body, false)
+			if wantRR.Code != http.StatusUnauthorized || wantBody["error"] != restAPI.ErrInvalidApiKey.Error() {
+				t.Fatalf("upstream without credentials: status = %d, body = %v; want 401 %q", wantRR.Code, wantBody, restAPI.ErrInvalidApiKey.Error())
+			}
 
-				jobID, _ := body["job_id"].(string)
-				want := map[string]any{"error": restAPI.ErrInvalidApiKey.Error(), "job_id": jobID}
+			rr, body = serveFork(t, allowMux, tc.method, tc.path, tc.body, false)
 
-				if rr.Code != http.StatusUnauthorized || jobID == "" || !reflect.DeepEqual(body, want) {
-					t.Fatalf("%s without credentials: status = %d, body = %v; want the upstream 401 %v", name, rr.Code, body, want)
+			for _, b := range []map[string]any{wantBody, body} {
+				if id, _ := b["job_id"].(string); id == "" {
+					t.Fatalf("401 body %v has no job_id", b)
 				}
+
+				delete(b, "job_id")
+			}
+
+			if rr.Code != wantRR.Code || !reflect.DeepEqual(body, wantBody) || !reflect.DeepEqual(rr.Header(), wantRR.Header()) {
+				t.Fatalf("rbac without credentials: status = %d, header = %v, body = %v; want the upstream %d, %v, %v",
+					rr.Code, rr.Header(), body, wantRR.Code, wantRR.Header(), wantBody)
 			}
 
 			rr, body = serveFork(t, upstreamMux, tc.method, tc.path, tc.body, true)

@@ -28,7 +28,7 @@ func (h *Handler) GetSyncWindowsHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if !h.authorize(w, jobLog, jobID, principal, "syncwindows", "get", "*") {
+	if !h.authorize(w, jobID, principal, "syncwindows", "get", "*") {
 		return
 	}
 

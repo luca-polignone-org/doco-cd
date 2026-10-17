@@ -39,13 +39,13 @@ func (h *Handler) authenticate(w http.ResponseWriter, r *http.Request, jobLog *s
 }
 
 // authorize checks resource/action on object and writes a 403 when the principal is denied.
-// Without RBAC (nil enforcer) it always allows.
-func (h *Handler) authorize(w http.ResponseWriter, jobLog *slog.Logger, jobID string, p rbac.Principal, resource, action, object string) bool {
+// Without RBAC (nil enforcer) it always allows. The Enforcer writes the audit line of every
+// deny, so nothing is logged here.
+func (h *Handler) authorize(w http.ResponseWriter, jobID string, p rbac.Principal, resource, action, object string) bool {
 	if h.rbac.Enforce(p, resource, action, object) {
 		return true
 	}
 
-	jobLog.Warn("permission denied", slog.String("resource", resource), slog.String("action", action), slog.String("object", object))
 	restapi.JSONError(w, errForbidden, resource+", "+action+", "+object, jobID, http.StatusForbidden)
 
 	return false
@@ -99,7 +99,7 @@ func (h *Handler) authorizeScheduledJob(w http.ResponseWriter, r *http.Request, 
 
 		found = true
 
-		if !h.authorize(w, jobLog, jobID, p, "jobs", "run", deploy.ObjectName(job.Context, job.Stack)) {
+		if !h.authorize(w, jobID, p, "jobs", "run", deploy.ObjectName(job.Context, job.Stack)) {
 			return false
 		}
 	}

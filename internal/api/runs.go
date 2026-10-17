@@ -26,7 +26,7 @@ func (h *Handler) GetDeploymentRunsHandler(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if !h.authorize(w, jobLog, jobID, principal, "runs", "get", "*") {
+	if !h.authorize(w, jobID, principal, "runs", "get", "*") {
 		return
 	}
 
@@ -72,7 +72,7 @@ func (h *Handler) GetDeploymentRunHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	if !h.authorize(w, jobLog, jobID, principal, "runs", "get", "*") {
+	if !h.authorize(w, jobID, principal, "runs", "get", "*") {
 		return
 	}
 

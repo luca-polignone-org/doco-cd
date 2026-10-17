@@ -30,7 +30,7 @@ func (h *Handler) CompactMirrorsHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if !h.authorize(w, jobLog, jobID, principal, "storage", "update", "*") {
+	if !h.authorize(w, jobID, principal, "storage", "update", "*") {
 		return
 	}
 

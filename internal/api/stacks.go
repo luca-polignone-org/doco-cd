@@ -53,7 +53,7 @@ func (h *Handler) StackActionApiHandler(w http.ResponseWriter, r *http.Request) 
 	jobLog = jobLog.With(slog.String("context", contextName))
 
 	// Fork: authorized before the stack lookup, so a denied caller cannot probe which stacks exist.
-	if !h.authorize(w, jobLog, jobID, principal, "stacks", "action/"+r.PathValue("action"), deploy.ObjectName(contextName, stackName)) {
+	if !h.authorize(w, jobID, principal, "stacks", "action/"+r.PathValue("action"), deploy.ObjectName(contextName, stackName)) {
 		return
 	}
 
@@ -211,7 +211,7 @@ func (h *Handler) StackApiHandler(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		if !h.authorize(w, jobLog, jobID, principal, "stacks", "get", object) {
+		if !h.authorize(w, jobID, principal, "stacks", "get", object) {
 			return
 		}
 
@@ -231,7 +231,7 @@ func (h *Handler) StackApiHandler(w http.ResponseWriter, r *http.Request) {
 
 		restapi.JSONResponse(w, services, jobID, http.StatusOK)
 	case http.MethodDelete:
-		if !h.authorize(w, jobLog, jobID, principal, "stacks", "delete", object) {
+		if !h.authorize(w, jobID, principal, "stacks", "delete", object) {
 			return
 		}
 

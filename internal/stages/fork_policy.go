@@ -104,15 +104,11 @@ func declaredFilesOf(c *deploy.Config) declaredFiles {
 // touches anything: a violation is a terminal error of the stage. The outcome is recorded for
 // forkJobGate.
 //
-// A targets/sync denial is checked first and leaves that record alone: it is about the caller
-// of the run, not about the project, so it neither marks the object as verified nor lets a
-// caller without permission disable the jobs of a target that passed.
-func (s *StageManager) checkForkPolicies(ctx context.Context) error {
+// targets/sync is not checked here: runForkPreDeployStage checks it before pre-deploy starts,
+// and pre-deploy is the only caller of loadComposeProjectHash, so a second check would only
+// write a second audit line for every allowed run.
+func (s *StageManager) checkForkPolicies(_ context.Context) error {
 	object := s.DeployConfig.Object()
-
-	if err := s.checkTargetSync(ctx, object); err != nil {
-		return err
-	}
 
 	err := s.evaluateForkPolicies(object)
 	verifiedObjects.Store(object, err == nil)
@@ -226,14 +222,35 @@ func (s *StageManager) checkTargetSync(ctx context.Context, object string) error
 	return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{{Field: "rbac", Value: "targets/sync"}}}
 }
 
-// runForkPreDeployStage is the pre-deploy stage of the deploy stage order: upstream
-// RunPreDeployStage, then forkPolicyGate.
+// runForkPreDeployStage is the pre-deploy stage of the deploy stage order: targets/sync, then
+// upstream RunPreDeployStage, then forkPolicyGate.
+//
+// targets/sync comes first, before external secrets are resolved (pki-role issues real
+// certificates) and before the cached-preflight "no changes" skip, so a denied caller gets a
+// terminal PolicyDeniedError on every target. The denial is about the caller, not the project:
+// it does not touch the forkJobGate record, so it neither marks the object as verified nor
+// lets a caller without permission disable the jobs of a target that passed.
 func (s *StageManager) runForkPreDeployStage(ctx context.Context, stageLog *slog.Logger) error {
+	if err := s.checkTargetSync(ctx, s.DeployConfig.Object()); err != nil {
+		return err
+	}
+
 	if err := s.RunPreDeployStage(ctx, stageLog); err != nil {
 		return err
 	}
 
 	return s.forkPolicyGate(ctx)
+}
+
+// runForkDestroyStage is the destroy stage of the destroy stage order: targets/sync, then
+// upstream RunDestroyStage. Destroy has no pre-deploy, so a run carrying a principal is checked
+// here, before anything is removed.
+func (s *StageManager) runForkDestroyStage(ctx context.Context, stageLog *slog.Logger) error {
+	if err := s.checkTargetSync(ctx, s.DeployConfig.Object()); err != nil {
+		return err
+	}
+
+	return s.RunDestroyStage(ctx, stageLog)
 }
 
 // forkPolicyGate makes sure the fork policies saw the project even when pre-deploy did not

@@ -28,6 +28,8 @@ type TargetPolicy struct {
 	// SecretAllowlist restricts external_secrets references (Portico fork, spec 4). nil means the
 	// key is absent and nothing is checked; a present empty list allows no reference.
 	SecretAllowlist *[]string `yaml:"secret_allowlist"`
+	// Logging is the only logging a service may declare (Portico fork, spec 5); default only.
+	Logging *LoggingPolicy `yaml:"logging"`
 }
 
 // File is the compose policy compiled by Portico (3b). The keys of targets are exact
@@ -94,6 +96,10 @@ func Parse(data []byte) (*File, error) {
 		return nil, fmt.Errorf("compose policy default: %w", err)
 	}
 
+	if f.Default.Logging != nil && strings.TrimSpace(f.Default.Logging.Driver) == "" {
+		return nil, errors.New("compose policy default: logging.driver is required")
+	}
+
 	for object, tp := range f.Targets {
 		if strings.ContainsAny(object, "*?[") {
 			return nil, fmt.Errorf("compose policy target %q: globs are not allowed", object)
@@ -102,6 +108,10 @@ func Parse(data []byte) (*File, error) {
 		ctx, project, ok := strings.Cut(object, "/")
 		if !ok || ctx == "" || project == "" || strings.Contains(project, "/") {
 			return nil, fmt.Errorf("compose policy target %q: must be <context>/<project>", object)
+		}
+
+		if tp.Logging != nil {
+			return nil, fmt.Errorf("compose policy target %q: %w", object, errLoggingInTarget)
 		}
 
 		if err := normalizeTarget(&tp, true); err != nil {

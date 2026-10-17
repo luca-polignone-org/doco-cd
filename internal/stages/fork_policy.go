@@ -9,27 +9,65 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/kimdre/doco-cd/internal/composepolicy"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker"
 )
 
-// Scheduled jobs (internal/docker/compose_scheduled_run.go) do not go through this check, and
-// do not need to: loadComposeScheduledProjectAll (~line 345) loads the compose project from the
-// working directory and config revision recorded in the labels of containers that a deploy
-// created, i.e. the per-revision artifact of a revision that already passed pre-deploy. A denied
-// revision never creates containers, so no label can point a job at it. RunComposeScheduledContainer
-// restarts or starts those existing containers; RunComposeOneOffFromServiceDefinitionWithOptions
-// (~line 166) creates a one-off container from that same deployed revision. What stays outside the
-// check is a policy tightened after that revision was deployed.
+// Jobs that rebuild containers from a deployed revision (scheduled and one-off jobs, cert
+// rotation, managed recreate, self-apply) go through docker.loadComposeScheduledProjectAll,
+// which re-reads the compose project and the declared env/secrets files without pre-deploy.
+// The policy may have been switched on or tightened after that revision was deployed, so
+// SetComposePolicy installs forkJobGate as docker.ForkJobGate: a job runs only on an object whose
+// last checkForkPolicies in this process passed. After a restart every job is refused until the
+// next poll or deploy of its target has checked it again.
 
-var composePolicy atomic.Pointer[composepolicy.Holder]
+var (
+	composePolicy atomic.Pointer[composepolicy.Holder]
+	// verifiedObjects maps an object to the outcome of its last checkForkPolicies (true = passed).
+	verifiedObjects sync.Map
+)
 
-// SetComposePolicy registers the compose policy of the process; nil disables it.
-func SetComposePolicy(h *composepolicy.Holder) { composePolicy.Store(h) }
+// SetComposePolicy registers the compose policy of the process and the job gate; nil disables
+// both. It is called at startup, before any scheduler reads docker.ForkJobGate.
+func SetComposePolicy(h *composepolicy.Holder) {
+	composePolicy.Store(h)
 
-var ErrPolicyDenied = errors.New("deployment denied by policy")
+	if h != nil {
+		docker.ForkJobGate = forkJobGate
+	} else {
+		docker.ForkJobGate = nil
+	}
+}
+
+var (
+	ErrPolicyDenied   = errors.New("deployment denied by policy")
+	ErrJobNotVerified = errors.New("job refused: target not yet verified by compose policy")
+)
+
+// forkJobGate allows a job on <contextName>/<project> only if checkForkPolicies passed for that
+// object in this process and did not deny it since.
+func forkJobGate(contextName, project string) error {
+	if composePolicy.Load() == nil {
+		return nil
+	}
+
+	object := deploy.ObjectName(contextName, project)
+
+	passed, known := verifiedObjects.Load(object)
+	if !known {
+		return fmt.Errorf("%w: %s", ErrJobNotVerified, object)
+	}
+
+	if ok, _ := passed.(bool); !ok {
+		return fmt.Errorf("job refused: %w for %s", ErrPolicyDenied, object)
+	}
+
+	return nil
+}
 
 // PolicyDeniedError is returned when a deployment violates the fork policies.
 type PolicyDeniedError struct {
@@ -61,10 +99,18 @@ func declaredFilesOf(c *deploy.Config) declaredFiles {
 }
 
 // checkForkPolicies applies the fork policies to the project just loaded, before pre-deploy
-// touches anything: a violation is a terminal error of the stage.
+// touches anything: a violation is a terminal error of the stage. The outcome is recorded for
+// forkJobGate.
 func (s *StageManager) checkForkPolicies(ctx context.Context) error {
 	object := s.DeployConfig.Object()
 
+	err := s.evaluateForkPolicies(ctx, object)
+	verifiedObjects.Store(object, err == nil)
+
+	return err
+}
+
+func (s *StageManager) evaluateForkPolicies(ctx context.Context, object string) error {
 	if s.Docker.SwarmMode && s.DeployConfig.Rollback != nil {
 		return &PolicyDeniedError{Object: object, Violations: []composepolicy.Violation{{Field: "swarm", Value: "true"}}}
 	}
@@ -105,6 +151,14 @@ func (s *StageManager) checkForkPolicies(ctx context.Context) error {
 // repository_url all of them live in the deploy checkout, relative to the working directory.
 // keepAbs mirrors the loaders: LoadLocalDotEnv reads an absolute entry as is, while
 // LoadExternalSecretsFiles joins every entry to its base path.
+//
+// An absolute env file entry (e.g. "remote:/abs" or "/abs") is a path inside the Doco-CD
+// container, but it is checked as a host path: one that points into the internal path of the
+// checkout is reported as outside it. This false positive errs toward denial.
+//
+// Reconciliation replays deploy configs whose lists the init stage already consumed, so on those
+// runs forkDeclared holds only the remainder. That is safe: those configs passed the same rule
+// earlier in this process, and their files are not read again (Internal.Environment is reused).
 func (s *StageManager) externalPaths(files []string, keepAbs bool) []string {
 	cfgBase := s.Repository.PathExternal
 	if s.DeployConfig.RepositoryUrl != "" && s.Repository.ConfigPath != "" {

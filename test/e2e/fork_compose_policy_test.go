@@ -62,6 +62,10 @@ func TestForkComposePolicy(t *testing.T) {
 	// Phase 1: privileged service, denied before any mutation.
 	h.WaitForLog("deployment denied by policy", 120*time.Second)
 
+	if !h.daemonHasLog("app: privileged=true") {
+		t.Fatal("daemon log must name the privileged violation")
+	}
+
 	// One more poll of the same commit must still create nothing.
 	mark := h.LogMark()
 	h.WaitForLogAfter("deployment denied by policy", mark, 60*time.Second)

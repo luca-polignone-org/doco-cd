@@ -17,6 +17,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker"
 )
 
 // The tests in this file register a process-wide compose policy, so none of them calls
@@ -319,6 +320,54 @@ func TestForkPolicyGate(t *testing.T) {
 
 		if s.Docker.Project != nil {
 			t.Fatal("forkPolicyGate() loaded the Compose project without fork keys")
+		}
+	})
+}
+
+func TestForkJobGate(t *testing.T) {
+	t.Cleanup(func() { verifiedObjects.Clear() })
+
+	t.Run("policy disabled", func(t *testing.T) {
+		SetComposePolicy(nil)
+
+		if docker.ForkJobGate != nil {
+			t.Fatal("SetComposePolicy(nil) left docker.ForkJobGate set")
+		}
+
+		if err := forkJobGate("", "jobs-unknown"); err != nil {
+			t.Fatalf("forkJobGate() error = %v, want nil without a policy", err)
+		}
+	})
+
+	t.Run("unknown, passed, then denied", func(t *testing.T) {
+		setForkComposePolicy(t, forkPolicyFor("default/jobs"))
+
+		if docker.ForkJobGate == nil {
+			t.Fatal("SetComposePolicy() did not install docker.ForkJobGate")
+		}
+
+		if err := forkJobGate("default", "jobs"); !errors.Is(err, ErrJobNotVerified) {
+			t.Fatalf("forkJobGate() error = %v, want ErrJobNotVerified for an unverified target", err)
+		}
+
+		s := newForkPolicyStageManager(t, "jobs", forkPolicyRepo)
+		s.Docker.Project = &types.Project{Name: "jobs", Services: types.Services{"app": {Name: "app", Image: "busybox:latest"}}}
+
+		if err := s.checkForkPolicies(context.Background()); err != nil {
+			t.Fatalf("checkForkPolicies() error = %v, want nil", err)
+		}
+
+		if err := forkJobGate("", "jobs"); err != nil {
+			t.Fatalf("forkJobGate() error = %v, want nil after a passed check", err)
+		}
+
+		s.Docker.Project = privilegedProject("jobs")
+		if err := s.checkForkPolicies(context.Background()); !errors.Is(err, ErrPolicyDenied) {
+			t.Fatalf("checkForkPolicies() error = %v, want ErrPolicyDenied", err)
+		}
+
+		if err := forkJobGate("default", "jobs"); !errors.Is(err, ErrPolicyDenied) {
+			t.Fatalf("forkJobGate() error = %v, want ErrPolicyDenied after a denied check", err)
 		}
 	})
 }

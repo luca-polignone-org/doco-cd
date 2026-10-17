@@ -32,13 +32,17 @@ func TestRestrictPollConfigs(t *testing.T) {
 		{SourceUrl: "/srv/repos/app", Reference: "main"},
 	}
 
+	// A request names the operator entry without its deployments, which the body may not set.
+	identical := known[0]
+	identical.Deployments = nil
+
 	for _, tc := range []struct {
 		name    string
 		req     poll.Config
 		want    int // index in known, or -1 for an error
 		wantErr string
 	}{
-		{name: "identical entry", req: known[0], want: 0},
+		{name: "identical entry", req: identical, want: 0},
 		{name: "short branch name against refs/heads", req: poll.Config{SourceUrl: validPollSourceURL, Reference: "main"}, want: 0},
 		{name: "body options are ignored", req: poll.Config{SourceUrl: validPollSourceURL, Reference: "refs/heads/main", RunOnce: false, Interval: time.Second, Watch: true}, want: 0},
 		{name: "tag with custom target", req: poll.Config{Source: "GIT", SourceUrl: validPollSourceURL, Reference: "v1.0.0", CustomTarget: "tagged"}, want: 1},
@@ -91,7 +95,7 @@ func TestRestrictPollConfigs(t *testing.T) {
 	t.Run("second entry reports its index", func(t *testing.T) {
 		t.Parallel()
 
-		_, err := RestrictPollConfigs(known, []poll.Config{known[0], {SourceUrl: "https://example.com/x.git"}})
+		_, err := RestrictPollConfigs(known, []poll.Config{identical, {SourceUrl: "https://example.com/x.git"}})
 		if err == nil || !strings.HasPrefix(err.Error(), "index 1: ") {
 			t.Fatalf("error = %v, want index 1", err)
 		}

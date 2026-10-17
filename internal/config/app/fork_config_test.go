@@ -1,6 +1,7 @@
 package app
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,24 @@ func setBaseEnv(t *testing.T) {
 
 	t.Setenv("WEBHOOK_SECRET", "secret")
 	t.Setenv("GIT_ACCESS_TOKEN", "token")
+
+	// Do not inherit these from the ambient environment (CI exports API_SECRET).
+	for _, k := range []string{
+		"API_SECRET", "API_SECRET_FILE", "MCP_ENABLED",
+		"JWT_JWKS_URL", "JWT_ISSUER", "JWT_AUDIENCE", "JWT_GROUPS_CLAIM",
+		"RBAC_POLICY_FILE", "COMPOSE_POLICY_FILE",
+	} {
+		t.Setenv(k, "")
+	}
+
+	// notEmpty keys with a default: register the restore, then really unset.
+	for _, k := range []string{"API_KEY_ENABLED"} {
+		t.Setenv(k, "")
+
+		if err := os.Unsetenv(k); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestGetConfigForkDefaults(t *testing.T) {

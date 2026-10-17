@@ -28,7 +28,10 @@ Smaller fork files in upstream packages: `internal/filesystem/atomic_write.go`,
 `internal/stages/fork_{policy,rollback,outcome}.go`. Added by `poli.2`:
 `internal/docker/fork_secret_gate.go`, `internal/git/fork_content_key.go` (`TreeHashAt`),
 `internal/secretprovider/openbao/fork_token_reload.go`,
-`internal/stages/fork_{secrets,content_key}.go`.
+`internal/stages/fork_{secrets,content_key}.go`. In the fork packages, `poli.2` also changes
+`internal/composepolicy/{check,file}.go` (the `secret_allowlist` and `logging` keys, `checkLogging`
+in `checkService`) and `internal/rollback/{store,lastgood}.go` (failure store version 2 with
+`content_key`, last good still version 1).
 
 **Registries, nil until a key is set.** `cmd/doco-cd/main.go` fills them at startup, before any
 scheduler or handler runs; a nil registry is the upstream behaviour.
@@ -47,7 +50,8 @@ The API and MCP handlers receive the `restapi.Authenticator` and the enforcer th
 Per-target rollback is the deploy config key `rollback` (`deploy.RollbackConfig`, a pointer with
 `omitempty`), not an app key.
 
-**Upstream touches.** Each one is a few lines marked `// Fork:` that call into the fork files:
+**Upstream touches.** Each one is a few lines that call into the fork files, mostly marked
+`// Fork:` (the OpenBao call sites wrapped by `retryOnForbidden` are not marked one by one):
 
 - `internal/stages/run.go`: stage functions of the deploy and destroy orders, target lock
   release, last good and success outcome before/after `clearDeploymentFailure`, rollback and
@@ -65,10 +69,6 @@ Per-target rollback is the deploy config key `rollback` (`deploy.RollbackConfig`
 - `internal/secretprovider/secretprovider.go`, `internal/secretprovider/openbao/{client,config}.go`:
   `EnableTokenReload`, the `SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD` key, `refreshToken` and
   `retryOnForbidden` around the OpenBao calls;
-- `internal/composepolicy/{check,file}.go`: the `secret_allowlist` and `logging` keys, and
-  `checkLogging` in `checkService`;
-- `internal/rollback/{store,lastgood}.go`: failure store version 2 (`content_key`), last good
-  still version 1;
 - `internal/api/*.go` and `internal/mcp/*.go`: `ValidateApiKey` replaced by
   `authenticate`/`authorize`, list filtering, the MCP per-tool authorization middleware;
 - `internal/controlplane/poll.go`: the `api` trigger marker;
@@ -207,7 +207,8 @@ deploy configs without `Internal.File` (inline, auto-discovery).
 - **Bounded rollback.** `rollback.timeout` is at most 30 m and `pre_rollback_timeout` at most
   5 m (defaults 5 m and 30 s): both are held under the target lock and a mutation slot.
 - **Every secret read is gated.** Each `ResolveSecretReferences` (and `GetSecret`/`GetSecrets`)
-  of production code under `internal/` and `cmd/` is preceded by its allowlist check;
+  of production code under `internal/` and `cmd/`, outside `internal/secretprovider`, is
+  preceded by its allowlist check;
   `TestEveryResolveIsGated` (`internal/stages/fork_secret_allowlist_test.go`) walks the sources
   and wants exactly the three known call sites, so an upstream merge that adds a read breaks it.
 - **No secret in the logs.** Neither a resolved value, nor the token, nor the content of the token
@@ -247,7 +248,7 @@ deploy configs without `Internal.File` (inline, auto-discovery).
     absent means no check; a present empty list allows no reference; `null`/`~` is a parse
     error. Entries: `kv:[<ns>:]<engine>:<prefix>` with segments in `[A-Za-z0-9._-]`, full
     `pki:`/`pki-role:` references, or literal prefixes for providers other than OpenBao;
-  - `logging` (only in `default`, a target with `logging` is a parse error): `driver` (required,
+  - `logging` (only in `default`, a non-null `logging` on a target is a parse error): `driver` (required,
     not padded) and `options` (string map), the only logging a service may declare.
 - **Deploy config `rollback.unblock_on`**: `commit` (default, also when absent) or `content`; any
   other value fails the deploy config parse. `omitempty`, so `deploy.Config.Hash()` is unchanged

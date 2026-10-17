@@ -115,7 +115,14 @@ func Initialize(ctx context.Context, provider, version string) (SecretProvider, 
 			return nil, cfgErr
 		}
 
-		p, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken)
+		var bao *openbao.Provider
+
+		bao, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken)
+		if err == nil && cfg.AccessTokenFileReload {
+			err = bao.EnableTokenReload(cfg.AccessTokenFilePath)
+		}
+
+		p = bao
 	case webhook.Name:
 		cfg, cfgErr := webhook.GetConfig()
 		if cfgErr != nil {

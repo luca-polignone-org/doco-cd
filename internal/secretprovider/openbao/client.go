@@ -50,6 +50,11 @@ type Provider struct {
 	// issuer is used for non-idempotent certificate issuance and has client-side retries disabled,
 	// so a lost response can never cause a duplicate certificate to be issued.
 	issuer *openbao.Client
+
+	// Fork (token reload): reload is nil unless EnableTokenReload ran; tokenMu orders a token swap
+	// against every WithNamespace copy, taken only through nsClient and nsIssuer.
+	reload  *tokenReload
+	tokenMu sync.RWMutex
 }
 
 // pkiCertValues holds the resolved values of a read-only pki reference: the leaf certificate and
@@ -107,24 +112,38 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 
-	c := p.Client.WithNamespace(namespace)
+	p.refreshToken()
 
 	var strValue string
 
 	switch engineType {
 	case "pki":
-		serial, err := GetCertSerial(ctx, c, engineName, id)
+		var serial string
+
+		err = p.retryOnForbidden(ctx, func() error {
+			var rerr error
+
+			serial, rerr = GetCertSerial(ctx, p.nsClient(namespace), engineName, id)
+
+			return rerr
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to retrieve certificate serial for common name %s: %w", id, err)
 		}
 
-		strValue, err = GetCert(ctx, c, engineName, serial)
+		err = p.retryOnForbidden(ctx, func() error {
+			var rerr error
+
+			strValue, rerr = GetCert(ctx, p.nsClient(namespace), engineName, serial)
+
+			return rerr
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to retrieve certificate with serial %s: %w", id, err)
 		}
 
 	case "pki-role":
-		issued, err := IssueCert(ctx, p.issuer.WithNamespace(namespace), engineName, key, id)
+		issued, err := IssueCert(ctx, p.nsIssuer(namespace), engineName, key, id)
 		if err != nil {
 			return "", fmt.Errorf("%w: failed to issue certificate for common name %s using role %s: %w", secrettypes.ErrNotRetryable, id, key, err)
 		}
@@ -132,7 +151,13 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		strValue = issued.Certificate
 
 	case "kv":
-		strValue, err = GetSecret(ctx, c, engineName, id, key)
+		err = p.retryOnForbidden(ctx, func() error {
+			var rerr error
+
+			strValue, rerr = GetSecret(ctx, p.nsClient(namespace), engineName, id, key)
+
+			return rerr
+		})
 		if err != nil {
 			return "", fmt.Errorf("failed to retrieve secret with id %s: %w", id, err)
 		}
@@ -145,6 +170,8 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 
 // GetSecrets retrieves multiple secrets from Secrets Manager using the provided list of secret references.
 func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]string, error) {
+	p.refreshToken()
+
 	resolvedSecrets := make(map[string]string)
 	containsPKIRole := false
 
@@ -215,6 +242,8 @@ func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]st
 //     envVar + PKIRoleKeySuffix (e.g. CERT_KEY) holds the private key PEM, and
 //     envVar + PKIFullChainSuffix (e.g. CERT_FULL) holds the full chain bundle.
 func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[string]string) (secrettypes.ResolvedSecrets, error) {
+	p.refreshToken()
+
 	plainSecrets := make(map[string]string, len(secrets))
 	pkiSecrets := make(map[string]string, len(secrets))
 	pkiRoleSecrets := make(map[string]string, len(secrets))
@@ -267,7 +296,15 @@ func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[stri
 	}
 
 	if len(pkiSecrets) > 0 {
-		resolved, err := p.resolvePKICerts(ctx, pkiSecrets)
+		var resolved map[string]pkiCertValues
+
+		err := p.retryOnForbidden(ctx, func() error {
+			var rerr error
+
+			resolved, rerr = p.resolvePKICerts(ctx, pkiSecrets)
+
+			return rerr
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -301,6 +338,8 @@ func (p *Provider) DeploymentHasRevokedCertificate(ctx context.Context, certStat
 		return false, nil
 	}
 
+	p.refreshToken()
+
 	var deployed []deployedCertState
 	if err := json.Unmarshal([]byte(certState), &deployed); err != nil {
 		return false, fmt.Errorf("parse deployed certificate state: %w", err)
@@ -326,7 +365,15 @@ func (p *Provider) DeploymentHasRevokedCertificate(ctx context.Context, certStat
 		key := mountKey{namespace: namespace, engine: engineName}
 
 		if _, ok := revokedByMount[key]; !ok {
-			serials, err := ListRevokedCertSerials(ctx, p.Client.WithNamespace(namespace), engineName)
+			var serials []string
+
+			err := p.retryOnForbidden(ctx, func() error {
+				var rerr error
+
+				serials, rerr = ListRevokedCertSerials(ctx, p.nsClient(namespace), engineName)
+
+				return rerr
+			})
 			if err != nil {
 				return false, fmt.Errorf("list revoked certificates for %s/%s: %w", namespace, engineName, err)
 			}
@@ -386,7 +433,7 @@ func (p *Provider) resolvePKICerts(ctx context.Context, refs map[string]string) 
 				return
 			}
 
-			c := p.Client.WithNamespace(namespace)
+			c := p.nsClient(namespace)
 
 			serial, err := GetCertSerial(ctx, c, engineName, commonName)
 			if err != nil {
@@ -448,7 +495,7 @@ func (p *Provider) issuePKIRoleCerts(ctx context.Context, refs map[string]string
 				return
 			}
 
-			cert, err := IssueCert(ctx, p.issuer.WithNamespace(namespace), engineName, roleName, commonName)
+			cert, err := IssueCert(ctx, p.nsIssuer(namespace), engineName, roleName, commonName)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("%w: failed to issue certificate for common name %s: %w", secrettypes.ErrNotRetryable, commonName, err):

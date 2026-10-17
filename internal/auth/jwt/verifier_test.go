@@ -13,7 +13,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -376,6 +375,11 @@ func TestKnownKidDoesNotWaitForRefresh(t *testing.T) {
 	entered, release := s.entered, s.release
 	s.mu.Unlock()
 
+	var once sync.Once
+
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock() // never leave the handler blocked, even on failure
+
 	done := make(chan error, 1)
 
 	go func() {
@@ -383,14 +387,23 @@ func TestKnownKidDoesNotWaitForRefresh(t *testing.T) {
 		done <- err
 	}()
 
-	<-entered // the refresh is now in flight and blocked in the handler
+	select {
+	case <-entered: // the refresh is now in flight and blocked in the handler
+	case <-time.After(10 * time.Second):
+		t.Fatal("refresh request never reached the server")
+	}
 
 	wantPrincipal(t, v, rs256(t, "rsa", claims(nil)), rbac.Principal{Subject: "alice"})
 
-	close(release)
+	unblock()
 
-	if err := <-done; !errors.Is(err, ErrInvalidToken) {
-		t.Fatalf("want ErrInvalidToken, got %v", err)
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrInvalidToken) {
+			t.Fatalf("want ErrInvalidToken, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Verify did not return after the refresh was released")
 	}
 }
 
@@ -398,18 +411,23 @@ func TestCancelledContextStillFetchesOnce(t *testing.T) {
 	s := newJWKSServer(t, pub(&testRSA.PublicKey, "rsa"))
 	v, _ := newTestVerifier(t, s, nil)
 
+	wantPrincipal(t, v, rs256(t, "rsa", claims(nil)), rbac.Principal{Subject: "alice"})
+
+	newKey := mustRSA()
+	s.setKeys(t, pub(&testRSA.PublicKey, "rsa"), pub(&newKey.PublicKey, "new"))
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	got, err := v.Verify(ctx, rs256(t, "rsa", claims(nil)))
+	got, err := v.Verify(ctx, sign(t, jwtlib.SigningMethodRS256, newKey, "new", claims(nil)))
 	if err != nil || got.Subject != "alice" {
 		t.Fatalf("got %#v, %v", got, err)
 	}
 
 	wantInvalid(t, v, rs256(t, "nope", claims(nil)))
 
-	if n := s.hits.Load(); n != 1 {
-		t.Fatalf("%d requests, want 1", n)
+	if n := s.hits.Load(); n != 2 {
+		t.Fatalf("%d requests, want 2 (initial load + one refresh)", n)
 	}
 }
 
@@ -418,6 +436,7 @@ func TestKeyRotation(t *testing.T) {
 	v, clk := newTestVerifier(t, s, nil)
 
 	wantPrincipal(t, v, rs256(t, "old", claims(nil)), rbac.Principal{Subject: "alice"})
+	wantInvalid(t, v, rs256(t, "nope", claims(nil))) // first reload: opens the rate-limit window
 
 	newKey := mustRSA()
 	s.setKeys(t, pub(&testRSA.PublicKey, "old"), pub(&newKey.PublicKey, "new"))
@@ -491,57 +510,25 @@ func TestInvalidJWKSEntriesAreIgnored(t *testing.T) {
 	wantInvalid(t, v, rs256(t, "oct", claims(nil)))
 }
 
-// The second lookup under refreshMu: a goroutine that waited for the lock finds
-// the key loaded by the one that held it and must not fail on the rate limit.
+// The second lookup under refreshMu: a caller that lost the race for the lock
+// finds the key loaded by the winner and must not fail on the rate limit.
 func TestKeyLoadedWhileWaitingForRefreshLock(t *testing.T) {
 	s := newJWKSServer(t)
 	v, _ := newTestVerifier(t, s, nil)
 
-	v.refreshMu.Lock()
-
-	done := make(chan error, 1)
-
-	go func() {
-		_, err := v.key(context.Background(), "late")
-		done <- err
-	}()
-
-	deadline := time.Now().Add(10 * time.Second)
-
-	for !waitingOnLock() {
-		if time.Now().After(deadline) {
-			t.Fatal("goroutine never blocked on refreshMu")
-		}
-
-		runtime.Gosched()
+	v.afterMiss = func() {
+		v.mu.Lock()
+		v.keys["late"] = &testRSA.PublicKey
+		v.mu.Unlock()
 	}
 
-	v.mu.Lock()
-	v.keys["late"] = &testRSA.PublicKey
-	v.mu.Unlock()
-	v.refreshMu.Unlock()
-
-	if err := <-done; err != nil {
+	if _, err := v.key(context.Background(), "late"); err != nil {
 		t.Fatal(err)
 	}
 
 	if n := s.hits.Load(); n != 0 {
 		t.Fatalf("%d requests, want 0", n)
 	}
-}
-
-// waitingOnLock reports whether some goroutine is blocked on a mutex inside Verifier.key.
-func waitingOnLock() bool {
-	buf := make([]byte, 1<<20)
-	buf = buf[:runtime.Stack(buf, true)]
-
-	for _, g := range strings.Split(string(buf), "\n\n") {
-		if strings.Contains(g, "Verifier).key") && strings.Contains(g, "lockSlow") {
-			return true
-		}
-	}
-
-	return false
 }
 
 func TestNewVerifier(t *testing.T) {

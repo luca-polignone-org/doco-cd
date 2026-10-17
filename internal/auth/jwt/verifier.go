@@ -50,7 +50,12 @@ type Verifier struct {
 
 	mu          sync.RWMutex // protects keys and lastRefresh
 	keys        map[string]any
-	lastRefresh time.Time
+	lastRefresh time.Time // start of the rate-limit window; zero until a refresh must be limited
+	loaded      bool      // a fetch has succeeded at least once
+
+	// afterMiss, if set, runs between the lock-free lookup and taking refreshMu.
+	// Tests use it to interleave a concurrent refresh deterministically.
+	afterMiss func()
 
 	refreshMu sync.Mutex // one fetch at a time; lookups of known kids never wait for it
 }
@@ -172,7 +177,8 @@ func groupsOf(raw any) ([]string, error) {
 	}
 }
 
-// key returns the key of kid. On an unknown kid it reloads the JWKS at most once
+// key returns the key of kid. The first call loads the JWKS (NewVerifier does not
+// contact the issuer). On an unknown kid it reloads the JWKS at most once
 // per MinRefreshInterval: one fetch at a time (refreshMu), while known kids are
 // read under RLock without waiting for it. The fetch uses a context detached
 // from the request, with its own timeout, so a cancelled request does not burn
@@ -180,6 +186,10 @@ func groupsOf(raw any) ([]string, error) {
 func (v *Verifier) key(ctx context.Context, kid string) (any, error) {
 	if k, ok := v.lookup(kid); ok {
 		return k, nil
+	}
+
+	if v.afterMiss != nil {
+		v.afterMiss()
 	}
 
 	v.refreshMu.Lock()
@@ -193,6 +203,7 @@ func (v *Verifier) key(ctx context.Context, kid string) (any, error) {
 	now := v.cfg.Now()
 
 	v.mu.RLock()
+	initial := !v.loaded
 	recent := !v.lastRefresh.IsZero() && now.Sub(v.lastRefresh) < v.cfg.MinRefreshInterval
 	v.mu.RUnlock()
 
@@ -206,10 +217,17 @@ func (v *Verifier) key(ctx context.Context, kid string) (any, error) {
 	keys, err := v.fetch(fetchCtx)
 
 	v.mu.Lock()
-	v.lastRefresh = now
 
 	if err == nil {
 		v.keys = keys // a failed fetch leaves the known keys as they are
+		v.loaded = true
+	}
+
+	// The first successful load is not a refresh: it does not open the rate-limit
+	// window, so the first unknown kid after it can still trigger one reload.
+	// Failures always open it, so an unreachable issuer is not hammered.
+	if err != nil || !initial {
+		v.lastRefresh = now
 	}
 	v.mu.Unlock()
 

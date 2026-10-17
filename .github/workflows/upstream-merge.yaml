@@ -5,16 +5,16 @@ on:
     - cron: '17 6 * * 1'
   workflow_dispatch:
 
+# GITHUB_TOKEN only reads the upstream release; the push and the PR use UPSTREAM_MERGE_TOKEN.
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 jobs:
   merge:
     if: github.repository == 'luca-polignone-org/doco-cd'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           # GITHUB_TOKEN cannot push commits that touch .github/workflows/, and an upstream merge
@@ -35,7 +35,9 @@ jobs:
           git fetch https://github.com/kimdre/doco-cd.git "refs/tags/$TAG:refs/tags/$TAG"
           if git merge-base --is-ancestor "$TAG" origin/main; then echo "already merged"; exit 0; fi
           branch="upstream/$TAG"
-          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then echo "PR already open"; exit 0; fi
+          # An existing branch means a PR is open, or was closed without merging and the branch was
+          # left behind: either way this tag is skipped from then on, until the branch is deleted.
+          if git ls-remote --exit-code origin "refs/heads/$branch" >/dev/null; then echo "branch $branch already exists, skipping"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$branch" origin/main

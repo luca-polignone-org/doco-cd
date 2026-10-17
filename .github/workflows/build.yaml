@@ -62,6 +62,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
+          # Multi-platform index digest pushed by the reusable workflow (its outputs.digest).
           DIGEST: ${{ needs.build.outputs.digest }}
         run: |
           # Upstream tags reach this repository only through the merge commit, not as tags.
@@ -70,7 +71,10 @@ jobs:
           base=$(git merge-base HEAD "$upstream_tag")
           # Upstream files the fork modified or deleted; files the fork added are not counted.
           touched=$(git diff --no-renames --diff-filter=MD --name-only "$base" HEAD | wc -l)
+          if [ -z "$DIGEST" ]; then echo "no image digest from the build job"; exit 1; fi
           gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --prerelease --generate-notes --verify-tag
+          # A re-run must not append the lines a second time.
+          if gh release view "$GITHUB_REF_NAME" --json body -q .body | grep -q '^Image: `ghcr.io/'; then echo "release notes already have the image digest"; exit 0; fi
           gh release edit "$GITHUB_REF_NAME" --notes "$(gh release view "$GITHUB_REF_NAME" --json body -q .body)
 
           Image: \`ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}\` (linux/amd64, linux/arm64, linux/arm/v7)

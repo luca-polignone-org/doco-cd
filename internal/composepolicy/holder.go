@@ -8,14 +8,14 @@ import (
 	"time"
 )
 
-// Holder tiene l'ultima compose policy valida e la ricarica quando il file cambia
-// (mtime o dimensione). Un file diventato invalido viene ignorato con un log error.
+// Holder keeps the last valid compose policy and reloads it when the file changes
+// (mtime or size). A file that became invalid is ignored with an error log.
 type Holder struct {
 	path    string
 	log     *slog.Logger
 	mu      sync.RWMutex
 	current *File
-	modTime time.Time // versione del file di current, o dell'ultimo tentativo fallito
+	modTime time.Time // file version of current, or of the last failed attempt
 	size    int64
 }
 
@@ -34,7 +34,7 @@ func (h *Holder) reload() error {
 		return fmt.Errorf("stat compose policy %s: %w", h.path, err)
 	}
 
-	data, err := os.ReadFile(h.path) // #nosec G304 -- path dell'operatore
+	data, err := os.ReadFile(h.path) // #nosec G304 -- operator-supplied path
 	if err != nil {
 		return fmt.Errorf("read compose policy %s: %w", h.path, err)
 	}
@@ -51,7 +51,7 @@ func (h *Holder) reload() error {
 	return nil
 }
 
-// Current restituisce la policy valida più recente; nil se l'Holder è nil (policy spenta).
+// Current returns the most recent valid policy; nil if the Holder is nil (policy disabled).
 func (h *Holder) Current() *File {
 	if h == nil {
 		return nil
@@ -64,8 +64,8 @@ func (h *Holder) Current() *File {
 
 		if changed {
 			if err = h.reload(); err != nil {
-				// Si ricorda la versione fallita, così il reload e il log non si ripetono a ogni
-				// deploy finché il file non cambia di nuovo.
+				// Remember the failed version so the reload and the log are not repeated on
+				// every deploy until the file changes again.
 				h.mu.Lock()
 				h.modTime, h.size = info.ModTime(), info.Size()
 				h.mu.Unlock()

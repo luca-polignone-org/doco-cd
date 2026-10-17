@@ -11,14 +11,14 @@ import (
 	"github.com/kimdre/doco-cd/internal/git"
 )
 
-// Capability del set di default di Docker: aggiungerle con cap_add non allarga niente.
+// defaultCaps is Docker's default capability set: adding them via cap_add widens nothing.
 var defaultCaps = []string{
 	"CHOWN", "DAC_OVERRIDE", "FSETID", "FOWNER", "MKNOD", "NET_RAW", "SETGID",
 	"SETUID", "SETFCAP", "SETPCAP", "NET_BIND_SERVICE", "SYS_CHROOT", "KILL", "AUDIT_WRITE",
 }
 
-// forbiddenSecurityOpt vieta ogni sostituzione del profilo seccomp o AppArmor (anche un
-// file committato può essere permissivo), label=disable, label=type:spc_t e systempaths=unconfined.
+// forbiddenSecurityOpt forbids any seccomp or AppArmor profile override (even a committed
+// file may be permissive), label=disable, label=type:spc_t and systempaths=unconfined.
 func forbiddenSecurityOpt(opt string) bool {
 	o := strings.ToLower(strings.TrimSpace(opt))
 	for _, prefix := range []string{"seccomp=", "seccomp:", "apparmor=", "apparmor:"} {
@@ -35,8 +35,8 @@ func forbiddenSecurityOpt(opt string) bool {
 	return false
 }
 
-// targetFor restituisce la policy effettiva del target: default per le liste che la
-// voce non dichiara.
+// targetFor returns the effective policy of the target: the default for the lists
+// the entry does not declare.
 func (f *File) targetFor(object string) (TargetPolicy, bool) {
 	tp, ok := f.Targets[object]
 	if !ok {
@@ -63,8 +63,8 @@ func (f *File) Check(in Input) []Violation {
 
 	tp, ok := f.targetFor(in.Identity.Object)
 	if !ok || !identityMatches(tp, in.Identity) {
-		// Senza identità legata al repository non ha senso valutare il resto:
-		// l'allowlist da applicare sarebbe quella di un oggetto che non è suo.
+		// Without an identity bound to the repository there is no point evaluating the rest:
+		// the allowlist to apply would belong to an object that is not theirs.
 		return append(out, Violation{Field: "target", Value: in.Identity.Object})
 	}
 
@@ -109,7 +109,7 @@ func identityMatches(tp TargetPolicy, id Identity) bool {
 		return false
 	}
 
-	// Con reference dichiarata, una sorgente OCI (Reference vuota) non corrisponde.
+	// With a declared reference, an OCI source (empty Reference) does not match.
 	if tp.Reference != "" && (id.Reference == "" || !git.ReferenceMatches(id.Reference, tp.Reference)) {
 		return false
 	}
@@ -127,8 +127,12 @@ func checkService(p *types.Project, svc types.ServiceConfig, pc pathChecker, tp 
 	}
 
 	for _, ns := range []struct{ field, value string }{
-		{"network_mode", svc.NetworkMode}, {"pid", svc.Pid}, {"ipc", svc.Ipc},
-		{"uts", svc.Uts}, {"userns_mode", svc.UserNSMode}, {"cgroup", svc.Cgroup},
+		{"network_mode", svc.NetworkMode},
+		{"pid", svc.Pid},
+		{"ipc", svc.Ipc},
+		{"uts", svc.Uts},
+		{"userns_mode", svc.UserNSMode},
+		{"cgroup", svc.Cgroup},
 	} {
 		if ns.value == "host" || joinsForeignContainer(p, ns.value) {
 			v(ns.field, ns.value)
@@ -158,7 +162,7 @@ func checkService(p *types.Project, svc types.ServiceConfig, pc pathChecker, tp 
 			v("build.context", b.Context)
 		}
 
-		// Un Dockerfile relativo è relativo al context: ../../x ne esce.
+		// A relative Dockerfile is relative to the context: ../../x escapes it.
 		if df := b.Dockerfile; df != "" {
 			if !filepathIsAbs(df) && isLocalPath(b.Context) {
 				df = filepath.Join(b.Context, df)
@@ -235,7 +239,7 @@ func checkService(p *types.Project, svc types.ServiceConfig, pc pathChecker, tp 
 			continue
 		}
 
-		// Senza name esplicito la rete esterna si chiama come la sua chiave.
+		// Without an explicit name, an external network is named after its key.
 		effective := n.Name
 		if effective == "" {
 			effective = name

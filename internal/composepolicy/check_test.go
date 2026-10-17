@@ -44,13 +44,13 @@ func pv(field, value string) Violation { return Violation{Field: field, Value: v
 
 type checkCase struct {
 	name string
-	tp   *TargetPolicy // sostituisce la voce di base
+	tp   *TargetPolicy // replaces the base entry
 	def  TargetPolicy
 	mod  func(*Input)
 	want []Violation
 }
 
-// app imposta il progetto con un solo servizio "app" modificato da f.
+// app sets the project to a single "app" service modified by f.
 func app(f func(*types.ServiceConfig)) func(*Input) {
 	return func(in *Input) {
 		s := types.ServiceConfig{Name: "app"}
@@ -66,6 +66,7 @@ func TestCheck(t *testing.T) {
 	cfgInt := t.TempDir()
 
 	mustSymlink(t, "/etc", filepath.Join(intl, "etc"))
+
 	gone := t.TempDir()
 	if err := os.RemoveAll(gone); err != nil {
 		t.Fatal(err)

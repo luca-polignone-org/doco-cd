@@ -14,8 +14,8 @@ import (
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
-// runtimeDirs contengono i socket dei runtime (docker.sock, containerd, rootless in
-// /run/user/<uid>): niente che li tocchi può essere montato.
+// runtimeDirs hold the runtime sockets (docker.sock, containerd, rootless in
+// /run/user/<uid>): nothing that touches them may be mounted.
 var runtimeDirs = []string{"/run", "/var/run"}
 
 type pathChecker struct {
@@ -23,16 +23,16 @@ type pathChecker struct {
 	allow []string
 }
 
-// inCheckout dice se un path dell'host sta nella checkout del deploy o in quella del
-// config source, anche dopo aver risolto i symlink di ogni componente dal lato del
-// container (il daemon li segue sull'host).
+// inCheckout reports whether a host path lies in the deploy checkout or in the config
+// source one, even after resolving the symlinks of every component on the container
+// side (the daemon follows them on the host).
 func (pc pathChecker) inCheckout(hostPath string) bool {
 	return within(pc.paths.CheckoutExternal, pc.paths.CheckoutInternal, hostPath) ||
 		within(pc.paths.ConfigExternal, pc.paths.ConfigInternal, hostPath)
 }
 
-// inCheckoutByPrefix dice se il path pretende di stare in una checkout guardando solo
-// il prefisso, senza risolvere symlink.
+// inCheckoutByPrefix reports whether the path claims to be in a checkout by looking
+// only at the prefix, without resolving symlinks.
 func (pc pathChecker) inCheckoutByPrefix(hostPath string) bool {
 	return (pc.paths.CheckoutExternal != "" && filesystem.InBasePath(pc.paths.CheckoutExternal, hostPath)) ||
 		(pc.paths.ConfigExternal != "" && filesystem.InBasePath(pc.paths.ConfigExternal, hostPath))
@@ -50,8 +50,8 @@ func within(external, internal, hostPath string) bool {
 		return false
 	}
 
-	// Se il daemon vede la checkout a un path diverso da quello interno, un symlink
-	// assoluto verrebbe risolto nel namespace dell'host e non in quello del container.
+	// If the daemon sees the checkout at a different path than the internal one, an
+	// absolute symlink would be resolved in the host namespace, not the container one.
 	if filepath.Clean(external) != filepath.Clean(internal) {
 		if err = rejectAbsoluteSymlinks(internal, rel); err != nil {
 			return false
@@ -79,10 +79,10 @@ var (
 
 const maxSymlinkHops = 40
 
-// rejectAbsoluteSymlinks percorre i componenti di rel sotto root e fallisce al primo
-// symlink con destinazione assoluta (anche raggiunto attraverso un symlink relativo).
-// Si ferma, senza errore, al primo componente inesistente: il resto lo giudica
-// evalExistingPrefix.
+// rejectAbsoluteSymlinks walks the components of rel under root and fails at the first
+// symlink with an absolute target (even one reached through a relative symlink).
+// It stops, without error, at the first nonexistent component: evalExistingPrefix
+// judges the rest.
 func rejectAbsoluteSymlinks(root, rel string) error {
 	pending := strings.Split(filepath.ToSlash(rel), "/")
 	cur := root
@@ -130,10 +130,10 @@ func rejectAbsoluteSymlinks(root, rel string) error {
 	return nil
 }
 
-// evalExistingPrefix risolve i symlink del più lungo prefisso esistente e vi riattacca
-// il resto, così un path non ancora creato sotto un symlink resta comunque risolto. Un
-// symlink pendente è un errore: nel container la destinazione manca, sull'host può
-// esistere, e il daemon lo seguirebbe.
+// evalExistingPrefix resolves the symlinks of the longest existing prefix and
+// reattaches the rest, so a path not yet created under a symlink is still resolved. A
+// dangling symlink is an error: the target is missing in the container but may exist
+// on the host, and the daemon would follow it.
 func evalExistingPrefix(p string) (string, error) {
 	rest := ""
 
@@ -143,7 +143,7 @@ func evalExistingPrefix(p string) (string, error) {
 			return filepath.Join(resolved, rest), nil
 		}
 
-		// Alla radice non c'è più un genitore da provare: l'errore è definitivo.
+		// At the root there is no parent left to try: the error is final.
 		if !errors.Is(err, os.ErrNotExist) || filepath.Dir(p) == p {
 			return "", err
 		}
@@ -168,8 +168,8 @@ func (pc pathChecker) bindAllowed(hostPath string) bool {
 		return true
 	}
 
-	// Un path che pretende di stare nella checkout ma ne esce via symlink non può
-	// essere salvato dall'allowlist: è proprio il bypass che la regola chiude.
+	// A path that claims to be in the checkout but escapes it via symlink cannot be
+	// rescued by the allowlist: that is exactly the bypass this rule closes.
 	if pc.inCheckoutByPrefix(hostPath) {
 		return false
 	}
@@ -183,8 +183,9 @@ func (pc pathChecker) bindAllowed(hostPath string) bool {
 	return false
 }
 
-// touchesSocket è vero per /run, /var/run, ogni path sotto di essi e ogni loro antenato
-// (/, /var): montare un antenato espone i socket dei runtime, qualunque allowlist ci sia.
+// touchesSocket is true for /run, /var/run, any path under them and any of their
+// ancestors (/, /var): mounting an ancestor exposes the runtime sockets, whatever the
+// allowlist says.
 func touchesSocket(p string) bool {
 	for _, d := range runtimeDirs {
 		if filesystem.InBasePath(d, p) || filesystem.InBasePath(p, d) {
@@ -222,7 +223,7 @@ func joinsForeignContainer(p *types.Project, mode string) bool {
 
 	switch kind {
 	case "container":
-		return true // un container per nome non è mai sotto il controllo del progetto
+		return true // a container by name is never under the project's control
 	case "service":
 		return !hasService(p, name)
 	default:

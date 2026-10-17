@@ -14,11 +14,11 @@ import (
 	"github.com/kimdre/doco-cd/internal/config"
 )
 
-// Violation è una regola della compose policy non rispettata. Service è vuoto per le
-// regole di progetto (identità, swarm, secrets, configs, file del deploy).
+// Violation is a compose policy rule that was not respected. Service is empty for
+// project-level rules (identity, swarm, secrets, configs, deploy files).
 type Violation struct{ Service, Field, Value string }
 
-// TargetPolicy è la policy di un oggetto <context>/<project>.
+// TargetPolicy is the policy of a <context>/<project> object.
 type TargetPolicy struct {
 	Repository      string   `yaml:"repository"`
 	Reference       string   `yaml:"reference"`
@@ -27,37 +27,37 @@ type TargetPolicy struct {
 	CapAddAllowlist []string `yaml:"cap_add_allowlist"`
 }
 
-// File è la compose policy compilata da Portico (3b). Le chiavi di targets sono
-// oggetti esatti <context>/<project>: un glob legherebbe a un repository più oggetti
-// di quelli dichiarati.
+// File is the compose policy compiled by Portico (3b). The keys of targets are exact
+// <context>/<project> objects: a glob would bind more objects to a repository than
+// the ones declared.
 type File struct {
 	Version int                     `yaml:"version"`
 	Default TargetPolicy            `yaml:"default"`
 	Targets map[string]TargetPolicy `yaml:"targets"`
 }
 
-// Identity è l'identità con cui il deploy si presenta: oggetto, sorgente e target di config.
+// Identity is the identity the deploy presents: object, source and config target.
 type Identity struct {
 	Object, Repository, Reference, ConfigTarget string
 	Swarm                                       bool
 }
 
-// Paths sono le checkout da cui Doco-CD legge file: quella del deploy e, se la deploy
-// config viene da un altro repository (repository_url), quella del config source.
+// Paths are the checkouts Doco-CD reads files from: the deploy one and, if the deploy
+// config comes from another repository (repository_url), the config source one.
 type Paths struct{ CheckoutExternal, CheckoutInternal, ConfigExternal, ConfigInternal string }
 
-// Input è quanto Check valuta.
+// Input is what Check evaluates.
 type Input struct {
 	Project        *types.Project
 	Identity       Identity
 	Paths          Paths
-	DeployEnvFiles []string // deploy.Config.EnvFiles risolti come path dell'host (external)
-	SecretsFiles   []string // deploy.Config.ExternalSecretsFiles risolti (external)
+	DeployEnvFiles []string // deploy.Config.EnvFiles resolved as host paths (external)
+	SecretsFiles   []string // deploy.Config.ExternalSecretsFiles resolved (external)
 }
 
 const fileVersion = 1
 
-// Parse legge e normalizza una compose policy; qualunque difetto è un errore.
+// Parse reads and normalizes a compose policy; any defect is an error.
 func Parse(data []byte) (*File, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -67,7 +67,7 @@ func Parse(data []byte) (*File, error) {
 		return nil, fmt.Errorf("decode compose policy: %w", err)
 	}
 
-	// Un secondo documento sarebbe ignorato in silenzio: meglio rifiutare il file.
+	// A second document would be silently ignored: better to reject the file.
 	var extra any
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return nil, errors.New("compose policy: multiple YAML documents or trailing data")
@@ -77,8 +77,8 @@ func Parse(data []byte) (*File, error) {
 		return nil, fmt.Errorf("compose policy: unsupported version %d", f.Version)
 	}
 
-	// default porta solo le liste: un repository o una reference di default
-	// legherebbero ogni voce che non li dichiara.
+	// default carries only the lists: a default repository or reference would
+	// bind every entry that does not declare its own.
 	if strings.TrimSpace(f.Default.Repository+f.Default.Reference+f.Default.ConfigTarget) != "" {
 		return nil, errors.New("compose policy default: repository, reference and config_target are not allowed")
 	}

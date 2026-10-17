@@ -45,7 +45,7 @@ func TestHolderReload(t *testing.T) {
 		t.Error("unchanged file must not be reloaded")
 	}
 
-	// File invalido: si tiene la versione vecchia e si logga una volta sola.
+	// Invalid file: keep the old version and log only once.
 	writeAt(t, path, "version: 2\n", base.Add(time.Second))
 
 	if h.Current() != first {
@@ -64,7 +64,7 @@ func TestHolderReload(t *testing.T) {
 		t.Fatalf("failed version logged again: %d lines", n)
 	}
 
-	// File valido di nuovo: nuova versione.
+	// Valid file again: new version.
 	writeAt(t, path, "version: 1\ntargets: {\"noi/b\": {repository: https://x/z}}\n", base.Add(2*time.Second))
 
 	next := h.Current()
@@ -72,7 +72,7 @@ func TestHolderReload(t *testing.T) {
 		t.Fatalf("expected new policy, got %+v", next)
 	}
 
-	// File sparito: si tiene l'ultima versione valida.
+	// File gone: keep the last valid version.
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestHolderErrors(t *testing.T) {
 		t.Error("invalid file: expected error")
 	}
 
-	// Una directory supera la stat ma non la lettura.
+	// A directory passes stat but not the read.
 	if _, err := NewHolder(dir, log); err == nil {
 		t.Error("directory: expected error")
 	}

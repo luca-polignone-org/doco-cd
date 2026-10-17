@@ -1,0 +1,6 @@
+name: e2e-fork-secret
+working_dir: deploy
+# v1 names a secret outside the allowlist of the target on purpose: the scenario points it to
+# prod/e2e-fork-secret/db in its second commit
+external_secrets:
+  DB: kv:secret:prod/other/db:PASS

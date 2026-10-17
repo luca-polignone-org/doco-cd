@@ -1,0 +1,1 @@
+Outside working_dir: a commit that changes only this file leaves the content key of the target unchanged.

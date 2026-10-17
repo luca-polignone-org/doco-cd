@@ -7,4 +7,7 @@ Modifications (from v0.127.0):
 - internal/rollback: on-disk failure store, last good deployment, local rollback
 - internal/hooks: pre_rollback veto and outcome events (signed, outbox)
 - cmd/doco-cd/version.go: version check against the fork base version
+- internal/composepolicy: secret allowlist for external_secrets, logging rule (v0.127.0-poli.2)
+- internal/secretprovider/openbao: token file reload (v0.127.0-poli.2)
+- internal/rollback, internal/stages: rollback.unblock_on content (v0.127.0-poli.2)
 All modifications are disabled unless their configuration keys are set.

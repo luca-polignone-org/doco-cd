@@ -1,0 +1,7 @@
+name: e2e-fork-unblock
+working_dir: deploy
+rollback:
+  enabled: true
+  unblock_on: content
+  timeout: 2m
+  pre_rollback_timeout: 10s

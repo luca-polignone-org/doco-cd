@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"testing"
@@ -65,6 +66,24 @@ func TestCheckForkSecretGate(t *testing.T) {
 	ForkSecretGate = func(string, string, map[string]string) error { return nil }
 	if err := checkForkSecretGate(ctx, cfg, namedProvider{}, refs); err != nil {
 		t.Fatalf("error = %v, want nil when the gate allows", err)
+	}
+}
+
+// TestWithForkJobGateObject sets the process-wide ForkSecretGate, so it does not call t.Parallel.
+func TestWithForkJobGateObject(t *testing.T) {
+	t.Cleanup(func() { ForkSecretGate = nil })
+
+	// Without the gate the client is not touched: a nil embedded command.Cli would panic.
+	ForkSecretGate = nil
+	if ctx := withForkJobGateObject(context.Background(), contextCli{}, "web"); ctx.Value(forkJobObjectKey{}) != nil {
+		t.Fatal("object recorded without a gate")
+	}
+
+	ForkSecretGate = func(string, string, map[string]string) error { return nil }
+
+	ctx := withForkJobGateObject(context.Background(), contextCli{name: "remote"}, "web")
+	if got, _ := ctx.Value(forkJobObjectKey{}).(string); got != "remote/web" {
+		t.Fatalf("object = %q, want remote/web", got)
 	}
 }
 
@@ -135,7 +154,14 @@ func TestScheduledReloadSecretGate(t *testing.T) {
 		t.Fatalf("provider called %d times, want 0", p.calls)
 	}
 
-	if gotObject != "default/web" || len(gotRefs) != 1 || gotRefs["CERT"] == "" {
-		t.Fatalf("gate called with %q, %v", gotObject, gotRefs)
+	wantRefs, err := secrettypes.EncodeExternalSecretRefs(map[string]secrettypes.ExternalSecretRef{
+		"CERT": {LegacyRef: "kv:secret:prod/other/db:PASS"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if gotObject != "default/web" || !maps.Equal(gotRefs, wantRefs) {
+		t.Fatalf("gate called with %q, %v, want default/web, %v", gotObject, gotRefs, wantRefs)
 	}
 }

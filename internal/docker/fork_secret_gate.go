@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/docker/cli/cli/command"
+
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 )
@@ -19,6 +21,18 @@ type forkJobObjectKey struct{}
 // gate applies the allowlist of that object and not of whatever the reloaded config declares.
 func withForkJobObject(ctx context.Context, object string) context.Context {
 	return context.WithValue(ctx, forkJobObjectKey{}, object)
+}
+
+// withForkJobGateObject records forkJobObject for the secret gate, only while ForkSecretGate is
+// set: without it the Docker client is not touched, so upstream behaviour (and upstream fakes
+// whose CurrentContext is not implemented) is unchanged. A gate installed after this point finds
+// no object and refuses, fail closed.
+func withForkJobGateObject(ctx context.Context, dockerCli command.Cli, project string) context.Context {
+	if ForkSecretGate == nil {
+		return ctx
+	}
+
+	return withForkJobObject(ctx, forkJobObject(dockerCli, project))
 }
 
 // checkForkSecretGate applies ForkSecretGate to the encoded references of a scheduled job. With the

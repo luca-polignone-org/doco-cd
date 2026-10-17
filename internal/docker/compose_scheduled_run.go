@@ -321,11 +321,7 @@ func loadComposeScheduledProjectAll(
 		return nil, nil, err
 	}
 
-	if dockerCli != nil {
-		ctx = withForkJobObject(ctx, deploy.ObjectName(dockerCli.CurrentContext(), ref.Project))
-	} else {
-		ctx = withForkJobObject(ctx, deploy.ObjectName("", ref.Project))
-	}
+	ctx = withForkJobGateObject(ctx, dockerCli, ref.Project)
 
 	if ref.WorkingDir == "" {
 		return nil, nil, fmt.Errorf("%w: missing %q label",

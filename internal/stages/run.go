@@ -11,6 +11,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/prometheus"
+	"github.com/kimdre/doco-cd/internal/rollback"
 	"github.com/kimdre/doco-cd/internal/selfupdate"
 )
 
@@ -283,23 +284,45 @@ func (s *StageManager) recordDeploymentFailure(stageName StageName, cause error)
 		return
 	}
 
-	docker.RecordDeploymentFailure(s.Repository.Name, s.DeployConfig.Name, docker.DeploymentFailure{
+	failure := docker.DeploymentFailure{
 		Repository: s.Repository.Name,
 		Stack:      s.DeployConfig.Name,
 		CommitSHA:  s.Repository.Revision,
 		Stage:      string(stageName),
 		Error:      cause.Error(),
 		FailedAt:   time.Now().UTC(),
-	})
+	}
+
+	docker.RecordDeploymentFailure(s.Repository.Name, s.DeployConfig.Name, failure)
+
+	// Fork: with rollback enabled the failure also goes to disk, with state failed;
+	// the rollback flow (fork_rollback.go) then updates it to rolled_back or blocked.
+	s.persistForkFailure(failure, rollback.StateFailed, "")
 }
 
 // lastDeploymentFailure returns the recorded failure of the stack's last
 // deployment attempt, if any.
 func (s *StageManager) lastDeploymentFailure() (docker.DeploymentFailure, bool) {
-	return docker.GetDeploymentFailure(s.Repository.Name, s.DeployConfig.Name)
+	if failure, ok := docker.GetDeploymentFailure(s.Repository.Name, s.DeployConfig.Name); ok {
+		return failure, true
+	}
+
+	// Fork: after a restart memory is empty, disk is not.
+	if f, ok := s.loadForkFailure(); ok {
+		failure := docker.DeploymentFailure{
+			Repository: f.Repository, Stack: f.Stack, CommitSHA: f.CommitSHA,
+			Stage: f.Stage, Error: f.Error, FailedAt: f.FailedAt,
+		}
+		docker.RecordDeploymentFailure(s.Repository.Name, s.DeployConfig.Name, failure)
+
+		return failure, true
+	}
+
+	return docker.DeploymentFailure{}, false
 }
 
 // clearDeploymentFailure removes the failure record of the stack, if present.
 func (s *StageManager) clearDeploymentFailure() {
 	docker.ClearDeploymentFailure(s.Repository.Name, s.DeployConfig.Name)
+	s.deleteForkFailure()
 }

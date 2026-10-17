@@ -327,7 +327,10 @@ var deployLastGood = docker.DeployStack
 
 // runForkRollback runs the rollback flow after a failed deploy, post-deploy or cleanup stage of
 // a target with rollback enabled; it never runs for a destroy. It reports whether the flow ran, in
-// which case it emitted the outcome event of the failure (emitRollbackOutcome). The failure comes from process
+// which case it emitted the outcome event of the failure (emitRollbackOutcome). cause is the error
+// of the stage: the error of the record comes from it, redacted and then truncated, not from the
+// in-memory failure, which upstream already truncated (a secret straddling the cut would survive
+// redaction as a prefix). The failure comes from process
 // memory, not from disk: if the initial write failed, an empty CommitSHA read back from disk
 // would make the failed commit look new to rollbackPoisoned, and it would be deployed again.
 //
@@ -335,7 +338,7 @@ var deployLastGood = docker.DeployStack
 // exclusion against another job of the same object is the fork target lock: runForkDeployStage
 // takes it for a target with rollback enabled, and RunStages releases it only after this function
 // returned (see lockForkTarget for the lock order).
-func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName) bool {
+func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName, cause error) bool {
 	if s.DeployConfig.Destroy.Enabled || !stageRecordsDeploymentFailure(stageName) {
 		return false
 	}
@@ -352,7 +355,7 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName)
 
 	f := rollback.Failure{
 		Object: s.DeployConfig.Object(), Repository: mem.Repository, Stack: mem.Stack,
-		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(s.redactSecrets(mem.Error), 2000),
+		CommitSHA: mem.CommitSHA, Stage: mem.Stage, Error: truncateRunes(s.redactSecrets(cause.Error()), 2000),
 		FailedAt: mem.FailedAt, State: rollback.StateFailed,
 	}
 
@@ -414,7 +417,8 @@ func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, st
 // does not decode, or has an unknown version), which blocks the target, is replaced by a failed
 // one of the deploy stage, so the next run retries with a full recreate; an I/O error is
 // returned. It reports false when nothing is blocked. It holds the fork target lock, so it never
-// interleaves with a deploy or a rollback of the same object in this process.
+// interleaves with a deploy or a rollback of the same object in this process. A successful unblock
+// emits unblocked with the repository and commit of the record.
 func UnblockTarget(ctx context.Context, dataMountPath, object string) (bool, error) {
 	unlock, err := lockForkTarget(ctx, object)
 	if err != nil {
@@ -437,7 +441,12 @@ func UnblockTarget(ctx context.Context, dataMountPath, object string) (bool, err
 
 	f.State, f.Decision = rollback.StateFailed, ""
 
-	return true, st.PutFailure(f)
+	err = st.PutFailure(f)
+	if err == nil {
+		emitUnblocked(f)
+	}
+
+	return true, err
 }
 
 // forkTargetLocks holds one lock per object: a channel of capacity 1, so a waiter can give up

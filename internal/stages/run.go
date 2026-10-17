@@ -256,7 +256,7 @@ func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageNa
 
 	// Fork: rollback to the last good deploy, behind the pre_rollback veto; it emits its outcome
 	// event, otherwise the failure emits policy_denied or failed.
-	if !s.runForkRollback(ctx, stageName) {
+	if !s.runForkRollback(ctx, stageName, err) {
 		s.emitFailureOutcome(ctx, stageName, err)
 	}
 

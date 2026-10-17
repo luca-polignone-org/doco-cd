@@ -16,6 +16,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/git"
+	"github.com/kimdre/doco-cd/internal/hooks"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/rbac"
@@ -179,6 +180,8 @@ func (c *Runs) TriggerPoll(ctx context.Context, configs []poll.Config, wait bool
 		// Polls triggered through the API or MCP are manual deployments,
 		// which sync windows with manual_sync let through.
 		runCtx = WithDeploymentOrigin(runCtx, syncwindow.OriginManual)
+		runCtx = hooks.WithAPITrigger(runCtx) // Fork: the outcome events of this run report trigger api.
+
 		if hasPrincipal {
 			runCtx = rbac.WithPrincipal(runCtx, principal)
 		}

@@ -497,6 +497,9 @@ func startPreRollback(t *testing.T, decision string) *int {
 	return &calls
 }
 
+// errRecorded is the stage error of recordMemoryFailure, given to runForkRollback as its cause.
+var errRecorded = errors.New(strings.Repeat("e", 2100))
+
 func recordMemoryFailure(sm *StageManager, stage StageName) {
 	docker.RecordDeploymentFailure(sm.Repository.Name, sm.DeployConfig.Name, docker.DeploymentFailure{
 		Repository: sm.Repository.Name, Stack: sm.DeployConfig.Name, CommitSHA: "failed-commit",
@@ -535,7 +538,7 @@ func TestRunForkRollbackRollsBack(t *testing.T) {
 	}
 
 	recordMemoryFailure(sm, StageDeploy)
-	sm.runForkRollback(t.Context(), StageDeploy)
+	sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 	if *calls != 1 || len(*got) != 1 {
 		t.Fatalf("pre_rollback calls %d, deploys %d", *calls, len(*got))
@@ -566,7 +569,7 @@ func TestRunForkRollbackOutcomes(t *testing.T) {
 		}
 
 		recordMemoryFailure(sm, StagePostDeploy)
-		sm.runForkRollback(t.Context(), StagePostDeploy)
+		sm.runForkRollback(t.Context(), StagePostDeploy, errRecorded)
 
 		if f := diskFailure(t, sm); f.State != rollback.StateRollbackFailed {
 			t.Fatalf("failure %+v", f)
@@ -586,7 +589,7 @@ func TestRunForkRollbackOutcomes(t *testing.T) {
 		}
 
 		recordMemoryFailure(sm, StageCleanup)
-		sm.runForkRollback(t.Context(), StageCleanup)
+		sm.runForkRollback(t.Context(), StageCleanup, errRecorded)
 
 		if f := diskFailure(t, sm); f.State != rollback.StateBlocked || f.Decision != "unconfigured" || len(*got) != 0 {
 			t.Fatalf("failure %+v, deploys %d", f, len(*got))
@@ -598,7 +601,7 @@ func TestRunForkRollbackOutcomes(t *testing.T) {
 		calls := startPreRollback(t, "proceed")
 
 		recordMemoryFailure(sm, StageDeploy)
-		sm.runForkRollback(t.Context(), StageDeploy)
+		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 		if f := diskFailure(t, sm); f.State != rollback.StateFailed || *calls != 0 {
 			t.Fatalf("failure %+v, pre_rollback calls %d", f, *calls)
@@ -618,7 +621,7 @@ func TestRunForkRollbackOutcomes(t *testing.T) {
 		}
 
 		recordMemoryFailure(sm, StageDeploy)
-		sm.runForkRollback(t.Context(), StageDeploy)
+		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 		if !strings.Contains(logs.String(), "failed to persist rollback state") {
 			t.Fatalf("log %q", logs.String())
@@ -651,7 +654,7 @@ func TestRunForkRollbackGuards(t *testing.T) {
 			}
 
 			recordMemoryFailure(sm, StageDeploy)
-			sm.runForkRollback(t.Context(), setup(sm))
+			sm.runForkRollback(t.Context(), setup(sm), errRecorded)
 
 			if *calls != 0 {
 				t.Fatal("the rollback flow ran")
@@ -912,7 +915,7 @@ func TestRunForkRollbackUnsupportedSkipsPreRollback(t *testing.T) {
 	}
 
 	recordMemoryFailure(sm, StageDeploy)
-	sm.runForkRollback(t.Context(), StageDeploy)
+	sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 	if f := diskFailure(t, sm); f.State != rollback.StateRollbackFailed || f.Decision != "" || *calls != 0 || len(*got) != 0 {
 		t.Fatalf("failure %+v, pre_rollback calls %d, deploys %d", f, *calls, len(*got))
@@ -1138,7 +1141,7 @@ func TestConcurrentJobWaitsForRollbackAndSkipsPoisonedCommit(t *testing.T) {
 	go func() {
 		defer close(aDone)
 
-		a.runForkRollback(t.Context(), StageDeploy)
+		a.runForkRollback(t.Context(), StageDeploy, errRecorded)
 		a.releaseForkTarget()
 	}()
 

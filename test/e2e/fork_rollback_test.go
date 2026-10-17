@@ -400,7 +400,7 @@ func forkRollbackBroken(greeting string) map[string]string {
 //
 // Every step also checks its signed outcome event: deployed (c1, with its images), rolled_back
 // (c2, with the images of c1), rollback_blocked (c2b, decision block), unblocked (the action),
-// deployed (c3), in this order.
+// unblocked (c3) and deployed (c3), in this order.
 func TestForkRollback(t *testing.T) {
 	t.Parallel()
 	requireStandaloneSuite(t)
@@ -553,7 +553,7 @@ func TestForkRollback(t *testing.T) {
 	}
 
 	_, iUnblocked := rec.waitOutcome(object, iBlocked+1, 60*time.Second, "unblocked by the action", func(ev hooks.Event) bool {
-		return ev.Outcome == hooks.OutcomeUnblocked
+		return ev.Outcome == hooks.OutcomeUnblocked && ev.Commit == c2b
 	})
 
 	h.WaitForLogAfter("last deployment attempt failed, retrying", mark, 60*time.Second)
@@ -579,7 +579,11 @@ func TestForkRollback(t *testing.T) {
 
 	h.WaitFor(30*time.Second, "lastgood ref moved to c3", func() bool { return rec.lastGoodRef() == c3.String() })
 
-	rec.waitOutcome(object, iUnblocked+1, 60*time.Second, "deployed c3", func(ev hooks.Event) bool {
+	// Spec, e2e item 4: the new commit emits unblocked before it is deployed.
+	_, iUnblockedC3 := rec.waitOutcome(object, iUnblocked+1, 60*time.Second, "unblocked by c3", func(ev hooks.Event) bool {
+		return ev.Outcome == hooks.OutcomeUnblocked && ev.Commit == c3.String()
+	})
+	rec.waitOutcome(object, iUnblockedC3+1, 60*time.Second, "deployed c3 after its unblocked", func(ev hooks.Event) bool {
 		return ev.Outcome == hooks.OutcomeDeployed && ev.Commit == c3.String()
 	})
 }
@@ -628,8 +632,16 @@ func TestForkOutcomeSecretNotLeaked(t *testing.T) {
 	failed, _ := rec.waitOutcome(object, 0, 180*time.Second, "failed on the render error", func(ev hooks.Event) bool {
 		return ev.Outcome == hooks.OutcomeFailed && strings.Contains(ev.Error, "E2E_REQUIRED")
 	})
-	if failed.Stage != "pre-deploy" {
-		t.Fatalf("failed = %+v, want the pre-deploy stage", failed)
+	// A first deploy (no containers yet) renders in the deploy stage, a later one in pre-deploy;
+	// from the deploy stage on the failure is also recorded in the fork store, checked below.
+	switch failed.Stage {
+	case "pre-deploy":
+	case "deploy":
+		if f := rec.storeFile("/data/fork/failures/default/" + forkOutcomeSecretStack + ".json"); !strings.Contains(f, "E2E_REQUIRED") {
+			t.Fatalf("failure record %q, want the render error of the deploy stage", f)
+		}
+	default:
+		t.Fatalf("failed = %+v, want the pre-deploy or deploy stage", failed)
 	}
 
 	// The secret was resolved, and the failure commit status of that run was posted.
@@ -642,7 +654,8 @@ func TestForkOutcomeSecretNotLeaked(t *testing.T) {
 			switch {
 			case strings.HasPrefix(req.Path, "/secret/"):
 				resolved++
-			case strings.Contains(req.Path, "/statuses/") && bytes.Contains(req.Body, []byte(`"state":"error"`)):
+			case strings.Contains(req.Path, "/statuses/") &&
+				(bytes.Contains(req.Body, []byte(`"state":"error"`)) || bytes.Contains(req.Body, []byte(`"state":"failure"`))):
 				statuses++
 			}
 		}

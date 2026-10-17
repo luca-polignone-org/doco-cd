@@ -111,3 +111,15 @@ func TestNewEventMalformedObject(t *testing.T) {
 		}
 	}
 }
+
+func TestAPITrigger(t *testing.T) {
+	t.Parallel()
+
+	if APITriggered(t.Context()) {
+		t.Fatal("a plain context is not an API run")
+	}
+
+	if !APITriggered(WithAPITrigger(t.Context())) {
+		t.Fatal("WithAPITrigger must mark the context")
+	}
+}

@@ -1,6 +1,7 @@
 package hooks
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -91,4 +92,18 @@ func NewEvent(object string) Event {
 	}
 
 	return e
+}
+
+type apiTriggerKey struct{}
+
+// WithAPITrigger marks ctx as a run requested through the API or MCP (poll/run, trigger_poll):
+// the outcome events of its deploys report trigger api. It does not depend on RBAC.
+func WithAPITrigger(ctx context.Context) context.Context {
+	return context.WithValue(ctx, apiTriggerKey{}, true)
+}
+
+// APITriggered reports whether ctx was marked by WithAPITrigger.
+func APITriggered(ctx context.Context) bool {
+	marked, _ := ctx.Value(apiTriggerKey{}).(bool)
+	return marked
 }

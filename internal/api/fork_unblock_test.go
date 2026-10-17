@@ -129,7 +129,7 @@ func TestUnblockProjectAction(t *testing.T) {
 		t.Cleanup(func() { stages.SetOutbox(nil) })
 
 		data := t.TempDir()
-		if err := rollback.StoreFor(data).PutFailure(rollback.Failure{Object: "default/allowed", CommitSHA: "c2", Stage: "deploy", State: rollback.StateBlocked}); err != nil {
+		if err := rollback.StoreFor(data).PutFailure(rollback.Failure{Object: "default/allowed", Repository: "org/repo", CommitSHA: "c2", Stage: "deploy", State: rollback.StateBlocked}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -153,7 +153,8 @@ func TestUnblockProjectAction(t *testing.T) {
 			Event hooks.Event `json:"event"`
 		}
 
-		if err := json.Unmarshal(raw, &e); err != nil || e.Event.Outcome != hooks.OutcomeUnblocked || e.Event.Object != "default/allowed" {
+		if err := json.Unmarshal(raw, &e); err != nil || e.Event.Outcome != hooks.OutcomeUnblocked || e.Event.Object != "default/allowed" ||
+			e.Event.Commit != "c2" || e.Event.Repository != "org/repo" {
 			t.Fatalf("event %s, err %v", raw, err)
 		}
 	})

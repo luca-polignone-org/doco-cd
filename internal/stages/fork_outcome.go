@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,7 +17,6 @@ import (
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/hooks"
-	"github.com/kimdre/doco-cd/internal/rbac"
 	"github.com/kimdre/doco-cd/internal/rollback"
 )
 
@@ -30,15 +30,16 @@ func SetOutbox(o *hooks.Outbox) { outcomeOutbox.Store(o) }
 // outcomeErrorRunes is the length the error of an event is truncated to (spec, "hooks.outcome").
 const outcomeErrorRunes = 2000
 
-// triggerAPI is the trigger of a run that carries a principal: poll/run and trigger_poll.
+// triggerAPI is the trigger of a run requested through poll/run or trigger_poll (hooks.WithAPITrigger).
 const triggerAPI = "api"
 
 // EmitOutcome enqueues ev in the registered outbox, with the version of this process and the error
-// truncated. It is fire-and-forget: an enqueue error is logged and never reaches the deploy.
-func EmitOutcome(log *slog.Logger, ev hooks.Event) {
+// truncated. It is fire-and-forget: an enqueue error is logged and never reaches the deploy. It
+// reports whether the event is in the outbox.
+func EmitOutcome(log *slog.Logger, ev hooks.Event) bool {
 	o := outcomeOutbox.Load()
 	if o == nil {
-		return
+		return false
 	}
 
 	ev.Error = truncateRunes(ev.Error, outcomeErrorRunes)
@@ -47,15 +48,22 @@ func EmitOutcome(log *slog.Logger, ev hooks.Event) {
 	if err := o.Enqueue(ev); err != nil {
 		log.Error("failed to enqueue outcome event", slog.String("object", ev.Object),
 			slog.String("outcome", string(ev.Outcome)), slog.Any("error", err))
+
+		return false
 	}
+
+	return true
 }
 
-// EmitUnblocked emits unblocked for object, released by the unblock action.
-func EmitUnblocked(log *slog.Logger, object string) {
-	ev := hooks.NewEvent(object)
+// emitUnblocked emits unblocked for the failure the unblock action just rewrote, with its
+// repository and commit.
+func emitUnblocked(f rollback.Failure) {
+	ev := hooks.NewEvent(f.Object)
 	ev.Outcome = hooks.OutcomeUnblocked
+	ev.Repository = f.Repository
+	ev.Commit = strings.TrimSpace(f.CommitSHA)
 
-	EmitOutcome(log, ev)
+	EmitOutcome(slog.Default(), ev)
 }
 
 type outcomeOpt func(*hooks.Event)
@@ -90,10 +98,11 @@ func withRollback(out rollback.Outcome) outcomeOpt {
 }
 
 // emitOutcome emits an event of the target with the fields every event of a run carries; opts add
-// the ones of the outcome. The error goes through redactSecrets.
-func (s *StageManager) emitOutcome(ctx context.Context, kind hooks.Outcome, opts ...outcomeOpt) {
+// the ones of the outcome. The error goes through redactSecrets. It reports whether the event is in
+// the outbox.
+func (s *StageManager) emitOutcome(ctx context.Context, kind hooks.Outcome, opts ...outcomeOpt) bool {
 	if outcomeOutbox.Load() == nil {
-		return
+		return false
 	}
 
 	ev := hooks.NewEvent(s.DeployConfig.Object())
@@ -103,7 +112,7 @@ func (s *StageManager) emitOutcome(ctx context.Context, kind hooks.Outcome, opts
 	ev.Commit = cmp.Or(s.forkDeployedCommit, strings.TrimSpace(s.Repository.Revision))
 	ev.Trigger = string(s.JobTrigger)
 
-	if _, ok := rbac.PrincipalFrom(ctx); ok {
+	if hooks.APITriggered(ctx) {
 		ev.Trigger = triggerAPI
 	}
 
@@ -117,7 +126,7 @@ func (s *StageManager) emitOutcome(ctx context.Context, kind hooks.Outcome, opts
 
 	ev.Error = s.redactSecrets(ev.Error)
 
-	EmitOutcome(s.Log, ev)
+	return EmitOutcome(s.Log, ev)
 }
 
 // emitSuccessOutcome emits destroyed or deployed at the end of a successful run. The images are
@@ -145,7 +154,8 @@ func (s *StageManager) emitSuccessOutcome(ctx context.Context, images []rollback
 
 // emittedPolicyDenials holds the (object, commit, violations) already reported as policy_denied in
 // this process, so the next poll of the same commit does not emit it again. It is in memory only:
-// one more event after a restart is accepted.
+// one more event after a restart is accepted. A key whose event could not be enqueued is removed,
+// so the next poll tries again.
 var emittedPolicyDenials sync.Map
 
 // emitFailureOutcome emits the outcome of a failure the rollback flow did not handle: policy_denied
@@ -174,8 +184,10 @@ func (s *StageManager) emitFailureOutcome(ctx context.Context, stageName StageNa
 		return
 	}
 
-	s.emitOutcome(ctx, hooks.OutcomePolicyDenied, withFailure(stageName, err.Error()),
-		func(e *hooks.Event) { e.Violations = violations })
+	if !s.emitOutcome(ctx, hooks.OutcomePolicyDenied, withFailure(stageName, err.Error()),
+		func(e *hooks.Event) { e.Violations = violations }) {
+		emittedPolicyDenials.Delete(key)
+	}
 }
 
 // emitRollbackOutcome emits the outcome of a rollback flow. A flow cut by shutdown left the
@@ -200,34 +212,47 @@ func (s *StageManager) emitRollbackOutcome(ctx context.Context, f rollback.Failu
 // redactedSecret replaces a secret value in an error, as the notifications do.
 const redactedSecret = "[REDACTED]"
 
-// minRedactedEnvRunes is the shortest value of Internal.Environment, other than a resolved external
-// secret, that redactSecrets replaces: shorter values (ports, flags, booleans) are not credentials,
-// and replacing them would make the error unreadable.
-const minRedactedEnvRunes = 8
+// The values redactSecrets replaces are chosen by length, a heuristic: replacing a value also
+// replaces every unrelated occurrence of the same text, so a very short value would make the error
+// unreadable. A resolved external secret is replaced from minRedactedSecretRunes (shorter is not a
+// credential worth hiding, "1" or "on"); any other value of Internal.Environment (dotenv files,
+// possibly SOPS-decrypted) from minRedactedEnvRunes, so ports, flags and booleans stay.
+const (
+	minRedactedSecretRunes = 4
+	minRedactedEnvRunes    = 8
+)
 
-// redactSecrets replaces in v the values of the resolved external secrets and the other values of
-// Internal.Environment (dotenv files, possibly SOPS-decrypted) of at least minRedactedEnvRunes.
-// Upstream redacts neither in the error of a failed deploy; the fork does it before the error
-// reaches the outcome event, the failure store and pre_rollback. Longer values go first, so a value
-// that contains another is replaced whole.
+// redactSecrets replaces in v the values of Internal.Environment chosen above, in their raw form
+// and in the escaped forms error formatting produces: %q (strconv.Quote) and JSON, without the
+// surrounding quotes. Upstream redacts neither in the error of a failed deploy; the fork does it
+// before the error reaches the outcome event, the failure store and pre_rollback. Longer forms go
+// first, so a value that contains another is replaced whole.
 func (s *StageManager) redactSecrets(v string) string {
 	if v == "" {
 		return v
 	}
 
-	var values []string
+	var forms []string
 
 	for k, val := range s.DeployConfig.Internal.Environment {
-		_, secret := s.DeployConfig.ExternalSecrets[k]
-		if val != "" && (secret || len([]rune(val)) >= minRedactedEnvRunes) {
-			values = append(values, val)
+		minRunes := minRedactedEnvRunes
+		if _, secret := s.DeployConfig.ExternalSecrets[k]; secret {
+			minRunes = minRedactedSecretRunes
 		}
+
+		if len([]rune(val)) < minRunes {
+			continue
+		}
+
+		quoted := strconv.Quote(val)
+		encoded, _ := json.Marshal(val) //nolint:errchkjson // a string always encodes
+		forms = append(forms, val, quoted[1:len(quoted)-1], string(encoded[1:len(encoded)-1]))
 	}
 
-	slices.SortFunc(values, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+	slices.SortFunc(forms, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
 
-	for _, val := range values {
-		v = strings.ReplaceAll(v, val, redactedSecret)
+	for _, form := range forms {
+		v = strings.ReplaceAll(v, form, redactedSecret)
 	}
 
 	return v

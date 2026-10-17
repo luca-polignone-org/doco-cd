@@ -6,11 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,7 +25,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/hooks"
-	"github.com/kimdre/doco-cd/internal/rbac"
 	"github.com/kimdre/doco-cd/internal/rollback"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 	"github.com/kimdre/doco-cd/internal/selfupdate"
@@ -118,7 +121,11 @@ func TestOutcomeWithoutOutbox(t *testing.T) {
 	sm.emitSuccessOutcome(t.Context(), nil)
 	sm.emitOutcome(t.Context(), hooks.OutcomeDeployed)
 	sm.emitFailureOutcome(t.Context(), StagePreDeploy, &PolicyDeniedError{Object: "default/web"})
-	EmitUnblocked(sm.Log, "default/web")
+
+	if EmitOutcome(sm.Log, hooks.NewEvent("default/web")) {
+		t.Fatal("EmitOutcome() without an outbox reported an enqueued event")
+	}
+
 	_ = sm.handleStageFailure(t.Context(), StageDeploy, sm.Log, errors.New("boom"))
 
 	assertNoForkDir(t, data)
@@ -196,14 +203,14 @@ func TestOutcomeDeployed(t *testing.T) {
 		}
 	})
 
-	t.Run("a run with a principal is api, the revision is the commit before the deploy stage", func(t *testing.T) {
+	t.Run("a poll/run or trigger_poll run is api, the revision is the commit before the deploy stage", func(t *testing.T) {
 		dir := startTestOutbox(t)
 		sm := newManager(t, &lastGoodClient{})
 		sm.forkDeployedCommit = ""
 		sm.Stages.Init.StartedAt = time.Time{}
 		sm.JobTrigger = JobTriggerPoll
 
-		sm.emitSuccessOutcome(rbac.WithPrincipal(t.Context(), rbac.Principal{Subject: "ci"}), []rollback.ServiceImage{})
+		sm.emitSuccessOutcome(hooks.WithAPITrigger(t.Context()), []rollback.ServiceImage{})
 
 		if ev := requireOneOutcome(t, dir, hooks.OutcomeDeployed); ev.Trigger != "api" || ev.Commit != "sha256:abc" || ev.DurationMS != 0 {
 			t.Fatalf("event %+v", ev)
@@ -473,20 +480,33 @@ func TestOutcomeUnblockedByNewCommit(t *testing.T) {
 	})
 }
 
-func TestEmitUnblocked(t *testing.T) {
+// The unblock action emits unblocked with the repository and commit of the record it rewrote.
+func TestUnblockTargetEmitsUnblocked(t *testing.T) {
 	dir := startTestOutbox(t)
+	data := t.TempDir()
 
-	EmitUnblocked(slog.New(slog.DiscardHandler), "noi/poli-gate")
+	if err := rollback.StoreFor(data).PutFailure(rollback.Failure{
+		Object: "noi/poli-gate", Repository: "org/repo", CommitSHA: " c2 ", Stage: "deploy", State: rollback.StateBlocked, Decision: "block",
+	}); err != nil {
+		t.Fatal(err)
+	}
 
-	if ev := requireOneOutcome(t, dir, hooks.OutcomeUnblocked); ev.Object != "noi/poli-gate" || ev.Context != "noi" || ev.Project != "poli-gate" || ev.Commit != "" {
+	for range 2 { // the second call finds nothing blocked and emits nothing
+		if _, err := UnblockTarget(t.Context(), data, "noi/poli-gate"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ev := requireOneOutcome(t, dir, hooks.OutcomeUnblocked)
+	if ev.Object != "noi/poli-gate" || ev.Context != "noi" || ev.Project != "poli-gate" || ev.Repository != "org/repo" || ev.Commit != "c2" {
 		t.Fatalf("event %+v", ev)
 	}
 }
 
-// An enqueue error is logged and never reaches the caller. The outbox directory is replaced by a
-// regular file, so writing the event under it fails with ENOTDIR whatever the uid.
-func TestEmitOutcomeEnqueueError(t *testing.T) {
-	dir := startTestOutbox(t)
+// breakOutbox replaces the outbox directory with a regular file, so writing an event under it fails
+// with ENOTDIR whatever the uid; the returned function restores it.
+func breakOutbox(t *testing.T, dir string) func() {
+	t.Helper()
 
 	if err := os.RemoveAll(dir); err != nil {
 		t.Fatal(err)
@@ -496,29 +516,70 @@ func TestEmitOutcomeEnqueueError(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	return func() {
+		if err := os.Remove(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// An enqueue error is logged, reported as false and never reaches the deploy.
+func TestEmitOutcomeEnqueueError(t *testing.T) {
+	dir := startTestOutbox(t)
+	breakOutbox(t, dir)
+
 	var buf bytes.Buffer
 
-	EmitUnblocked(slog.New(slog.NewTextHandler(&buf, nil)), "default/web")
+	ev := hooks.NewEvent("default/web")
+	ev.Outcome = hooks.OutcomeUnblocked
+
+	if EmitOutcome(slog.New(slog.NewTextHandler(&buf, nil)), ev) {
+		t.Fatal("EmitOutcome() reported an event the outbox could not write")
+	}
 
 	if !strings.Contains(buf.String(), "failed to enqueue outcome event") || !strings.Contains(buf.String(), "outcome=unblocked") {
 		t.Fatalf("log %q", buf.String())
 	}
 }
 
+// A policy_denied that could not be enqueued is not marked as emitted: the next poll emits it.
+func TestOutcomePolicyDeniedRetriedAfterEnqueueError(t *testing.T) {
+	dir := startTestOutbox(t)
+	sm, _ := newForkFailureManager(t, nil)
+	denied := &PolicyDeniedError{Object: "default/web", Violations: []composepolicy.Violation{{Service: "app", Field: "privileged", Value: "true"}}}
+
+	restore := breakOutbox(t, dir)
+
+	_ = sm.handleStageFailure(t.Context(), StagePreDeploy, sm.Log, denied)
+
+	restore()
+
+	_ = sm.handleStageFailure(t.Context(), StagePreDeploy, sm.Log, denied)
+
+	requireOneOutcome(t, dir, hooks.OutcomePolicyDenied)
+}
+
 // Resolved secrets and long environment values never reach the event or the failure store (whose
-// error pre_rollback sends); short values that are not secrets are kept.
+// error pre_rollback sends), raw or escaped; short values are kept.
 func TestOutcomeRedactsSecrets(t *testing.T) {
-	const errText = "render: token=s3cr3t-e2e pin=42 dotenv=dotenv-password-value port=8080 prefix=s3cr3t-e2e-long"
+	const tricky = "pa\"ss\\wo\nrd"
+
+	errText := "render: token=s3cr3t-e2e pin=42 dotenv=dotenv-password-value port=8080 prefix=s3cr3t-e2e-long" +
+		" quoted=" + strconv.Quote(tricky) + " json=" + string(mustJSON(t, tricky)) + " raw=" + tricky
 
 	setup := func(sm *StageManager) {
-		sm.DeployConfig.ExternalSecrets = map[string]secrettypes.ExternalSecretRef{"TOKEN": {LegacyRef: "ref"}, "PIN": {LegacyRef: "ref"}}
+		sm.DeployConfig.ExternalSecrets = map[string]secrettypes.ExternalSecretRef{
+			"TOKEN": {LegacyRef: "ref"}, "PIN": {LegacyRef: "ref"}, "TRICKY": {LegacyRef: "ref"},
+		}
 		sm.DeployConfig.Internal.Environment = map[string]string{
 			"TOKEN": "s3cr3t-e2e", "PIN": "42", "DOTENV": "dotenv-password-value", "PORT": "8080",
-			"LONGER": "s3cr3t-e2e-long", "EMPTY": "",
+			"LONGER": "s3cr3t-e2e-long", "EMPTY": "", "TRICKY": tricky,
 		}
 	}
 
-	const want = "render: token=[REDACTED] pin=[REDACTED] dotenv=[REDACTED] port=8080 prefix=[REDACTED]"
+	// PIN is a secret under the 4-rune floor, PORT an env value under the 8-rune one: both stay.
+	const want = "render: token=[REDACTED] pin=42 dotenv=[REDACTED] port=8080 prefix=[REDACTED]" +
+		` quoted="[REDACTED]" json="[REDACTED]" raw=[REDACTED]`
 
 	t.Run("failed event", func(t *testing.T) {
 		dir := startTestOutbox(t)
@@ -547,7 +608,7 @@ func TestOutcomeRedactsSecrets(t *testing.T) {
 			t.Fatalf("error %q", ev.Error)
 		}
 
-		assertNoSecretUnder(t, data, "s3cr3t-e2e", "dotenv-password-value")
+		assertNoSecretUnder(t, data, "s3cr3t-e2e", "dotenv-password-value", "ss\\\\wo")
 	})
 
 	t.Run("empty error", func(t *testing.T) {
@@ -558,4 +619,70 @@ func TestOutcomeRedactsSecrets(t *testing.T) {
 			t.Fatalf("redactSecrets(\"\") = %q", got)
 		}
 	})
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+
+	data, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return data
+}
+
+// A secret that straddles rune 2000 of the stage error is redacted before the cut: no prefix of it
+// reaches pre_rollback, the failure store or the outcome event. Upstream truncates the in-memory
+// failure to 2000 runes first, which is why the record is built from the stage error.
+func TestOutcomeRedactsSecretAcrossTruncation(t *testing.T) {
+	const secret = "s3cr3t-e2e" // runes 1995-2004 of the error
+
+	r := newRollbackRepo(t)
+	dir := startTestOutbox(t)
+	sm := newRollbackManager(t, r, &lastGoodClient{})
+	sm.DeployConfig.ExternalSecrets = map[string]secrettypes.ExternalSecretRef{"TOKEN": {LegacyRef: "ref"}}
+	sm.DeployConfig.Internal.Environment = map[string]string{"TOKEN": secret}
+
+	if err := rollback.StoreFor(sm.AppConfig.DataMountPath).PutLastGood(rollbackLastGood(r, "good", rollbackConfig)); err != nil {
+		t.Fatal(err)
+	}
+
+	var preRollback []hooks.PreRollbackRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		var body hooks.PreRollbackRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			t.Errorf("decode pre_rollback: %v", err)
+		}
+
+		preRollback = append(preRollback, body)
+		_, _ = io.WriteString(w, `{"decision":"block"}`)
+	}))
+	t.Cleanup(server.Close)
+
+	SetPreRollback(&hooks.PreRollbackClient{URL: server.URL, Signer: hooks.Signer{Secret: []byte("s")}})
+	t.Cleanup(func() { SetPreRollback(nil) })
+
+	errText := strings.Repeat("x", 1995) + secret + " tail"
+	_ = sm.handleStageFailure(t.Context(), StageDeploy, sm.Log, errors.New(errText))
+
+	wantErr := strings.Repeat("x", 1995) + "[REDA"
+
+	if len(preRollback) != 1 || preRollback[0].Error != wantErr {
+		t.Fatalf("pre_rollback requests %+v, want one with the redacted error", preRollback)
+	}
+
+	if f := diskFailure(t, sm); f.Error != wantErr || f.State != rollback.StateBlocked {
+		t.Fatalf("failure %+v", f)
+	}
+
+	if ev := requireOneOutcome(t, dir, hooks.OutcomeRollbackBlocked); ev.Error != wantErr {
+		t.Fatalf("event error %q", ev.Error)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(sm.AppConfig.DataMountPath, "fork", "failures", "default", "web.json"))
+	if err != nil || bytes.Contains(raw, []byte("s3c")) {
+		t.Fatalf("failure file %s, err %v", raw, err)
+	}
 }

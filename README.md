@@ -1,5 +1,18 @@
 # doco-cd - Docker Compose Continuous Deployment
 
+> [!NOTE]
+> **This is a fork.** `luca-polignone-org/doco-cd` is a fork of [kimdre/doco-cd](https://github.com/kimdre/doco-cd), based on `v0.127.0`, maintained for Portico v2.
+> It adds JWT (JWKS) authentication with Argo CD-style RBAC for REST and MCP, a compose policy bound to the target repository, an on-disk failure store with local rollback to the last good deployment, a `pre_rollback` veto hook and signed outcome events delivered through an outbox. See [NOTICE](NOTICE) for the list of modifications.
+>
+> Every fork feature is off unless its configuration keys are set (`JWT_JWKS_URL`, `RBAC_POLICY_FILE`, `COMPOSE_POLICY_FILE`, `HOOK_PRE_ROLLBACK_URL`, `HOOK_OUTCOME_URL`, and `rollback` in the deploy configuration); without them it behaves as upstream.
+>
+> Formats (RBAC CSV, compose policy YAML, hook signature verification, outcome payload), flows and known limits are described in [docs/ARCHITETTURA.md](docs/ARCHITETTURA.md).
+>
+> Fork releases are tagged `vX.Y.Z-poli.N` and their images are published to `ghcr.io/luca-polignone-org/doco-cd` (linux/amd64, linux/arm64, linux/arm/v7), pinned by the digest written in each release's notes. The documentation below is upstream's.
+
+> [!WARNING]
+> With `PASS_ENV=true` the Doco-CD environment reaches compose interpolation, so a `HOOK_SECRET` set in the environment can be read by an app through `${HOOK_SECRET}`. Use `HOOK_SECRET_FILE` instead.
+
 ## GitOps for Docker Compose
 
 <img src="https://raw.githubusercontent.com/kimdre/doco-cd/main/wiki/docs/images/doco-cd_logo.svg" alt="Doco-CD Logo" height="48px" />

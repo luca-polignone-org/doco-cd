@@ -1,0 +1,10 @@
+Doco-CD fork for Portico v2 (luca-polignone-org/doco-cd)
+Based on Doco-CD by kimdre, https://github.com/kimdre/doco-cd, Apache License 2.0.
+
+Modifications (from v0.127.0):
+- internal/auth/jwt, internal/rbac: JWT (JWKS) authentication and Argo CD-style RBAC for REST and MCP
+- internal/composepolicy: compose policy and target/repository binding
+- internal/rollback: on-disk failure store, last good deployment, local rollback
+- internal/hooks: pre_rollback veto and outcome events (signed, outbox)
+- cmd/doco-cd/version.go: version check against the fork base version
+All modifications are disabled unless their configuration keys are set.

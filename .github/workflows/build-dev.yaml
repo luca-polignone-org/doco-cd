@@ -17,6 +17,8 @@ concurrency:
 
 jobs:
   build:
+    # Fork: dev images are published by upstream only.
+    if: github.repository == 'kimdre/doco-cd'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:

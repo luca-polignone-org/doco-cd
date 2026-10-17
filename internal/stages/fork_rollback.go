@@ -62,24 +62,44 @@ func (s *StageManager) persistForkFailure(f docker.DeploymentFailure, state roll
 }
 
 // loadForkFailure reads the failure from disk. An unreadable file counts as a
-// blocked failure: never a blind deploy on top of a state that cannot be read.
-// Its commit is the current revision, so rollbackPoisoned keeps the target blocked
-// on every later commit too: only the unblock action (UnblockTarget) releases it.
+// blocked failure of the current revision: never a blind deploy on top of a state
+// that cannot be read.
+//
+// A corrupt record (it does not decode, or has an unknown version) is replaced on disk by that
+// blocked record, so the revision seen when the corruption was found stays blocked and a new
+// commit releases it, as for any other blocked record (rollbackPoisoned). Its stage is deploy,
+// so the retry of the new commit force recreates the project. Any other read error (e.g.
+// permissions) leaves the file alone: the record stays blocked in memory on every revision,
+// until the file can be read again or the unblock action (UnblockTarget) replaces it.
 func (s *StageManager) loadForkFailure() (rollback.Failure, bool) {
 	store := s.forkStore()
 	if store == nil {
 		return rollback.Failure{}, false
 	}
 
-	f, ok, err := store.GetFailure(s.DeployConfig.Object())
-	if err != nil {
-		s.Log.Error("failed to read deployment failure, treating target as blocked",
-			slog.String("object", s.DeployConfig.Object()), slog.Any("error", err))
+	object := s.DeployConfig.Object()
 
-		return rollback.Failure{Object: s.DeployConfig.Object(), State: rollback.StateBlocked, CommitSHA: s.Repository.Revision}, true
+	f, ok, err := store.GetFailure(object)
+	if err == nil {
+		return f, ok
 	}
 
-	return f, ok
+	s.Log.Error("failed to read deployment failure, treating target as blocked",
+		slog.String("object", object), slog.Any("error", err))
+
+	f = rollback.Failure{
+		Object: object, Repository: s.Repository.Name, Stack: s.DeployConfig.Name,
+		CommitSHA: strings.TrimSpace(s.Repository.Revision), Stage: string(StageDeploy),
+		FailedAt: time.Now().UTC(), State: rollback.StateBlocked,
+	}
+
+	if errors.Is(err, rollback.ErrCorrupt) {
+		if err = store.PutFailure(f); err != nil {
+			s.Log.Error("failed to replace corrupt deployment failure", slog.String("object", object), slog.Any("error", err))
+		}
+	}
+
+	return f, true
 }
 
 func (s *StageManager) deleteForkFailure() {
@@ -408,7 +428,81 @@ func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, st
 	stageLog.Warn("deployment of this commit was rolled back or blocked, skipping",
 		slog.String("commit", revision), slog.String("state", string(f.State)))
 
+	s.verifyPoisonedTarget(ctx, f.State, stageLog)
+
 	return true
+}
+
+// verifyPoisonedTarget gives the job gate (forkJobGate) a verdict for a poisoned target that has
+// none in this process. pre-deploy skips the poisoned commit before loadComposeProjectHash, so
+// after a restart checkForkPolicies never runs for it, and every job of the target (scheduled and
+// one-off jobs, cert rotation, managed recreate, self-apply) would be refused while it runs the
+// project the poison protects. The project actually running is checked against the policy in
+// force, and the verdict is recorded as checkForkPolicies does:
+//
+//   - blocked: the failed commit stays deployed, and it is the current revision, so
+//     loadComposeProjectHash checks it (and records the verdict itself);
+//   - rolled_back: the last good runs, so it is rendered and checked as the rollback did;
+//   - rollback_failed: what runs is not known (the failed commit, or a rollback halfway), so no
+//     verdict is recorded and the jobs stay refused until a new commit or the unblock action.
+//
+// A failure that is not a policy denial (a render error, an unreachable secret provider)
+// records nothing either: the next run tries again. Without a compose policy, or once the
+// object has a verdict, it does nothing.
+func (s *StageManager) verifyPoisonedTarget(ctx context.Context, state rollback.State, stageLog *slog.Logger) {
+	if composePolicy.Load() == nil {
+		return
+	}
+
+	object := s.DeployConfig.Object()
+	if _, known := verifiedObjects.Load(object); known {
+		return
+	}
+
+	var err error
+
+	switch state {
+	case rollback.StateBlocked:
+		_, err = s.loadComposeProjectHash(ctx)
+	case rollback.StateRolledBack:
+		err = s.verifyLastGood(ctx, object)
+	default:
+		return
+	}
+
+	if err != nil && !errors.Is(err, ErrPolicyDenied) {
+		stageLog.Warn("failed to check the running project of a poisoned target against the compose policy, its jobs stay refused",
+			slog.String("state", string(state)), slog.String("error", s.redactSecrets(err.Error())))
+	}
+}
+
+// verifyLastGood renders the last good of object as the rollback does (lastGoodRequest, without
+// deploying it) and records whether it passes the compose policy in force.
+func (s *StageManager) verifyLastGood(ctx context.Context, object string) error {
+	lg, ok, err := s.forkStore().GetLastGood(object)
+	if err != nil {
+		return err
+	}
+
+	if !ok {
+		return fmt.Errorf("no last good recorded for %s", object)
+	}
+
+	e := stageExecutor{s: s, log: s.Log.With(slog.String("object", object))}
+	if err = e.Supports(lg); err != nil {
+		return err
+	}
+
+	_, err = e.lastGoodRequest(ctx, lg)
+
+	switch {
+	case err == nil:
+		verifiedObjects.Store(object, true)
+	case errors.Is(err, ErrPolicyDenied):
+		verifiedObjects.Store(object, false)
+	}
+
+	return err
 }
 
 // UnblockTarget puts the failure of object back to failed with the same commit, without deleting
@@ -793,7 +887,8 @@ func (s *StageManager) renderLastGood(ctx context.Context, cfg *deploy.Config, i
 //
 // It does not touch verifiedObjects (the job gate): that records the outcome of the pre-deploy
 // check of the commit the target was asked to deploy. A denied rollback deploys nothing, and the
-// next pre-deploy of the target checks it again and updates the gate.
+// next pre-deploy of the target checks it again and updates the gate. Only verifyLastGood, which
+// checks a last good that already runs, records its verdict.
 func (s *StageManager) checkLastGoodPolicy(cfg *deploy.Config, project *types.Project, declared declaredFiles, internalPath, externalPath string) error {
 	f := composePolicy.Load().Current()
 	if f == nil {

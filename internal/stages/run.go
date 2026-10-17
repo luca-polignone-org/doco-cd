@@ -260,6 +260,11 @@ func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageNa
 		s.emitFailureOutcome(ctx, stageName, err)
 	}
 
+	// Fork: a targets/sync denial is about the caller: no notification, no failed commit status.
+	if isTargetSyncDenial(err) {
+		return callerDenied(stageLog, err)
+	}
+
 	notifiedErr := s.NotifyFailure(err)
 
 	if shouldPostFailureCommitStatus(s.DeployConfig.Destroy.Enabled) {

@@ -3,7 +3,9 @@ name: Build Image
 on:
   push:
     tags:
-      - 'v*'
+      # Fork: only fork releases (vX.Y.Z-poli.N) build an image; upstream tags fetched by the
+      # upstream merge never do.
+      - 'v*-poli.*'
 
 jobs:
   build:
@@ -40,6 +42,44 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+  # Fork: provenance is always attested by docker/github-builder and sbom is set above. This job
+  # creates the release if missing and adds the multi-platform digest and the number of upstream
+  # files the fork touches (spec, "Risks") to its notes.
+  release-notes:
+    name: Digest in the release notes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create and edit the release
+    needs:
+      - build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+
+      - name: Digest in the release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # Multi-platform index digest pushed by the reusable workflow (its outputs.digest).
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: |
+          # Upstream tags reach this repository only through the merge commit, not as tags.
+          git fetch --no-tags https://github.com/kimdre/doco-cd.git 'refs/tags/v*:refs/tags/v*'
+          upstream_tag=$(git describe --tags --match 'v*' --exclude '*-poli.*' --abbrev=0)
+          base=$(git merge-base HEAD "$upstream_tag")
+          # Upstream files the fork modified or deleted; files the fork added are not counted.
+          touched=$(git diff --no-renames --diff-filter=MD --name-only "$base" HEAD | wc -l)
+          if [ -z "$DIGEST" ]; then echo "no image digest from the build job"; exit 1; fi
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --prerelease --generate-notes --verify-tag
+          # A re-run must not append the lines a second time.
+          if gh release view "$GITHUB_REF_NAME" --json body -q .body | grep -q '^Image: `ghcr.io/'; then echo "release notes already have the image digest"; exit 0; fi
+          gh release edit "$GITHUB_REF_NAME" --notes "$(gh release view "$GITHUB_REF_NAME" --json body -q .body)
+
+          Image: \`ghcr.io/${GITHUB_REPOSITORY}@${DIGEST}\` (linux/amd64, linux/arm64, linux/arm/v7)
+          Upstream files touched by the fork (since ${upstream_tag}): ${touched}"
+
   generate-sbom:
     name: Generate SBOM
     runs-on: ubuntu-latest
@@ -47,6 +87,7 @@ jobs:
        contents: write # write to upload the SBOM file
     needs:
       - build
+      - release-notes # the release must exist before the SBOM is uploaded to it
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

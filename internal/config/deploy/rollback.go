@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"go.yaml.in/yaml/v4"
@@ -16,17 +17,39 @@ const (
 	DefaultRollbackTimeout = 5 * time.Minute
 	// DefaultPreRollbackTimeout is the pre_rollback wait when the key is missing or zero.
 	DefaultPreRollbackTimeout = 30 * time.Second
+	// MaxRollbackTimeout caps timeout: the rollback holds the target lock and a mutation slot.
+	MaxRollbackTimeout = 30 * time.Minute
+	// MaxPreRollbackTimeout caps pre_rollback_timeout, for the same reason.
+	MaxPreRollbackTimeout = 5 * time.Minute
 )
 
 // RollbackConfig enables local rollback to the last good deploy (Portico fork).
 // It is written as a bool or as an object, like destroy.
 type RollbackConfig struct {
 	Enabled            bool              `yaml:"enabled" json:"enabled" default:"false"`           // Enabled turns on rollback and the on-disk failure store for this target
-	Timeout            duration.Duration `yaml:"timeout" json:"timeout"`                           // Timeout of the rollback: Create/Start plus wait healthy (default 5m)
-	PreRollbackTimeout duration.Duration `yaml:"pre_rollback_timeout" json:"pre_rollback_timeout"` // PreRollbackTimeout is the maximum wait for the pre_rollback response (default 30s)
+	Timeout            duration.Duration `yaml:"timeout" json:"timeout"`                           // Timeout of the rollback: Create/Start plus wait healthy (default 5m, at most 30m)
+	PreRollbackTimeout duration.Duration `yaml:"pre_rollback_timeout" json:"pre_rollback_timeout"` // PreRollbackTimeout is the maximum wait for the pre_rollback response (default 30s, at most 5m)
 }
 
-var errInvalidRollback = errors.New("invalid rollback value: expected bool or object")
+var (
+	errInvalidRollback        = errors.New("invalid rollback value: expected bool or object")
+	errInvalidRollbackTimeout = errors.New("invalid rollback timeout")
+)
+
+// checkRollbackTimeouts bounds the timeouts read from the repository: they come from the app's
+// deploy config, and the rollback waits for them while it holds the fork target lock and a global
+// mutation slot.
+func checkRollbackTimeouts(timeout, preRollback duration.Duration) error {
+	if timeout < 0 || timeout.Duration() > MaxRollbackTimeout {
+		return fmt.Errorf("%w: timeout must be between 0 and %s", errInvalidRollbackTimeout, MaxRollbackTimeout)
+	}
+
+	if preRollback < 0 || preRollback.Duration() > MaxPreRollbackTimeout {
+		return fmt.Errorf("%w: pre_rollback_timeout must be between 0 and %s", errInvalidRollbackTimeout, MaxPreRollbackTimeout)
+	}
+
+	return nil
+}
 
 func (c *RollbackConfig) UnmarshalYAML(node *yaml.Node) error {
 	type plain RollbackConfig
@@ -49,6 +72,10 @@ func (c *RollbackConfig) UnmarshalYAML(node *yaml.Node) error {
 		return errInvalidRollback
 	}
 
+	if err := checkRollbackTimeouts(decoded.Timeout, decoded.PreRollbackTimeout); err != nil {
+		return err
+	}
+
 	*c = RollbackConfig(decoded)
 
 	return nil
@@ -67,6 +94,10 @@ func (c *RollbackConfig) UnmarshalJSON(data []byte) error {
 		decoded.Enabled = bytes.Equal(trimmed, []byte("true"))
 	} else if err := json.Unmarshal(data, &decoded); err != nil {
 		return errInvalidRollback
+	}
+
+	if err := checkRollbackTimeouts(decoded.Timeout, decoded.PreRollbackTimeout); err != nil {
+		return err
 	}
 
 	*c = RollbackConfig(decoded)

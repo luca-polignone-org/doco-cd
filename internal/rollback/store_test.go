@@ -33,7 +33,7 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 
 	got, ok, err := s.GetFailure("noi/poli gate")
-	if err != nil || !ok || got.State != StateRolledBack || got.Version != 1 || got.CommitSHA != "abc" {
+	if err != nil || !ok || got.State != StateRolledBack || got.Version != 2 || got.CommitSHA != "abc" {
 		t.Fatalf("%+v %v %v", got, ok, err)
 	}
 

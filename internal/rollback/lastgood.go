@@ -23,6 +23,9 @@ type ServiceImage struct {
 	RepoDigests []string `json:"repo_digests,omitempty"`
 }
 
+// lastGoodVersion is the version of the last good record; it did not change with poli.2.
+const lastGoodVersion = 1
+
 // LastGood is the recorded state of the last successful deploy of a target.
 type LastGood struct {
 	Version      int            `json:"version"`
@@ -41,7 +44,7 @@ func (s *Store) PutLastGood(lg LastGood) error {
 		return err
 	}
 
-	lg.Version = storeVersion
+	lg.Version = lastGoodVersion
 
 	data, err := json.Marshal(lg)
 	if err != nil {
@@ -74,7 +77,7 @@ func (s *Store) GetLastGood(object string) (LastGood, bool, error) {
 		return LastGood{}, false, fmt.Errorf("decode last good %s: %w", object, err)
 	}
 
-	if lg.Version != storeVersion {
+	if lg.Version != lastGoodVersion {
 		return LastGood{}, false, fmt.Errorf("last good %s: unsupported version %d", object, lg.Version)
 	}
 

@@ -29,7 +29,12 @@ const (
 	StateRollbackFailed State = "rollback_failed"
 )
 
-const storeVersion = 1
+// storeVersion 2 adds content_key (rollback.unblock_on: content). Version 1 records are still read:
+// they carry no content key, so they release on a new commit as before. A downgrade to poli.1 reads
+// version 2 as corrupt, which blocks the target on its current revision (release notes).
+const storeVersion = 2
+
+const storeVersionNoContentKey = 1
 
 type Failure struct {
 	Version    int       `json:"version"`
@@ -42,6 +47,7 @@ type Failure struct {
 	FailedAt   time.Time `json:"failed_at"`
 	State      State     `json:"state"`
 	Decision   string    `json:"decision,omitempty"`
+	ContentKey string    `json:"content_key,omitempty"`
 }
 
 type Store struct {
@@ -144,7 +150,7 @@ func (s *Store) GetFailure(object string) (Failure, bool, error) {
 		return Failure{}, false, fmt.Errorf("%w: decode failure %s: %w", ErrCorrupt, object, err)
 	}
 
-	if f.Version != storeVersion {
+	if f.Version != storeVersion && f.Version != storeVersionNoContentKey {
 		return Failure{}, false, fmt.Errorf("%w: failure %s: unsupported version %d", ErrCorrupt, object, f.Version)
 	}
 

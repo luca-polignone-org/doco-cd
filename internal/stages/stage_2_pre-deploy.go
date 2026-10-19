@@ -369,7 +369,8 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	// Only a failed deploy stage leaves half-applied containers behind (e.g. a
 	// lifecycle hook that never finished), and a plain re-up of an unchanged
 	// project would touch nothing. Force recreate so the retry re-runs it all.
-	retryForceRecreate := retryAfterFailure && lastFailure.Stage == string(StageDeploy)
+	// Fork: not after a successful rollback, which already replaced those containers.
+	retryForceRecreate := retryAfterFailure && lastFailure.Stage == string(StageDeploy) && s.forkRetryRecreates(ctx, lastFailure)
 
 	// Services whose artifact was removed must be recreated even if nothing changed, see staleArtifactServices.
 	staleArtifacts := staleArtifactServices(deployedState.DeployedStatus,

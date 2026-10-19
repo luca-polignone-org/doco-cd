@@ -1,0 +1,6 @@
+services:
+  app:
+    image: alpine:3.22
+    command: ["sleep", "600"]
+    post_start:
+      - command: ["sh", "-c", "exit ${HOOK_EXIT:-0}"]

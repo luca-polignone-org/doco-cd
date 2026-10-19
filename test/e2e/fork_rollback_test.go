@@ -390,8 +390,8 @@ func forkRollbackBroken(greeting string) map[string]string {
 //
 //  1. the first deploy (c1) records the last good: the JSON in the store and the mirror ref;
 //  2. a broken commit (c2) asks pre_rollback with a signed request; proceed rolls back to the
-//     image ID of c1 (image: sha256:<id>, pull_policy: never), with the include and the service
-//     env_file of c1, and the next poll skips c2;
+//     image of c1 through the reference of c1's compose file, which still names it (pull_policy:
+//     never), with the include and the service env_file of c1, and the next poll skips c2;
 //  3. a broken commit (c2b) with block stays as it is (blocked); after a restart of the daemon
 //     the next polls do not recreate the containers;
 //  4. unblock puts the failure back to failed, and the next poll retries c2b with a full
@@ -475,8 +475,8 @@ func TestForkRollback(t *testing.T) {
 	}
 
 	imageID, configured := h.containerImageID(app)
-	if imageID != c1ImageID || !strings.HasPrefix(configured, "sha256:") {
-		t.Fatalf("app image after rollback = %s (configured %q), want the image ID of c1 %s", imageID, configured, c1ImageID)
+	if imageID != c1ImageID || configured != "alpine:3.22" {
+		t.Fatalf("app image after rollback = %s (configured %q), want the image of c1 %s through alpine:3.22", imageID, configured, c1ImageID)
 	}
 
 	if got := h.ExecOutput(app, "printenv", "GREETING"); got != "from-c1" {

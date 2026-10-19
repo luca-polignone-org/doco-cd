@@ -48,6 +48,11 @@ type Failure struct {
 	State      State     `json:"state"`
 	Decision   string    `json:"decision,omitempty"`
 	ContentKey string    `json:"content_key,omitempty"`
+	// RolledBackTo is the last good commit a successful rollback of this failure deployed. It
+	// stays when a new commit or the unblock action puts the record back to failed: the
+	// containers that run are then the complete ones of the rollback, not the half-applied ones
+	// of the failed deploy, so the retry does not force recreate them (RetryRecreates).
+	RolledBackTo string `json:"rolled_back_to,omitempty"`
 }
 
 type Store struct {
@@ -171,6 +176,14 @@ func (s *Store) DeleteFailure(object string) error {
 	}
 
 	return nil
+}
+
+// RetryRecreates reports whether the retry of the failed deploy it records must force recreate
+// the whole project, as upstream does after a failed deploy stage. It must not after a successful
+// rollback: the rollback already force recreated the project with the last good and waited for it
+// to be healthy, and its labels name the last good commit, so the regular comparison is right.
+func (f Failure) RetryRecreates() bool {
+	return f.RolledBackTo == ""
 }
 
 // Blocks reports whether the failure prevents redeploying the failed commit.

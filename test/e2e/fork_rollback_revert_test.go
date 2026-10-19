@@ -59,7 +59,9 @@ func (r *preRollbackReceiver) forkRevertFailure() (state, commit, rolledBackTo s
 //     rollback brings c1 back, with the image reference of c1's compose file (not the image ID);
 //  3. the daemon restarts, so the failure is read from disk;
 //  4. c3 has the content of c1 (a revert): unblocked, then deployed, and the container is still
-//     the one the rollback created, same ID and StartedAt.
+//     the one the rollback created, same ID and StartedAt;
+//  5. after another restart the polls skip c3: the labels of the rollback carry the compose hash
+//     of c1's content, not of the pinned project.
 func TestForkRollbackRevertKeepsContainers(t *testing.T) {
 	t.Parallel()
 	requireStandaloneSuite(t)
@@ -162,4 +164,22 @@ func TestForkRollbackRevertKeepsContainers(t *testing.T) {
 		state, _, _ := rec.forkRevertFailure()
 		return state == ""
 	})
+
+	// 5. After another restart the deploy status cache is empty and the labels decide: they carry
+	// the commit and the compose hash of c1's content, so the polls skip c3 without deploying.
+	before := len(rec.outcomes(object))
+
+	h.KillAndRestartDaemon()
+	rec.start()
+
+	mark = h.LogMark()
+	h.WaitForLogOccurrencesAfter("no changes detected, skipping deployment", mark, 2, 90*time.Second)
+
+	if n := len(rec.outcomes(object)); n != before {
+		t.Fatalf("%d new outcome events after the restart, want none: %+v", n-before, rec.outcomes(object)[before:])
+	}
+
+	if got := h.ContainerID(forkRevertStack, "app"); got != rolled {
+		t.Fatalf("app container after the restart = %s, want the one of the rollback %s", shortContainerID(got), shortContainerID(rolled))
+	}
 }

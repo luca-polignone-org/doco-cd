@@ -143,3 +143,33 @@ func TestForkRetryRecreates(t *testing.T) {
 		})
 	}
 }
+
+// TCK-644: the compose hash the rollback stamps is the one of the last good's content, not of the
+// pinned project: it does not depend on how the images were pinned.
+func TestRollbackExecutorHashesContentBeforePin(t *testing.T) {
+	r := newRollbackRepo(t)
+
+	hashWith := func(apiClient *lastGoodClient) (string, string) {
+		t.Helper()
+
+		sm := newRollbackManager(t, r, apiClient)
+		got := stubDeployLastGood(t, nil)
+
+		if err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), rollbackLastGood(r, "good", rollbackConfig)); err != nil {
+			t.Fatal(err)
+		}
+
+		return (*got)[0].ProjectHash, (*got)[0].Project.Services["app"].Image
+	}
+
+	byRef, refImage := hashWith(&lastGoodClient{refs: map[string]string{"alpine:3.22": "sha256:app", "busybox:1": "sha256:extra"}})
+	byID, idImage := hashWith(&lastGoodClient{})
+
+	if refImage != "alpine:3.22" || idImage != "sha256:app" {
+		t.Fatalf("app images %q and %q, want one run per pin", refImage, idImage)
+	}
+
+	if byRef == "" || byRef != byID {
+		t.Fatalf("project hashes %q and %q, want the same non-empty hash of the unpinned project", byRef, byID)
+	}
+}

@@ -132,7 +132,8 @@ it still resolves locally to the recorded image ID, so `docker ps`, the outcome 
 compose config hash are those of a regular deploy of that content; else the image ID; else the
 first registry digest; a local image gets `pull_policy: never`, a pinned service loses `build`),
 the compose policy in force applied, and deployed with a full force recreate within
-`rollback.timeout`. A `rolled_back` record names the last good it deployed in `rolled_back_to`
+`rollback.timeout`. The compose hash it stamps is taken before the pin, so the labels describe the
+last good's content as a regular deploy of it would. A `rolled_back` record names the last good it deployed in `rolled_back_to`
 (store version 2, an `omitempty` field), kept when a new commit or unblock puts it back to
 `failed`, dropped by the next recorded failure. The outcome event goes to the outbox: one file per event,
 written atomically, delivered at least once by one worker, FIFO per object, retried with

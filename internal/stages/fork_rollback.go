@@ -744,6 +744,16 @@ func (e stageExecutor) lastGoodRequest(ctx context.Context, lg rollback.LastGood
 		return docker.DeployRequest{}, err
 	}
 
+	// The labels describe the content of the last good, as a regular deploy of it would stamp
+	// them: the hash is taken before the pin, which only sets pull_policy, drops build and, for a
+	// moved tag, replaces the image. A later commit with the same content then compares equal.
+	normMap := pkiRoleNormMap(cfg.ExternalSecrets, cfg.Internal.Environment)
+
+	projectHash, err := docker.ProjectHash(docker.WithNormalizedEnvValues(project, normMap), externalPath)
+	if err != nil {
+		return docker.DeployRequest{}, err
+	}
+
 	if err = rollback.PinImages(project, lg.Images, e.localImage(ctx)); err != nil {
 		return docker.DeployRequest{}, err
 	}
@@ -776,9 +786,9 @@ func (e stageExecutor) lastGoodRequest(ctx context.Context, lg rollback.LastGood
 		AppVersion:       app.Version,
 		ComposeLoad:      docker.NewComposeLoadOptions(s.AppConfig),
 		SwarmRetention:   docker.NewSwarmRetentionOptions(s.AppConfig),
-		// DeployStack hashes the preloaded project itself when ProjectHash is empty.
-		HashNormMap: pkiRoleNormMap(cfg.ExternalSecrets, cfg.Internal.Environment),
-		Project:     project,
+		ProjectHash:      projectHash,
+		HashNormMap:      normMap,
+		Project:          project,
 	}, nil
 }
 

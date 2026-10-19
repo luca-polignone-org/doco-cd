@@ -122,7 +122,7 @@ func TestForkRollbackRevertKeepsContainers(t *testing.T) {
 	})
 
 	if state, commit, to := rec.forkRevertFailure(); state != "rolled_back" || commit != c2 || to != c1 {
-		t.Fatalf("failure = %s/%s rolled back to %q, want rolled_back/%s to %s", state, commit, to, c2, c1)
+		t.Errorf("failure = %s/%s rolled back to %q, want rolled_back/%s to %s", state, commit, to, c2, c1)
 	}
 
 	rolled := h.ContainerID(forkRevertStack, "app")

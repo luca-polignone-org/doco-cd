@@ -1,1 +1,3 @@
-* @kimdre
+# Changes under .github/ need the owner's review (decision 0036 of sbx-kit-manager).
+# The upstream line (* @kimdre) is dropped: in this fork the owner reviews only .github/.
+/.github/ @lucapolignone

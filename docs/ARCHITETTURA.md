@@ -1,7 +1,7 @@
 # Fork architecture
 
-Last verified: 2026-10-19, on commit `20f46cb3` of `main` plus the branch `fix/rollback-image-ref`
-(TCK-644, rollback image references and the retry after a rollback); before that on 2026-10-17, on
+Last verified: 2026-10-19, on commit `ad4fa837` (PR #15, TCK-644: rollback image references,
+image verification and the retry after a rollback; base `main` `20f46cb3`); before that on 2026-10-17, on
 commit `3e1fdcb2` (PR #11 merged, the last code PR of `v0.127.0-poli.2`) plus the e2e commit
 `b26d341f` of `fork/release-poli2`. Base: upstream
 `kimdre/doco-cd` `v0.127.0` (`772ed15`). Binding design: the Portico spec
@@ -102,10 +102,16 @@ denied. The enforcer writes the audit line of every deny and of every allow on a
 3. poison skip (`rollbackPoisoned`): a commit that ended `rolled_back`, `blocked` or
    `rollback_failed` is skipped with `SkipReasonRolledBack`; a new commit resets the record to
    `failed` and emits `unblocked`. The upstream retry of that `failed` record force recreates the
-   project, except when the record carries `rolled_back_to` (`forkRetryRecreates`): the rollback
-   already replaced the half-applied containers with the complete ones of the last good, so the
-   retry is a regular deploy and a commit with the content of the last good recreates nothing. After a restart the skipped target gets its job gate verdict
-   from the project that runs (`verifyPoisonedTarget`, see «Invariants»);
+   project, except when (`forkRetryRecreates`) the disk record is the same failure as the one
+   retried (same commit and `failed_at`), its state is `failed`, it carries `rolled_back_to`, and
+   every container of the project carries that commit: the rollback already replaced the
+   half-applied containers with the complete ones of the last good, so the retry is a regular
+   deploy and a commit with the content of the last good recreates nothing. A container with
+   another commit (a service of the failed commit that the last good lacks, kept by
+   `remove_orphans: false`) keeps the force recreate (#1702). When the tag of the last good had
+   moved, the rollback pinned the image ID, so the config hash differs and the revert recreates
+   onto the tag. After a restart the skipped target gets its job gate verdict from the project
+   that runs (`verifyPoisonedTarget`, see «Invariants»);
 4. upstream skip checks, then `loadComposeProjectHash`, where `checkForkPolicies` applies the
    Swarm rule and the compose policy to the resolved project and records the verdict for the job
    gate;
@@ -132,7 +138,10 @@ it still resolves locally to the recorded image ID, so `docker ps`, the outcome 
 compose config hash are those of a regular deploy of that content; else the image ID; else the
 first registry digest; a local image gets `pull_policy: never`, a pinned service loses `build`),
 the compose policy in force applied, and deployed with a full force recreate within
-`rollback.timeout`. The compose hash it stamps is taken before the pin, so the labels describe the
+`rollback.timeout`. With `pull_policy: never` Compose resolves a reference again at
+`ContainerCreate`, so after the deploy `verifyImages` checks that every container of a recorded
+service runs the recorded image ID; a mismatch (a tag moved in between) or a missing container is
+`rollback_failed`, naming the service. The compose hash it stamps is taken before the pin, so the labels describe the
 last good's content as a regular deploy of it would. A `rolled_back` record names the last good it deployed in `rolled_back_to`
 (store version 2, an `omitempty` field), kept when a new commit or unblock puts it back to
 `failed`, dropped by the next recorded failure. The outcome event goes to the outbox: one file per event,
@@ -308,6 +317,8 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   concurrent pre-deploys may emit two `unblocked`, repeated `failed` events, `dead/` without a
   cap, no redaction in the upstream sinks) —
   https://app.notion.com/p/3fca27896a5381e3abc2f0a910177734
+- The rollback with a moved tag (pin by image ID, `verifyImages` mismatch) is covered only by unit
+  tests, never against a real daemon — https://app.notion.com/p/3fea27896a5381beb421e37e3b035c9b
 - The upstream merge workflow needs `UPSTREAM_MERGE_TOKEN` —
   https://app.notion.com/p/3fca27896a538191b34cd06425995426
 - The upstream OpenAPI generator is nondeterministic on boolean defaults —

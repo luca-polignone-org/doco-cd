@@ -16,15 +16,16 @@ func pinProject(services ...types.ServiceConfig) *types.Project {
 	return p
 }
 
-func localImages(ids ...string) func(string) bool {
-	return func(id string) bool {
+// localImages is a local image store holding the image IDs ids, and no reference.
+func localImages(ids ...string) LocalImage {
+	return func(ref string) (string, bool) {
 		for _, known := range ids {
-			if id == known {
-				return true
+			if ref == known {
+				return known, true
 			}
 		}
 
-		return false
+		return "", false
 	}
 }
 

@@ -34,6 +34,7 @@ type lastGoodClient struct {
 
 	containers []container.Summary
 	digests    map[string][]string
+	refs       map[string]string // reference -> ID of the local image it names; any other ref is its own ID
 	listErr    error
 	inspectErr error
 	options    client.ContainerListOptions
@@ -47,6 +48,10 @@ func (c *lastGoodClient) ContainerList(_ context.Context, options client.Contain
 func (c *lastGoodClient) ImageInspect(_ context.Context, id string, _ ...client.ImageInspectOption) (client.ImageInspectResult, error) {
 	if c.inspectErr != nil {
 		return client.ImageInspectResult{}, c.inspectErr
+	}
+
+	if ref, ok := c.refs[id]; ok {
+		id = ref
 	}
 
 	return client.ImageInspectResult{InspectResponse: image.InspectResponse{ID: id, RepoDigests: c.digests[id]}}, nil

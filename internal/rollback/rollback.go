@@ -98,5 +98,10 @@ func runFrom(ctx context.Context, store *Store, decider Decider, exec Executor, 
 func finish(store *Store, f Failure, state State, decision hooks.Decision, to string, cause error) Outcome {
 	f.State, f.Decision = state, string(decision)
 
+	f.RolledBackTo = ""
+	if state == StateRolledBack {
+		f.RolledBackTo = to
+	}
+
 	return Outcome{State: state, Decision: decision, ToCommit: to, Err: cause, PersistErr: store.PutFailure(f)}
 }

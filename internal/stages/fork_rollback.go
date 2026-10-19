@@ -110,6 +110,26 @@ func (s *StageManager) deleteForkFailure() {
 	}
 }
 
+// forkRetryRecreates reports whether the retry of failure must force recreate the project. It
+// must not when the disk record of the same failure says the rollback deployed the last good
+// (rollback.Failure.RetryRecreates): those containers are complete and healthy, and recreating
+// them would replace the containers of the rollback for nothing. Without rollback, or when the
+// record cannot be read or is another failure, the upstream rule holds.
+func (s *StageManager) forkRetryRecreates(failure docker.DeploymentFailure) bool {
+	store := s.forkStore()
+	if store == nil {
+		return true
+	}
+
+	f, ok, err := store.GetFailure(s.DeployConfig.Object())
+	if err != nil || !ok || f.State != rollback.StateFailed ||
+		strings.TrimSpace(f.CommitSHA) != strings.TrimSpace(failure.CommitSHA) || !f.FailedAt.Equal(failure.FailedAt) {
+		return true
+	}
+
+	return f.RetryRecreates()
+}
+
 func truncateRunes(v string, n int) string {
 	if r := []rune(v); len(r) > n {
 		return string(r[:n])
@@ -724,7 +744,7 @@ func (e stageExecutor) lastGoodRequest(ctx context.Context, lg rollback.LastGood
 		return docker.DeployRequest{}, err
 	}
 
-	if err = rollback.PinImages(project, lg.Images, e.localImageExists(ctx)); err != nil {
+	if err = rollback.PinImages(project, lg.Images, e.localImage(ctx)); err != nil {
 		return docker.DeployRequest{}, err
 	}
 
@@ -931,9 +951,15 @@ func (s *StageManager) checkLastGoodPolicy(cfg *deploy.Config, project *types.Pr
 	return nil
 }
 
-func (e stageExecutor) localImageExists(ctx context.Context) func(string) bool {
-	return func(id string) bool {
-		_, err := e.s.Docker.Cmd.Client().ImageInspect(ctx, id)
-		return err == nil
+// localImage resolves a reference or an image ID to the ID of the local image, as the daemon does
+// for a container create.
+func (e stageExecutor) localImage(ctx context.Context) rollback.LocalImage {
+	return func(ref string) (string, bool) {
+		inspect, err := e.s.Docker.Cmd.Client().ImageInspect(ctx, ref)
+		if err != nil || inspect.ID == "" {
+			return "", false
+		}
+
+		return inspect.ID, true
 	}
 }

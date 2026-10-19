@@ -111,11 +111,15 @@ func (s *StageManager) deleteForkFailure() {
 }
 
 // forkRetryRecreates reports whether the retry of failure must force recreate the project. It
-// must not when the disk record of the same failure says the rollback deployed the last good
-// (rollback.Failure.RetryRecreates): those containers are complete and healthy, and recreating
-// them would replace the containers of the rollback for nothing. Without rollback, or when the
-// record cannot be read or is another failure, the upstream rule holds.
-func (s *StageManager) forkRetryRecreates(failure docker.DeploymentFailure) bool {
+// must not when the disk record of the same failure (same commit and failed_at, state failed) says
+// the rollback deployed the last good (rollback.Failure.RetryRecreates), and every container of
+// the project carries the commit of that last good: those containers are the complete, healthy
+// ones of the rollback, and recreating them would replace them for nothing. A container with
+// another commit was not replaced by the rollback, e.g. a service of the failed commit that the
+// last good does not have, left behind with remove_orphans: false: the half-applied state of
+// #1702, so the upstream rule holds. Without rollback, or when the record or the containers
+// cannot be read, the upstream rule holds too.
+func (s *StageManager) forkRetryRecreates(ctx context.Context, failure docker.DeploymentFailure) bool {
 	store := s.forkStore()
 	if store == nil {
 		return true
@@ -127,7 +131,22 @@ func (s *StageManager) forkRetryRecreates(failure docker.DeploymentFailure) bool
 		return true
 	}
 
-	return f.RetryRecreates()
+	if f.RetryRecreates() {
+		return true
+	}
+
+	containers, err := s.projectContainers(ctx)
+	if err != nil {
+		return true
+	}
+
+	for _, c := range containers {
+		if strings.TrimSpace(c.Labels[docker.DocoCDLabels.Deployment.CommitSHA]) != f.RolledBackTo {
+			return true
+		}
+	}
+
+	return false
 }
 
 func truncateRunes(v string, n int) string {
@@ -302,13 +321,11 @@ func withoutUserinfo(raw string) string {
 	return u.String()
 }
 
-// serviceImages reads the effective image of every service: ImageID from the container,
-// RepoDigests from the image. One container per service, the first by name; one-off and
-// ephemeral job containers are skipped, as Compose does not reconcile them.
-func (s *StageManager) serviceImages(ctx context.Context) ([]rollback.ServiceImage, error) {
-	apiClient := s.Docker.Cmd.Client()
-
-	list, err := apiClient.ContainerList(ctx, client.ContainerListOptions{
+// projectContainers lists the containers of the target's project that Compose reconciles: one-off
+// and ephemeral job containers are skipped, as are containers without a service label. They are
+// sorted by name.
+func (s *StageManager) projectContainers(ctx context.Context) ([]container.Summary, error) {
+	list, err := s.Docker.Cmd.Client().ContainerList(ctx, client.ContainerListOptions{
 		All: true,
 		Filters: make(client.Filters).
 			Add("label", api.ProjectLabel+"="+s.DeployConfig.Name).
@@ -318,23 +335,43 @@ func (s *StageManager) serviceImages(ctx context.Context) ([]rollback.ServiceIma
 		return nil, fmt.Errorf("list project containers: %w", err)
 	}
 
-	containers := slices.Clone(list.Items)
+	containers := make([]container.Summary, 0, len(list.Items))
+
+	for _, c := range list.Items {
+		if c.Labels[api.ServiceLabel] == "" || strings.EqualFold(strings.TrimSpace(c.Labels[docker.DocoCDJobLabels.JobEphemeral]), "true") {
+			continue
+		}
+
+		containers = append(containers, c)
+	}
+
 	slices.SortStableFunc(containers, func(a, b container.Summary) int {
 		return cmp.Compare(firstName(a.Names), firstName(b.Names))
 	})
+
+	return containers, nil
+}
+
+// serviceImages reads the effective image of every service: ImageID from the container,
+// RepoDigests from the image. One container per service, the first by name (projectContainers).
+func (s *StageManager) serviceImages(ctx context.Context) ([]rollback.ServiceImage, error) {
+	containers, err := s.projectContainers(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	seen := map[string]bool{}
 	out := []rollback.ServiceImage{}
 
 	for _, c := range containers {
 		svc := c.Labels[api.ServiceLabel]
-		if svc == "" || seen[svc] || strings.EqualFold(strings.TrimSpace(c.Labels[docker.DocoCDJobLabels.JobEphemeral]), "true") {
+		if seen[svc] {
 			continue
 		}
 
 		seen[svc] = true
 
-		inspect, err := apiClient.ImageInspect(ctx, c.ImageID)
+		inspect, err := s.Docker.Cmd.Client().ImageInspect(ctx, c.ImageID)
 		if err != nil {
 			return nil, fmt.Errorf("inspect image of %s: %w", svc, err)
 		}
@@ -426,7 +463,8 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName,
 // rollbackPoisoned reports whether the current revision of the target is a commit that ended
 // rolled_back, blocked or rollback_failed: pre-deploy then skips it, on every source and with or
 // without containers. On a new commit the failure goes back to failed with its own commit, so
-// the upstream retry stays the usual one and the success of the new commit clears it. The reset
+// the upstream retry runs and the success of the new commit clears it; after a successful rollback
+// that retry does not force recreate the project (forkRetryRecreates). The reset
 // emits unblocked, before the new commit is deployed. With rollback.unblock_on: content a new
 // commit whose content key equals the recorded one stays poisoned (sameForkContent).
 func (s *StageManager) rollbackPoisoned(ctx context.Context, revision string, stageLog *slog.Logger) bool {
@@ -706,7 +744,56 @@ func (e stageExecutor) Deploy(ctx context.Context, lg rollback.LastGood) error {
 		return err
 	}
 
-	return deployLastGood(ctx, req)
+	if err = deployLastGood(ctx, req); err != nil {
+		return err
+	}
+
+	return e.verifyImages(ctx, lg)
+}
+
+var errRollbackImageMismatch = errors.New("the rollback does not run the images of the last good")
+
+// verifyImages checks that every container of a service recorded in the last good runs the image
+// ID recorded for it. PinImages checks a reference before the deploy, but with pull_policy: never
+// Compose resolves the name again at ContainerCreate: a tag moved in between would start another
+// image, and the rolled_back event, which reports the images of the last good, would hide it. A
+// mismatch, or a recorded service without a container, is an error, hence rollback_failed, and
+// names the services.
+func (e stageExecutor) verifyImages(ctx context.Context, lg rollback.LastGood) error {
+	containers, err := e.s.projectContainers(ctx)
+	if err != nil {
+		return fmt.Errorf("verify the images of the rollback: %w", err)
+	}
+
+	running := map[string][]string{}
+
+	for _, c := range containers {
+		svc := c.Labels[api.ServiceLabel]
+		running[svc] = append(running[svc], c.ImageID)
+	}
+
+	var mismatches []string
+
+	for _, im := range lg.Images {
+		ids := running[im.Service]
+		if len(ids) == 0 {
+			mismatches = append(mismatches, fmt.Sprintf("service %s has no container, want image %s", im.Service, im.ImageID))
+			continue
+		}
+
+		for _, id := range ids {
+			if id != im.ImageID {
+				mismatches = append(mismatches, fmt.Sprintf("service %s runs image %s, want %s", im.Service, id, im.ImageID))
+				break
+			}
+		}
+	}
+
+	if len(mismatches) > 0 {
+		return fmt.Errorf("%w: %s", errRollbackImageMismatch, strings.Join(mismatches, "; "))
+	}
+
+	return nil
 }
 
 // lastGoodRequest republishes the artifact of the last good commit, renders it with the saved

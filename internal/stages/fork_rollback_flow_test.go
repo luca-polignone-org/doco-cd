@@ -119,6 +119,16 @@ func newRollbackRepo(t *testing.T) *rollbackRepo {
 func newRollbackManager(t *testing.T, r *rollbackRepo, apiClient *lastGoodClient) *StageManager {
 	t.Helper()
 
+	// The rollback verifies the images it started (stageExecutor.verifyImages): by default the
+	// project runs the images of rollbackLastGood, labeled with the good commit.
+	if apiClient.containers == nil {
+		label := map[string]string{docker.DocoCDLabels.Deployment.CommitSHA: r.commits["good"]}
+		apiClient.containers = []container.Summary{
+			serviceContainer("/web-app-1", "app", "alpine:3.22", "sha256:app", label),
+			serviceContainer("/web-extra-1", "extra", "busybox:1", "sha256:extra", label),
+		}
+	}
+
 	sm := newTestStageManager(t)
 	data := t.TempDir()
 	sm.Log = slog.New(slog.NewTextHandler(io.Discard, nil))

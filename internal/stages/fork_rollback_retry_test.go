@@ -1,10 +1,15 @@
 package stages
 
 import (
+	"errors"
 	"io"
 	"log/slog"
+	"slices"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/moby/moby/api/types/container"
 
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -68,14 +73,14 @@ func TestRetryAfterRolledBackDoesNotForceRecreate(t *testing.T) {
 			t.Fatalf("lastDeploymentFailure() = %+v, %v, want the deploy failure retried", failure, retry)
 		}
 
-		if sm.forkRetryRecreates(failure) {
+		if sm.forkRetryRecreates(t.Context(), failure) {
 			t.Fatal("the retry after a rolled back failure must not force recreate")
 		}
 
 		// After a restart memory is empty and the failure comes from disk: same answer.
 		docker.ClearDeploymentFailure(sm.Repository.Name, sm.DeployConfig.Name)
 
-		if failure, _ = sm.lastDeploymentFailure(); sm.forkRetryRecreates(failure) {
+		if failure, _ = sm.lastDeploymentFailure(); sm.forkRetryRecreates(t.Context(), failure) {
 			t.Fatal("the retry after a restart must not force recreate either")
 		}
 	})
@@ -96,37 +101,50 @@ func TestRetryAfterRolledBackDoesNotForceRecreate(t *testing.T) {
 		}
 
 		failure, _ := sm.lastDeploymentFailure()
-		if !sm.forkRetryRecreates(failure) {
+		if !sm.forkRetryRecreates(t.Context(), failure) {
 			t.Fatal("the containers of a blocked failure are the half-applied ones: the retry must force recreate")
 		}
 	})
 }
 
 // forkRetryRecreates keeps the upstream rule unless the disk record is the same failure, failed,
-// and rolled back.
+// and rolled back, and every container of the project carries the last good commit.
 func TestForkRetryRecreates(t *testing.T) {
 	at := time.Unix(40, 0).UTC()
 	failure := docker.DeploymentFailure{CommitSHA: "c2", Stage: "deploy", FailedAt: at}
 	repaired := rollback.Failure{Object: "default/web", CommitSHA: "c2", Stage: "deploy", FailedAt: at, State: rollback.StateFailed, RolledBackTo: "c1"}
+	commit := func(sha string) map[string]string {
+		return map[string]string{docker.DocoCDLabels.Deployment.CommitSHA: sha}
+	}
+	rolledBack := []container.Summary{serviceContainer("/web-app-1", "app", "app:1", "sha256:app", commit("c1"))}
+	// worker exists only in c2, and remove_orphans: false left its half-applied container.
+	withOrphan := append(slices.Clone(rolledBack), serviceContainer("/web-worker-1", "worker", "worker:1", "sha256:worker", commit("c2")))
+
+	enabled := &deploy.RollbackConfig{Enabled: true}
 
 	cases := map[string]struct {
-		rb     *deploy.RollbackConfig
-		record *rollback.Failure
-		edit   func(*rollback.Failure)
-		want   bool
+		rb         *deploy.RollbackConfig
+		record     *rollback.Failure
+		edit       func(*rollback.Failure)
+		containers []container.Summary
+		listErr    error
+		want       bool
 	}{
-		"without rollback":             {nil, nil, nil, true},
-		"without record":               {&deploy.RollbackConfig{Enabled: true}, nil, nil, true},
-		"rolled back":                  {&deploy.RollbackConfig{Enabled: true}, &repaired, nil, false},
-		"not rolled back":              {&deploy.RollbackConfig{Enabled: true}, &repaired, func(f *rollback.Failure) { f.RolledBackTo = "" }, true},
-		"another commit":               {&deploy.RollbackConfig{Enabled: true}, &repaired, func(f *rollback.Failure) { f.CommitSHA = "c3" }, true},
-		"another failure, same commit": {&deploy.RollbackConfig{Enabled: true}, &repaired, func(f *rollback.Failure) { f.FailedAt = at.Add(time.Second) }, true},
-		"still poisoned":               {&deploy.RollbackConfig{Enabled: true}, &repaired, func(f *rollback.Failure) { f.State = rollback.StateRolledBack }, true},
+		"without rollback":             {nil, nil, nil, rolledBack, nil, true},
+		"without record":               {enabled, nil, nil, rolledBack, nil, true},
+		"rolled back":                  {enabled, &repaired, nil, rolledBack, nil, false},
+		"not rolled back":              {enabled, &repaired, func(f *rollback.Failure) { f.RolledBackTo = "" }, rolledBack, nil, true},
+		"another commit":               {enabled, &repaired, func(f *rollback.Failure) { f.CommitSHA = "c3" }, rolledBack, nil, true},
+		"another failure, same commit": {enabled, &repaired, func(f *rollback.Failure) { f.FailedAt = at.Add(time.Second) }, rolledBack, nil, true},
+		"still poisoned":               {enabled, &repaired, func(f *rollback.Failure) { f.State = rollback.StateRolledBack }, rolledBack, nil, true},
+		"orphan of the failed commit":  {enabled, &repaired, nil, withOrphan, nil, true},
+		"containers unreadable":        {enabled, &repaired, nil, nil, errors.New("daemon down"), true},
 	}
 
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			sm, _ := newForkFailureManager(t, tc.rb)
+			sm.Docker.Cmd = destroyOwnershipTestCli{apiClient: &lastGoodClient{containers: tc.containers, listErr: tc.listErr}}
 
 			if tc.record != nil {
 				f := *tc.record
@@ -137,11 +155,77 @@ func TestForkRetryRecreates(t *testing.T) {
 				putDiskFailure(t, sm, f)
 			}
 
-			if got := sm.forkRetryRecreates(failure); got != tc.want {
+			if got := sm.forkRetryRecreates(t.Context(), failure); got != tc.want {
 				t.Fatalf("forkRetryRecreates() = %v, want %v", got, tc.want)
 			}
 		})
 	}
+}
+
+// Review of #15: Compose resolves the reference again at ContainerCreate, so the rollback checks
+// the images it started; a moved tag is rollback_failed, naming the service.
+func TestRollbackExecutorVerifiesStartedImages(t *testing.T) {
+	r := newRollbackRepo(t)
+	refs := map[string]string{"alpine:3.22": "sha256:app", "busybox:1": "sha256:extra"}
+
+	t.Run("tag moved before the create", func(t *testing.T) {
+		label := map[string]string{docker.DocoCDLabels.Deployment.CommitSHA: r.commits["good"]}
+		sm := newRollbackManager(t, r, &lastGoodClient{refs: refs, containers: []container.Summary{
+			serviceContainer("/web-app-1", "app", "alpine:3.22", "sha256:moved", label),
+			serviceContainer("/web-extra-1", "extra", "busybox:1", "sha256:extra", label),
+		}})
+		stubDeployLastGood(t, nil)
+
+		err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), rollbackLastGood(r, "good", rollbackConfig))
+		if !errors.Is(err, errRollbackImageMismatch) || !strings.Contains(err.Error(), "service app runs image sha256:moved, want sha256:app") ||
+			strings.Contains(err.Error(), "service extra") {
+			t.Fatalf("Deploy() error = %v, want a mismatch naming app only", err)
+		}
+	})
+
+	t.Run("service without container", func(t *testing.T) {
+		label := map[string]string{docker.DocoCDLabels.Deployment.CommitSHA: r.commits["good"]}
+		sm := newRollbackManager(t, r, &lastGoodClient{refs: refs, containers: []container.Summary{
+			serviceContainer("/web-app-1", "app", "alpine:3.22", "sha256:app", label),
+		}})
+		stubDeployLastGood(t, nil)
+
+		err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), rollbackLastGood(r, "good", rollbackConfig))
+		if !errors.Is(err, errRollbackImageMismatch) || !strings.Contains(err.Error(), "service extra has no container") {
+			t.Fatalf("Deploy() error = %v, want extra without container", err)
+		}
+	})
+
+	t.Run("list error", func(t *testing.T) {
+		sm := newRollbackManager(t, r, &lastGoodClient{refs: refs, containers: []container.Summary{}, listErr: errors.New("daemon down")})
+		stubDeployLastGood(t, nil)
+
+		err := (stageExecutor{s: sm, log: sm.Log}).Deploy(t.Context(), rollbackLastGood(r, "good", rollbackConfig))
+		if err == nil || !strings.Contains(err.Error(), "verify the images of the rollback") {
+			t.Fatalf("Deploy() error = %v", err)
+		}
+	})
+
+	t.Run("mismatch is rollback_failed", func(t *testing.T) {
+		label := map[string]string{docker.DocoCDLabels.Deployment.CommitSHA: r.commits["good"]}
+		sm := newRollbackManager(t, r, &lastGoodClient{refs: refs, containers: []container.Summary{
+			serviceContainer("/web-app-1", "app", "alpine:3.22", "sha256:moved", label),
+			serviceContainer("/web-extra-1", "extra", "busybox:1", "sha256:extra", label),
+		}})
+		startPreRollback(t, "proceed")
+		stubDeployLastGood(t, nil)
+
+		if err := rollback.StoreFor(sm.AppConfig.DataMountPath).PutLastGood(rollbackLastGood(r, "good", rollbackConfig)); err != nil {
+			t.Fatal(err)
+		}
+
+		recordMemoryFailure(sm, StageDeploy)
+		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
+
+		if f := diskFailure(t, sm); f.State != rollback.StateRollbackFailed || f.RolledBackTo != "" {
+			t.Fatalf("failure %+v, want rollback_failed without rolled_back_to", f)
+		}
+	})
 }
 
 // TCK-644: the compose hash the rollback stamps is the one of the last good's content, not of the

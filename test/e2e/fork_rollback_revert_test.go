@@ -126,8 +126,9 @@ func TestForkRollbackRevertKeepsContainers(t *testing.T) {
 	rolled := h.ContainerID(forkRevertStack, "app")
 	rolledStartedAt := h.containerStartedAt(rolled)
 
+	// Errorf: the recreate check below is a separate defect, and must run too.
 	if imageID, configured := h.containerImageID(rolled); imageID != c1ImageID || configured != "alpine:3.22" {
-		t.Fatalf("app after rollback runs %s (configured %q), want %s with the reference of c1, alpine:3.22", imageID, configured, c1ImageID)
+		t.Errorf("app after rollback runs %s (configured %q), want %s with the reference of c1, alpine:3.22", imageID, configured, c1ImageID)
 	}
 
 	// 3. A restart empties the in-memory failure: the retry below reads it from disk.

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,7 +21,7 @@ const defaultHTTPPort = 80
 const Path = "/v1/health"
 
 // Run checks the health endpoint of the server running in the same container.
-// It only reads HTTP_PORT, HTTP_TLS_CERT_FILE, HTTP_TLS_KEY_FILE and LOG_LEVEL,
+// It only reads HTTP_PORT, HTTP_BIND_ADDRESS, HTTP_TLS_CERT_FILE, HTTP_TLS_KEY_FILE and LOG_LEVEL,
 // so it stays cheap and works even when unrelated settings (e.g. secret files)
 // cannot be loaded.
 func Run(ctx context.Context, lookupEnv func(string) (string, bool)) error {
@@ -56,10 +57,12 @@ type Target struct {
 	SkipTLSVerify bool
 }
 
-// TargetFromEnv resolves the health endpoint from HTTP_PORT, HTTP_TLS_CERT_FILE
-// and HTTP_TLS_KEY_FILE only, so the healthcheck command does not need the full
-// application configuration. TLS is used when both certificate and key are set,
-// matching the server.
+// TargetFromEnv resolves the health endpoint from HTTP_PORT, HTTP_BIND_ADDRESS,
+// HTTP_TLS_CERT_FILE and HTTP_TLS_KEY_FILE only, so the healthcheck command does
+// not need the full application configuration. TLS is used when both certificate
+// and key are set, matching the server. A specific HTTP_BIND_ADDRESS (fork) is
+// the host to check, because the server does not listen on localhost then;
+// empty or unspecified (0.0.0.0, ::) keeps localhost.
 func TargetFromEnv(lookupEnv func(string) (string, bool), path string) (Target, error) {
 	port := uint64(defaultHTTPPort)
 
@@ -86,8 +89,21 @@ func TargetFromEnv(lookupEnv func(string) (string, bool), path string) (Target, 
 		scheme = "https"
 	}
 
+	host := "localhost"
+
+	if value, ok := lookupEnv("HTTP_BIND_ADDRESS"); ok && strings.TrimSpace(value) != "" {
+		ip := net.ParseIP(strings.TrimSpace(value))
+		if ip == nil {
+			return Target{}, fmt.Errorf("invalid HTTP_BIND_ADDRESS %q", value)
+		}
+
+		if !ip.IsUnspecified() {
+			host = ip.String()
+		}
+	}
+
 	return Target{
-		URL:           fmt.Sprintf("%s://localhost:%d%s", scheme, port, path),
+		URL:           fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(host, strconv.FormatUint(port, 10)), path),
 		SkipTLSVerify: hasCert,
 	}, nil
 }

@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/api"
@@ -65,12 +67,13 @@ func registryApiServer(c *app.Config, h *api.Handler, mounts api.Mounts, log *lo
 	log.Info(
 		"listening for events",
 		slog.Int("http_port", int(c.HttpPort)),
+		slog.String("bind_address", c.HttpBindAddress),
 		slog.String("protocol", protocol),
 		slog.Any("enabled_endpoints", enabledApiEndpoints),
 	)
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", c.HttpPort),
+		Addr:              net.JoinHostPort(c.HttpBindAddress, strconv.Itoa(int(c.HttpPort))),
 		ReadHeaderTimeout: 3 * time.Second,
 		// ReadTimeout bounds the time to read the request (headers + body) to
 		// mitigate slow-body (Slowloris) attacks. The webhook body is already

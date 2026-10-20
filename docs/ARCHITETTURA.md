@@ -300,6 +300,12 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   stack until it changes, and its jobs keep the last verdict of this process.
 - Unblock exists only on REST, not MCP. `API_KEY_ENABLED=false` without JWT or RBAC starts and
   closes the API.
+- `HTTP_BIND_ADDRESS` and `METRICS_BIND_ADDRESS` choose the IP the API and the metrics server bind
+  to; empty (the default) binds every interface, as upstream. Only a literal IP is accepted: a
+  hostname would be resolved once at startup. With a specific API address the container
+  healthcheck targets that address instead of `localhost`. With `network_mode: host` behind a
+  local `tailscale serve`, `127.0.0.1` keeps the plain-HTTP API off every other interface. The
+  pprof server is loopback-only already.
 
 ## Known debts
 

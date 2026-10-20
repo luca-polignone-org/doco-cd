@@ -121,7 +121,7 @@ func Check(ctx context.Context, url string, skipTLSVerify bool) error {
 	if skipTLSVerify {
 		client = &http.Client{
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- Container-local healthchecks may use self-signed certificates on localhost.
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, // #nosec G402 -- Container-local healthchecks may use self-signed certificates on the container-local address.
 			},
 		}
 	}

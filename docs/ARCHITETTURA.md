@@ -1,7 +1,9 @@
 # Fork architecture
 
-Last verified: 2026-10-19, on commit `ad4fa837` (PR #15, TCK-644: rollback image references,
-image verification and the retry after a rollback; base `main` `20f46cb3`); before that on 2026-10-17, on
+Last verified: 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
+`METRICS_BIND_ADDRESS`; base `main` `d715be6d`); before that on 2026-10-19, on commit `ad4fa837`
+(PR #15, TCK-644: rollback image references, image verification and the retry after a rollback;
+base `main` `20f46cb3`); before that on 2026-10-17, on
 commit `3e1fdcb2` (PR #11 merged, the last code PR of `v0.127.0-poli.2`) plus the e2e commit
 `b26d341f` of `fork/release-poli2`. Base: upstream
 `kimdre/doco-cd` `v0.127.0` (`772ed15`). Binding design: the Portico spec
@@ -300,6 +302,12 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   stack until it changes, and its jobs keep the last verdict of this process.
 - Unblock exists only on REST, not MCP. `API_KEY_ENABLED=false` without JWT or RBAC starts and
   closes the API.
+- `HTTP_BIND_ADDRESS` and `METRICS_BIND_ADDRESS` choose the IP the API and the metrics server bind
+  to; empty (the default) binds every interface, as upstream. Only a literal IP is accepted: a
+  hostname would be resolved once at startup. With a specific API address the container
+  healthcheck targets that address instead of `localhost`. With `network_mode: host` behind a
+  local `tailscale serve`, both set to `127.0.0.1` keep the plain-HTTP API and metrics off every
+  other interface. IPv6 zones are rejected. The pprof server is loopback-only already.
 
 ## Known debts
 

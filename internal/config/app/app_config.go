@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"net/url"
 	"path"
@@ -132,6 +133,8 @@ type Config struct {
 	HookOutcomeURL                string                 `env:"HOOK_OUTCOME_URL"`                                                                                // HookOutcomeURL receives the outcome events from the outbox (fork)
 	HookSecret                    string                 `env:"HOOK_SECRET"`                                                                                     // #nosec G117 -- HookSecret signs the hooks with HMAC-SHA256
 	HookSecretFile                string                 `env:"HOOK_SECRET_FILE,file"`                                                                           // HookSecretFile is the file containing the HookSecret
+	HttpBindAddress               string                 `env:"HTTP_BIND_ADDRESS"`                                                                               // HttpBindAddress is the IP the HTTP server binds to; empty binds every interface (fork)
+	MetricsBindAddress            string                 `env:"METRICS_BIND_ADDRESS"`                                                                            // MetricsBindAddress is the IP the metrics server binds to; empty binds every interface (fork)
 }
 
 // GetConfig returns the app Config.
@@ -169,6 +172,11 @@ func GetConfig() (*Config, error) {
 	}
 
 	err = cfg.validateForkHooks()
+	if err != nil {
+		return nil, err
+	}
+
+	err = cfg.validateForkBind()
 	if err != nil {
 		return nil, err
 	}
@@ -444,6 +452,26 @@ func (cfg *Config) validateForkAuth() error {
 
 	if cfg.RBACPolicyFile != "" && !cfg.APIKeyEnabled && cfg.JWTJWKSURL == "" {
 		return errors.New("RBAC_POLICY_FILE with API_KEY_ENABLED=false requires JWT_JWKS_URL")
+	}
+
+	return nil
+}
+
+// validateForkBind accepts an empty bind address (every interface, the
+// upstream behaviour) or a literal IP. A hostname is rejected: it would be
+// resolved once at startup and could bind an unexpected interface.
+func (cfg *Config) validateForkBind() error {
+	for _, b := range []struct {
+		name string
+		addr *string
+	}{
+		{"HTTP_BIND_ADDRESS", &cfg.HttpBindAddress},
+		{"METRICS_BIND_ADDRESS", &cfg.MetricsBindAddress},
+	} {
+		*b.addr = strings.TrimSpace(*b.addr)
+		if *b.addr != "" && net.ParseIP(*b.addr) == nil {
+			return fmt.Errorf("%s must be an IP address, got %q", b.name, *b.addr)
+		}
 	}
 
 	return nil

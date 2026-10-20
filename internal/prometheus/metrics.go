@@ -1,9 +1,10 @@
 package prometheus
 
 import (
-	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/graceful"
@@ -16,7 +17,8 @@ const (
 )
 
 // RegisterServer registers the Prometheus metrics server.
-func RegisterServer(port uint16, tlsCertFile string, tlsKeyFile string, log *logger.Logger) {
+// bindAddress is the IP to listen on; empty binds every interface.
+func RegisterServer(bindAddress string, port uint16, tlsCertFile string, tlsKeyFile string, log *logger.Logger) {
 	protocol := "http"
 	if tlsCertFile != "" && tlsKeyFile != "" {
 		protocol = "https"
@@ -24,6 +26,7 @@ func RegisterServer(port uint16, tlsCertFile string, tlsKeyFile string, log *log
 
 	log.Info("serving prometheus metrics",
 		slog.Int("http_port", int(port)),
+		slog.String("bind_address", bindAddress),
 		slog.String("protocol", protocol),
 		slog.String("path", MetricsPath),
 	)
@@ -32,7 +35,7 @@ func RegisterServer(port uint16, tlsCertFile string, tlsKeyFile string, log *log
 	mux.Handle(MetricsPath, Handler())
 
 	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", port),
+		Addr:              net.JoinHostPort(bindAddress, strconv.Itoa(int(port))),
 		ReadHeaderTimeout: 3 * time.Second,
 		Handler:           mux,
 	}

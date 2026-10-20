@@ -708,7 +708,7 @@ func run() error {
 		return err
 	}
 
-	prometheus.RegisterServer(c.MetricsPort, c.HttpTLSCertFile, c.HttpTLSKeyFile, log)
+	prometheus.RegisterServer(c.MetricsBindAddress, c.MetricsPort, c.HttpTLSCertFile, c.HttpTLSKeyFile, log)
 
 	if c.PprofEnabled {
 		profiling.RegisterServer(c.PprofPort, log)

@@ -86,6 +86,7 @@ type Harness struct {
 	selfLogDone   chan struct{}
 
 	remoteContext    bool
+	remoteSwarm      bool
 	contextConfigDir string
 	remoteDaemon     testcontainers.Container
 	remoteDocker     *client.Client
@@ -153,6 +154,13 @@ func NewHarness(t *testing.T, scenario string) *Harness {
 func (h *Harness) EnableRemoteContext() {
 	h.t.Helper()
 	h.remoteContext = true
+}
+
+// EnableRemoteSwarmContext uses an isolated Swarm manager without changing the host daemon.
+func (h *Harness) EnableRemoteSwarmContext() {
+	h.t.Helper()
+	h.remoteContext = true
+	h.remoteSwarm = true
 }
 
 // EnableAPI enables the daemon REST API with apiKey and publishes the daemon
@@ -548,7 +556,16 @@ func (h *Harness) startRemoteDocker() {
 	}
 
 	h.remoteDaemon = remote
+
 	h.remoteDocker = remoteDocker
+	if h.remoteSwarm {
+		if _, err := remoteDocker.SwarmInit(h.ctx, client.SwarmInitOptions{
+			ListenAddr: "0.0.0.0:2377", AdvertiseAddr: "127.0.0.1",
+		}); err != nil {
+			h.t.Fatalf("initialize isolated Swarm manager: %v", err)
+		}
+	}
+
 	h.logContainerStart("remote-docker", remote)
 }
 
@@ -783,7 +800,9 @@ func (h *Harness) teardownInternal() {
 		}
 
 		if h.ociRegistry != nil && h.net != nil {
-			h.ociRegistry.detachFromNetwork(h.ctx, h.net.Name)
+			if err := h.ociRegistry.detachFromNetwork(h.ctx, h.net.Name); err != nil {
+				h.logf("detach OCI registry from network %s: %v", h.net.Name, err)
+			}
 		}
 
 		if h.net != nil {

@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -438,47 +440,121 @@ func (r *trackingReadCloser) Close() error {
 	return nil
 }
 
-func TestHandler_TriggerPollHandlerReportsSyncWindowDeferral(t *testing.T) {
-	log := logger.New(logger.LevelCritical)
-	h := &Handler{
-		appConfig: &app.Config{ApiSecret: "poll-secret", MaxPayloadSize: 1024}, // #nosec G101 -- test fixture.
-		log:       log,
-	}
-	h.controlPlaneRuns = newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
-		appConfig: h.appConfig,
-		log:       log,
-		pollRunner: func(ctx context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider, _ string,
-		) error {
-			if origin := controlplane.DeploymentOrigin(ctx); origin != syncwindow.OriginManual {
-				t.Errorf("API poll origin = %q, want manual", origin)
+func TestHandler_TriggerPollHandlerReportsSkippedRuns(t *testing.T) {
+	pauseErr := fmt.Errorf("web: %w", stages.ErrDeploymentPaused)
+
+	for _, tc := range []struct {
+		name    string
+		outcome error
+		wait    bool
+	}{
+		{"sync window", &stages.SyncWindowBlockedError{Stacks: []string{"web"}, Windows: []string{"freeze"}}, true},
+		{"paused", pauseErr, true},
+		{"paused async", pauseErr, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			log := logger.New(logger.LevelCritical)
+			h := &Handler{
+				appConfig: &app.Config{ApiSecret: "poll-test-key", MaxPayloadSize: 1024}, // #nosec G101 -- test fixture.
+				log:       log,
+			}
+			h.controlPlaneRuns = newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+				appConfig: h.appConfig,
+				log:       log,
+				pollRunner: func(ctx context.Context, cfg poll.Config, _ *app.Config, _ container.MountPoint,
+					_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider, _ string,
+				) error {
+					if origin := controlplane.DeploymentOrigin(ctx); origin != syncwindow.OriginManual {
+						t.Errorf("API poll origin = %q, want manual", origin)
+					}
+
+					if len(cfg.Deployments) != 1 || !cfg.Deployments[0].Pause {
+						t.Errorf("manual poll lost pause configuration: %#v", cfg)
+					}
+
+					return tc.outcome
+				},
+			})
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, APIPath+"/poll/run?wait="+strconv.FormatBool(tc.wait),
+				strings.NewReader(`[{"url":"https://example.com/repo.git","deployments":[{"name":"web","pause":true}]}]`))
+			request.Header.Set(restAPI.KeyHeader, h.appConfig.ApiSecret)
+			h.TriggerPollHandler(response, request)
+
+			if response.Code != http.StatusAccepted {
+				t.Fatalf("status = %d, want 202: %s", response.Code, response.Body.String())
 			}
 
-			return &stages.SyncWindowBlockedError{Stacks: []string{"web"}, Windows: []string{"freeze"}}
-		},
-	})
-	response := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, APIPath+"/poll/run", strings.NewReader(`[{"url":"https://example.com/repo.git"}]`))
-	request.Header.Set(restAPI.KeyHeader, h.appConfig.ApiSecret)
+			var result restAPI.Response
+			if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
+				t.Fatal(err)
+			}
 
-	h.TriggerPollHandler(response, request)
+			wantContent := tc.outcome.Error()
+			if !tc.wait {
+				wantContent = "poll jobs started"
+			}
 
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d: %s", response.Code, http.StatusAccepted, response.Body.String())
+			if result.JobID == "" || result.Content != wantContent {
+				t.Fatalf("response lost skip reason or job ID: %#v", result)
+			}
+
+			run := waitForDeploymentRunStatus(t, h.controlPlaneRuns.(*controlplane.Runs), result.JobID, controlplane.RunStatusSkipped)
+			if !strings.Contains(run.Message, tc.outcome.Error()) {
+				t.Fatalf("run lost skip reason: %#v", run)
+			}
+		})
 	}
+}
 
-	var result restAPI.Response
-	if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil {
-		t.Fatal(err)
-	}
+func TestHandler_TriggerPollPreservesManualOriginWithRetryPolicy(t *testing.T) {
+	for _, wait := range []bool{true, false} {
+		t.Run(strconv.FormatBool(wait), func(t *testing.T) {
+			origin := make(chan syncwindow.Origin, 1)
+			log := logger.New(logger.LevelCritical)
+			h := &Handler{
+				appConfig: &app.Config{ApiSecret: "poll-test-key", MaxPayloadSize: 1024}, // #nosec G101 -- test fixture.
+				log:       log,
+			}
+			h.controlPlaneRuns = newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+				appConfig: h.appConfig,
+				log:       log,
+				pollRunner: func(ctx context.Context, cfg poll.Config, _ *app.Config, _ container.MountPoint,
+					_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider, _ string,
+				) error {
+					if len(cfg.Deployments) != 1 || cfg.Deployments[0].Retry.Limit == nil ||
+						*cfg.Deployments[0].Retry.Limit != 0 {
+						t.Errorf("manual poll lost retry configuration: %#v", cfg)
+					}
 
-	const want = "deployment of web deferred by sync window freeze"
-	if result.Content != want || result.JobID == "" {
-		t.Fatalf("response = %#v", result)
-	}
+					origin <- controlplane.DeploymentOrigin(ctx)
 
-	run, ok := h.controlPlaneRuns.Get(result.JobID)
-	if !ok || run.Status != controlplane.RunStatusSkipped || run.Message != want {
-		t.Fatalf("tracked run = %#v, found = %t", run, ok)
+					return nil
+				},
+			})
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, APIPath+"/poll/run?wait="+strconv.FormatBool(wait),
+				strings.NewReader(`[{"url":"https://example.com/repo.git","deployments":[{"name":"web","retry":{"limit":0,"delay":"1h"}}]}]`))
+			request.Header.Set(restAPI.KeyHeader, h.appConfig.ApiSecret)
+			h.TriggerPollHandler(response, request)
+
+			wantStatus := http.StatusOK
+			if !wait {
+				wantStatus = http.StatusAccepted
+			}
+
+			if response.Code != wantStatus {
+				t.Fatalf("status = %d, want %d: %s", response.Code, wantStatus, response.Body.String())
+			}
+
+			select {
+			case got := <-origin:
+				if got != syncwindow.OriginManual {
+					t.Fatalf("origin = %s, want manual", got)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("manual API trigger did not execute")
+			}
+		})
 	}
 }

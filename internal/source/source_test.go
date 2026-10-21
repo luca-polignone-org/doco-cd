@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,6 +20,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/commitstatus"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
@@ -41,7 +44,14 @@ func TestEarlySourceFailureReportsNativeTimeout(t *testing.T) {
 		git.ConfigureAuthResolver(nil, "", "", "", "", git.GitHubAppConfig{})
 	})
 
-	var conclusion string
+	var received struct {
+		Name       string `json:"name"`
+		Conclusion string `json:"conclusion"`
+		Output     struct {
+			Title   string `json:"title"`
+			Summary string `json:"summary"`
+		} `json:"output"`
+	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
@@ -49,14 +59,10 @@ func TestEarlySourceFailureReportsNativeTimeout(t *testing.T) {
 			return
 		}
 
-		var body struct {
-			Conclusion string `json:"conclusion"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
 			t.Errorf("decode check: %v", err)
 		}
 
-		conclusion = body.Conclusion
 		_, _ = w.Write([]byte(`{"id":123}`))
 	}))
 	defer server.Close()
@@ -64,12 +70,25 @@ func TestEarlySourceFailureReportsNativeTimeout(t *testing.T) {
 	preparer := &Preparer{appConfig: &app.Config{
 		GitCommitStatus: true, GitScmProvider: "github", GitScmApiUrl: config.HttpUrl(server.URL),
 	}}
-	preparer.postEarlyFailureCommitStatus(t.Context(), Request{
-		Logger: slog.Default(), SourceRef: "https://github.com/owner/repo",
-	}, config.SourceTypeGit, "deadbeef", webhook.ParsedPayload{}, context.DeadlineExceeded)
 
-	if conclusion != "timed_out" {
-		t.Fatalf("expected source timeout check, got %q", conclusion)
+	for _, timedOut := range []bool{false, true} {
+		failure := errors.New(strings.Repeat("source context ", 15) + "\nimportant error tail")
+		wantConclusion := "failure"
+
+		if timedOut {
+			failure = fmt.Errorf("%w: %w", failure, context.DeadlineExceeded)
+			wantConclusion = "timed_out"
+		}
+
+		preparer.postEarlyFailureCommitStatus(t.Context(), Request{
+			Logger: slog.Default(), SourceRef: "https://github.com/owner/repo", CustomTarget: "staging",
+		}, config.SourceTypeGit, "deadbeef", webhook.ParsedPayload{}, failure)
+
+		if received.Name != "doco-cd/staging/deploy" || received.Conclusion != wantConclusion ||
+			received.Output.Title != commitstatus.FailureDescription(failure) ||
+			received.Output.Summary != "### Failure details\n\n    "+strings.ReplaceAll(failure.Error(), "\n", "\n    ") {
+			t.Fatalf("source failure details were lost: %+v", received)
+		}
 	}
 }
 
@@ -414,6 +433,7 @@ func TestPrepare_GitCloneFailure_PostsEarlyCommitStatus(t *testing.T) {
 		SourceType:     config.SourceTypeGit,
 		SourceRef:      "file://" + srcPath,
 		Ref:            "refs/heads/does-not-exist",
+		CustomTarget:   "production",
 		Payload:        webhook.ParsedPayload{Ref: git.MainBranch, CommitSHA: plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"), WebURL: srv.URL + "/owner/repo", FullName: "owner/repo"},
 		DataMountPoint: testMountPoint(t),
 	})
@@ -423,6 +443,10 @@ func TestPrepare_GitCloneFailure_PostsEarlyCommitStatus(t *testing.T) {
 
 	if received["state"] != "error" {
 		t.Fatalf("expected an early 'error' commit status to be posted, got %v", received)
+	}
+
+	if received["context"] != "doco-cd/production/deploy" {
+		t.Fatalf("context = %q, want doco-cd/production/deploy", received["context"])
 	}
 }
 
@@ -451,21 +475,44 @@ func TestPrepare_DeployConfigFailure_PostsEarlyCommitStatus(t *testing.T) {
 		GitScmProvider:  "gitea",
 	})
 
-	_, err := p.Prepare(t.Context(), Request{
-		Logger:         logger.New(logger.LevelCritical).Logger,
-		JobTrigger:     stages.JobTriggerWebhook,
-		SourceType:     config.SourceTypeGit,
-		SourceRef:      "file://" + srcPath,
-		Ref:            git.MainBranch,
-		Payload:        webhook.ParsedPayload{Ref: git.MainBranch, CommitSHA: plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"), WebURL: srv.URL + "/owner/repo", FullName: "owner/repo"},
-		DataMountPoint: testMountPoint(t),
-	})
-	if !errors.Is(err, ErrDeployConfig) {
-		t.Fatalf("expected ErrDeployConfig, got %v", err)
-	}
+	for _, trigger := range []stages.JobTrigger{stages.JobTriggerWebhook, stages.JobTriggerPoll} {
+		for _, tt := range []struct {
+			name   string
+			target string
+			want   string
+		}{
+			{name: "default", want: commitstatus.DeployContext},
+			{name: "targeted", target: "staging", want: "doco-cd/staging/deploy"},
+		} {
+			t.Run(string(trigger)+"/"+tt.name, func(t *testing.T) {
+				received = nil
 
-	if received["state"] != "error" {
-		t.Fatalf("expected an early 'error' commit status to be posted, got %v", received)
+				req := Request{
+					Logger:         logger.New(logger.LevelCritical).Logger,
+					JobTrigger:     trigger,
+					SourceType:     config.SourceTypeGit,
+					SourceRef:      "file://" + srcPath,
+					Ref:            git.MainBranch,
+					CustomTarget:   tt.target,
+					Payload:        webhook.ParsedPayload{Ref: git.MainBranch, CommitSHA: plumbing.NewHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"), WebURL: srv.URL + "/owner/repo", FullName: "owner/repo"},
+					DataMountPoint: testMountPoint(t),
+				}
+				req.PollConfig.CustomTarget = tt.target
+
+				_, err := p.Prepare(t.Context(), req)
+				if !errors.Is(err, ErrDeployConfig) {
+					t.Fatalf("expected ErrDeployConfig, got %v", err)
+				}
+
+				if received["state"] != "error" {
+					t.Fatalf("expected an early 'error' commit status to be posted, got %v", received)
+				}
+
+				if received["context"] != tt.want {
+					t.Fatalf("context = %q, want %q", received["context"], tt.want)
+				}
+			})
+		}
 	}
 }
 

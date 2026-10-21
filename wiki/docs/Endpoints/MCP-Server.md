@@ -151,7 +151,7 @@ To poll progress with `#!yaml wait: false`:
 | `running`   | No       | Job is actively executing.                           |
 | `succeeded` | Yes      | Job completed without error.                         |
 | `failed`    | Yes      | Job encountered an error.                            |
-| `skipped`   | Yes      | Job was not executed (e.g. no changes detected or deferred by a [sync window](../Advanced/Sync-Windows.md)). |
+| `skipped`   | Yes      | Job was not executed (e.g. no changes detected, deployments [paused](../Deploy-Settings.md#pause-settings), or deferred by a [sync window](../Advanced/Sync-Windows.md)). |
 
 !!! note
     For `trigger_scheduled_job`, `succeeded` means the trigger completed without error. Compose restarts and Swarm reruns can return after Docker accepts the start or update, so this does not guarantee the workload finished successfully or exited with code 0.
@@ -183,9 +183,16 @@ Each item in `configs` accepts these fields:
 | `target`      | No       | Custom deployment configuration target.                                  |
 | `deployments` | No       | Inline deployment configurations, overriding the repository's config.    |
 
-The `interval`, `schedule` and `run_once` fields are not accepted; MCP-triggered polls always run once immediately.
-MCP-triggered polls count as manual deployments for [sync windows](../Advanced/Sync-Windows.md#manual-deployments).
+The `interval`, `schedule` and `run_once` fields are not accepted; MCP-triggered polls always run once immediately and 
+count as manual deployments for [sync windows](../Advanced/Sync-Windows.md#manual-deployments).
+They also bypass [deployment retry delay and exhausted-budget pause](../Deploy-Settings.md#manual-retry) for that attempt only,
+including `#!yaml limit: 0` with either `#!yaml wait: true` or `#!yaml wait: false`.
+A failed manual deployment neither consumes nor refills the automatic retry budget; complete success clears the failure and retry state.
+Other deployment safety checks, including source trust and sync windows, still apply.
 All configs in one request run with bounded concurrency controlled by `MAX_CONCURRENT_DEPLOYMENTS` (default: 4).
+
+Manual `trigger_poll` calls do **not** bypass [`pause`](../Deploy-Settings.md#pause-settings). Inline deployments accept `"pause": true`.
+With `wait=true`, a run whose deployments are all paused returns `status: "skipped"` with the pause reason and no MCP error flag.
 
 ## Logging
 

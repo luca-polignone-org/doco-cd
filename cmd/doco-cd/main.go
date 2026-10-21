@@ -423,7 +423,7 @@ func run() error {
 
 	graceful.SafeGo(&wg, log.Logger,
 		func() {
-			notificationForNewAppVersion(log.Logger, notifier)
+			notificationForNewAppVersion(log.Logger, notifier, c.VersionCheckEnabled)
 		},
 	)
 
@@ -624,7 +624,9 @@ func run() error {
 				slog.String("secret_provider", c.SecretProvider),
 			)
 		} else {
-			watcher := certrotation.New(contexts, log.Logger, h.secretProvider, c.CertRotationThreshold, c.CertRotationCheckInterval, docker.NewCertificateRotationOptions(c))
+			rotationOptions := docker.NewCertificateRotationOptions(c)
+			rotationOptions.Admission = reconciliationManager.AdmitCertificateRotation
+			watcher := certrotation.New(contexts, log.Logger, h.secretProvider, c.CertRotationThreshold, c.CertRotationCheckInterval, rotationOptions)
 
 			graceful.SafeGo(&wg, log.Logger, func() {
 				watcher.Start(workCtx)

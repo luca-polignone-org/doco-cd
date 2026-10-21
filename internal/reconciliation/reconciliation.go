@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 
@@ -131,6 +132,15 @@ func (j *job) cleanupConfigsForContextMode(contextName string, swarmMode bool) [
 	return filterConfigsByMode(filterConfigsByContext(j.cleanupConfigs, contextName), j.swarmModeForContext(contextName), swarmMode)
 }
 
+// cleanupRequest returns the latest observed cleanup request of the repository.
+// Without an observation, it uses the cleanup configs of the job, not its recovery configs.
+func (j *job) cleanupRequest() DeployRequest {
+	fallback := j.info
+	fallback.DeployConfigs = j.cleanupConfigs
+
+	return j.manager.currentCleanupRequest(fallback)
+}
+
 func (j *job) run(ctx context.Context) {
 	jobLog := j.info.Logger
 
@@ -155,7 +165,7 @@ func (j *job) run(ctx context.Context) {
 			}
 
 			unhealthyConfigs := filterConfigsByMode(
-				getDeployConfigGroupByEvent(configs)["unhealthy"],
+				j.manager.recoveryGroupByEvent(j.info, configs)["unhealthy"],
 				entry.swarmMode,
 				swarmMode,
 			)
@@ -261,7 +271,7 @@ func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, 
 		repositoryLabelValue = j.info.Payload.FullName
 	}
 
-	contextGroupByEvent := getDeployConfigGroupByEvent(contextDCs)
+	contextGroupByEvent := j.manager.recoveryGroupByEvent(j.info, contextDCs)
 
 	if len(contextGroupByEvent) == 0 {
 		return
@@ -414,6 +424,16 @@ func dockerEventTime(event events.Message) time.Time {
 
 func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events.Message, contextName string, swarmMode bool) {
 	action := normalizeReconciliationEventAction(string(event.Action))
+	if event.Type == events.ContainerEventType && event.Actor.Attributes[api.HookLabel] != "" {
+		jobLog.Debug("skipping reconciliation for lifecycle-hook runner",
+			slog.String("event", action),
+			slog.String("container_name", event.Actor.Attributes["name"]),
+			slog.String("hook", event.Actor.Attributes[api.HookLabel]),
+		)
+
+		return
+	}
+
 	// Restrict candidates to the context the event originated from, since stack
 	// names are only guaranteed to be unique within a single Docker context.
 	dcs := filterConfigsByMode(filterConfigsByContext(j.deployConfigGroupByEvent[action], contextName), j.swarmModeForContext(contextName), swarmMode)
@@ -428,6 +448,8 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 	}
 
 	stackDCs := deployConfigsByName(dcs, stackName)
+
+	stackDCs = j.manager.recoveryConfigs(j.info, stackDCs)
 	if len(stackDCs) == 0 {
 		return
 	}
@@ -494,7 +516,7 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		jobLog.Debug("suppressing follow-up event from self-initiated container restart",
 			slog.String("event", action),
 			slog.String("container_name", event.Actor.Attributes["name"]),
-			slog.String("restart_cooldown_remaining", remaining.Truncate(time.Second).String()),
+			slog.String("restart_delay_remaining", remaining.Truncate(time.Second).String()),
 			slog.String("stack", stackName),
 		)
 
@@ -609,7 +631,8 @@ func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConf
 	// Use the context-specific CLI and only the deploy configs targeting this context
 	// for cleanup, so we inspect the correct remote daemon for obsolete containers.
 	contextCLI := j.cliForContext(contextName)
-	contextDCs := j.cleanupConfigsForContextMode(contextName, swarmMode)
+	cleanupReq := j.cleanupRequest()
+	contextDCs := filterConfigsByMode(filterConfigsByContext(cleanupReq.DeployConfigs, contextName), j.swarmModeForContext(contextName), swarmMode)
 
 	// Removing an obsolete stack is a change, not the recovery of a deployed
 	// revision, so sync windows apply to it like to any automatic deployment.
@@ -618,10 +641,16 @@ func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConf
 	removalReq.Origin = syncwindow.OriginAutomatic
 	removalGate := j.manager.newSyncWindowGate(removalReq, time.Now())
 
-	if err := cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog,
-		contextCLI, swarmMode, contextName, j.info,
-		contextDCs, j.manager.notifier, removalGate.removalPredicate(contextName)); err != nil {
-		jobLog.Error("failed to clean up obsolete auto-discovered containers", logger.ErrAttr(err))
+	pending, cleanupErr := cleanupObsoleteAutoDiscoveredContainersResult(ctx, jobLog,
+		contextCLI, swarmMode, contextName, cleanupReq,
+		contextDCs, j.manager.notifier, j.manager.removalPredicate(cleanupReq, contextName, removalGate))
+	// This event covers one context. It must not clear retries for other contexts.
+	if pending || cleanupErr != nil {
+		j.manager.scheduleCleanupRetry(ctx, cleanupReq, true)
+	}
+
+	if cleanupErr != nil {
+		jobLog.Error("failed to clean up obsolete auto-discovered containers", logger.ErrAttr(cleanupErr))
 	}
 
 	// Enrich metadata with reconciliation event information for deploy notifications
@@ -649,8 +678,8 @@ func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConf
 		req.Origin = syncwindow.OriginReconciliation
 
 		err := j.manager.handleDeploy(ctx, req)
-		if errors.Is(err, stages.ErrSyncWindowBlocked) {
-			// The gate already logged the deferral.
+		if errors.Is(err, stages.ErrSkipDeployment) {
+			// Skips such as sync window deferrals, retry suppression, and pause are logged where they occur.
 			continue
 		}
 

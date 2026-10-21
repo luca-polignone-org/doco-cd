@@ -304,7 +304,7 @@ func TestRunForkRollbackRecordsContentKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	docker.RecordDeploymentFailure(sm.Repository.Name, sm.DeployConfig.Name, docker.DeploymentFailure{
+	recordTargetFailure(t, sm, docker.DeploymentFailure{
 		Repository: sm.Repository.Name, Stack: sm.DeployConfig.Name, CommitSHA: failed,
 		Stage: string(StageDeploy), Error: "e", FailedAt: time.Unix(40, 0).UTC(),
 	})

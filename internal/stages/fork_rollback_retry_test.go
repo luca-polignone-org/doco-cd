@@ -53,7 +53,7 @@ func TestRetryAfterRolledBackDoesNotForceRecreate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		recordMemoryFailure(sm, StageDeploy)
+		recordMemoryFailure(t, sm, StageDeploy)
 		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 		if f := diskFailure(t, sm); f.State != rollback.StateRolledBack || f.RolledBackTo != r.commits["good"] {
@@ -78,7 +78,7 @@ func TestRetryAfterRolledBackDoesNotForceRecreate(t *testing.T) {
 		}
 
 		// After a restart memory is empty and the failure comes from disk: same answer.
-		docker.ClearDeploymentFailure(sm.Repository.Name, sm.DeployConfig.Name)
+		docker.DeploymentFailures.Clear(sm.deploymentFailureTarget())
 
 		if failure, _ = sm.lastDeploymentFailure(); sm.forkRetryRecreates(t.Context(), failure) {
 			t.Fatal("the retry after a restart must not force recreate either")
@@ -93,7 +93,7 @@ func TestRetryAfterRolledBackDoesNotForceRecreate(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		recordMemoryFailure(sm, StageDeploy)
+		recordMemoryFailure(t, sm, StageDeploy)
 		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 		if sm.rollbackPoisoned(t.Context(), "next-commit", stageLog) {
@@ -219,7 +219,7 @@ func TestRollbackExecutorVerifiesStartedImages(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		recordMemoryFailure(sm, StageDeploy)
+		recordMemoryFailure(t, sm, StageDeploy)
 		sm.runForkRollback(t.Context(), StageDeploy, errRecorded)
 
 		if f := diskFailure(t, sm); f.State != rollback.StateRollbackFailed || f.RolledBackTo != "" {

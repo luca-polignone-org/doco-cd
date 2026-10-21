@@ -14,10 +14,12 @@ import (
 )
 
 // Token reload (Portico fork, spec 4, innesto 2). A bao agent rewrites its sink when it renews
-// beyond token_max_ttl or restarts; upstream reads SECRET_PROVIDER_ACCESS_TOKEN_FILE once. With
-// SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD every public method stats the file first and swaps the
-// token of both clients when mtime or size changed. A 403 on an idempotent read re-reads the file
-// once and retries once; issuance (pki-role) is never retried.
+// beyond token_max_ttl or restarts. Since v0.129.0 upstream reads SECRET_PROVIDER_ACCESS_TOKEN_FILE
+// before every operation and fails the operation when the file is missing, empty or not
+// decodable. With SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD the fork keeps its own semantics
+// instead: every public method stats the file first and swaps the token of both clients when
+// mtime or size changed, an unusable file keeps the token in use, and a 403 on an idempotent read
+// re-reads the file once and retries once; issuance (pki-role) is never retried.
 
 var errTokenReload = errors.New("token reload")
 
@@ -32,8 +34,8 @@ func (c *Config) ValidateTokenReload(tokenFromEnv bool) error {
 		return errors.Join(errTokenReload, errors.New("SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD needs SECRET_PROVIDER_ACCESS_TOKEN_FILE"))
 	}
 
-	// Defensive: GetConfig never gets here with both variables set, because ParseConfigFromEnv
-	// returns ErrBothSecretsSet first. The check keeps the rule true for any other caller.
+	// Defensive: GetConfig never gets here with both variables set, because it returns
+	// ErrBothSecretsSet first. The check keeps the rule true for any other caller.
 	if tokenFromEnv {
 		return errors.Join(errTokenReload, errors.New("SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD cannot be used with SECRET_PROVIDER_ACCESS_TOKEN"))
 	}
@@ -98,6 +100,9 @@ func (p *Provider) EnableTokenReload(path string) error {
 	}
 
 	p.reload = &tokenReload{path: path, size: st.Size(), mtime: st.ModTime()}
+	// The reload replaces the upstream per-operation read (namespaceClient): that read fails the
+	// operation on an unusable file, where the reload keeps the token in use.
+	p.tokenFile = nil
 
 	return nil
 }
@@ -154,9 +159,16 @@ func (p *Provider) loadTokenLocked(r *tokenReload, st os.FileInfo) {
 		return
 	}
 
-	tok := strings.TrimSpace(string(data))
-	if tok == "" {
+	// parseAccessToken is the upstream parser (trim, SOPS decryption), so a reloaded token is read
+	// exactly as the startup one.
+	tok, err := parseAccessToken(data, r.path)
+	if errors.Is(err, errEmptyAccessTokenFile) {
 		r.failLocked("openbao token file empty, keeping the token in use", nil, false)
+		return
+	}
+
+	if err != nil {
+		r.failLocked("openbao token file not decodable, keeping the token in use", err, false)
 		return
 	}
 

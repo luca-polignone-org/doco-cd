@@ -1,12 +1,13 @@
 # Fork architecture
 
-Last verified: 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
+Last verified: 2026-10-21, on the merge of upstream `v0.129.0` (branch
+`merge/upstream-v0.129.0`, base `main` `b7754382`); before that on 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
 `METRICS_BIND_ADDRESS`; base `main` `d715be6d`); before that on 2026-10-19, on commit `ad4fa837`
 (PR #15, TCK-644: rollback image references, image verification and the retry after a rollback;
 base `main` `20f46cb3`); before that on 2026-10-17, on
 commit `3e1fdcb2` (PR #11 merged, the last code PR of `v0.127.0-poli.2`) plus the e2e commit
 `b26d341f` of `fork/release-poli2`. Base: upstream
-`kimdre/doco-cd` `v0.127.0` (`772ed15`). Binding design: the Portico spec
+`kimdre/doco-cd` `v0.129.0` (`6216106f`), before that `v0.127.0` (`772ed15`). Binding design: the Portico spec
 `docs/superpowers/specs/2026-10-15-portico-v2-doco-cd-fork-design.md` in
 `lucapolignone/portico`, with the errata of 2026-10-17, and for `poli.2` the specs 3c, 4 and 5 of
 Portico v2 with the errata listed at the end of this file. This file describes the product (layers,
@@ -32,7 +33,8 @@ Smaller fork files in upstream packages: `internal/filesystem/atomic_write.go`,
 `internal/stages/fork_{policy,rollback,outcome}.go`. Added by `poli.2`:
 `internal/docker/fork_secret_gate.go`, `internal/git/fork_content_key.go` (`TreeHashAt`),
 `internal/secretprovider/openbao/fork_token_reload.go`,
-`internal/stages/fork_{secrets,content_key}.go`. In the fork packages, `poli.2` also changes
+`internal/stages/fork_{secrets,content_key}.go`. Added by the `v0.129.0` merge:
+`internal/docker/fork_failure_restore.go` (`RestoreForkFailure`). In the fork packages, `poli.2` also changes
 `internal/composepolicy/{check,file}.go` (the `secret_allowlist` and `logging` keys, `checkLogging`
 in `checkService`) and `internal/rollback/{store,lastgood}.go` (failure store version 2 with
 `content_key`, last good still version 1).
@@ -60,7 +62,13 @@ Per-target rollback is the deploy config key `rollback` (`deploy.RollbackConfig`
 - `internal/stages/run.go`: stage functions of the deploy and destroy orders, target lock
   release, last good and success outcome before/after `clearDeploymentFailure`, rollback and
   failure outcome in `handleStageFailure`, disk failure in `recordDeploymentFailure` and
-  `lastDeploymentFailure`;
+  `lastDeploymentFailure`. Since `v0.129.0` the upstream failure store
+  (`docker.DeploymentFailures`) is keyed by the full `DeploymentTarget` (context, stack,
+  repository, config source, config target) and owns the retry budget: the fork writes to disk
+  the failure that `DeploymentAttempt.Fail` recorded (with its `failed_at`, but the full error,
+  redacted before truncation), skips the disk when an interruption kept the recorded failure, and
+  after a restart puts the disk record back under the full target with `RestoreForkFailure`;
+  `runForkRollback` reads it by the same target;
 - `internal/stages/stage_2_pre-deploy.go`: poison skip after `lastDeploymentFailure`,
   `forkRetryRecreates` in the retry's force recreate,
   `checkForkPolicies` right after `docker.LoadCompose` in `loadComposeProjectHash`,
@@ -72,8 +80,9 @@ Per-target rollback is the deploy config key `rollback` (`deploy.RollbackConfig`
   (`withForkJobGateObject`, only while `ForkSecretGate` is set), and `checkForkSecretGate` right
   before `ResolveSecretReferences` in `prepareComposeScheduledDeployConfig`;
 - `internal/secretprovider/secretprovider.go`, `internal/secretprovider/openbao/{client,config}.go`:
-  `EnableTokenReload`, the `SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD` key, `refreshToken` and
-  `retryOnForbidden` around the OpenBao calls;
+  `EnableTokenReload` after the upstream `NewProviderWithConfig`, the
+  `SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD` key, `refreshToken`, `retryOnForbidden` around the
+  OpenBao reads, and the upstream `namespaceClient` taking its copy through `nsClient`/`nsIssuer`;
 - `internal/api/*.go` and `internal/mcp/*.go`: `ValidateApiKey` replaced by
   `authenticate`/`authorize`, list filtering, the MCP per-tool authorization middleware;
 - `internal/controlplane/poll.go`: the `api` trigger marker;
@@ -181,12 +190,16 @@ compare a literal prefix.
 (`sanitizeKeyMod`) starts with `COM_DOCKER_COMPOSE_` is denied. The violations are ordinary
 policy violations: `policy_denied` in pre-deploy, `rollback_failed` on the last good.
 
-**Token reload (`poli.2`).** With `SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD=true` every public
-method of the OpenBao provider stats the token file first (`refreshToken`, under a mutex) and
-swaps the token of both clients when mtime or size changed. An empty or unreadable file keeps the
-token in use and logs one ERROR per distinct failure, and one line on recovery. A 403 on an
-idempotent read re-reads the file once and retries once (`retryOnForbidden`); `pki-role`
-issuance is never retried.
+**Token reload (`poli.2`).** Since `v0.129.0` upstream reads `SECRET_PROVIDER_ACCESS_TOKEN_FILE`
+before every OpenBao operation (`accessTokenFile`, `namespaceClient`) and fails the operation
+when the file is missing, empty or not decodable. With `SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD=true`
+the fork's reload replaces that read (`EnableTokenReload` sets `tokenFile` to nil): every public
+method of the provider stats the token file first (`refreshToken`, under a mutex) and swaps the
+token of both clients when mtime or size changed, parsing it with the upstream
+`parseAccessToken` (trim, SOPS). An empty, unreadable or undecodable file keeps the token in use
+and logs one ERROR per distinct failure, and one line on recovery. A 403 on an idempotent read
+re-reads the file once and retries once (`retryOnForbidden`); `pki-role` issuance is never
+retried. Without the key the behaviour is upstream's.
 
 **Poison by content (`poli.2`).** With `rollback.unblock_on: content`, the failure record carries
 `content_key` = `tree:<git tree hash of working_dir at the failed commit, from the deploy
@@ -212,7 +225,10 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   cross `/`. With a compose policy an object is accepted only if the `targets` entry binds it to
   the repository that holds the deploy config.
 - **Lock order.** Deployment limiters (pre-deploy and mutation admission) → fork target lock →
-  `lock.LockStack` (inside `DeployStack`). The holder of the target lock never waits for a
+  `lock.LockStack` (inside `DeployStack`). Since `v0.129.0`, with `retry` configured, the upstream
+  retry lock (`DeploymentFailures.Acquire`, per `DeploymentTarget`) is taken at the start of
+  pre-deploy, so before the fork target lock, and released after it; nothing takes the retry
+  lock while holding the fork target lock. The holder of the target lock never waits for a
   limiter and nothing takes the target lock while holding `LockStack`. A job that gives up
   waiting for the target lock records nothing.
 - **Redaction before truncation.** The error of a failure is redacted of the
@@ -302,6 +318,15 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   stack until it changes, and its jobs keep the last verdict of this process.
 - Unblock exists only on REST, not MCP. `API_KEY_ENABLED=false` without JWT or RBAC starts and
   closes the API.
+- With the deploy config key `retry` (upstream `v0.129.0`) the budget also applies after a
+  rollback or an unblock: the record goes back to `failed` with the same desired state, so an
+  automatic retry may be suppressed (`delay`, `budget_exhausted`); a manual trigger (API, MCP)
+  bypasses it. After a restart the restored failure carries only the revision, so the budget
+  starts again, as upstream after a restart.
+- Since `v0.129.0` direct start and restart operations reload the deployed project for Compose
+  hooks through `loadComposeScheduledProject`, hence through the job gate: on an object without a
+  verdict in this process the load is refused and the service starts without its hooks (one Warn),
+  as before `v0.129.0`.
 - `HTTP_BIND_ADDRESS` and `METRICS_BIND_ADDRESS` choose the IP the API and the metrics server bind
   to; empty (the default) binds every interface, as upstream. Only a literal IP is accepted: a
   hostname would be resolved once at startup. With a specific API address the container

@@ -45,6 +45,7 @@ var (
 var ErrInvalidSecretReference = errors.New("invalid secret reference")
 
 type Provider struct {
+	// Client keeps the startup token. With a token file, operations use copies with the current token.
 	Client *openbao.Client
 
 	// issuer is used for non-idempotent certificate issuance and has client-side retries disabled,
@@ -55,6 +56,10 @@ type Provider struct {
 	// against every WithNamespace copy, taken only through nsClient and nsIssuer.
 	reload  *tokenReload
 	tokenMu sync.RWMutex
+
+	// tokenFile is nil when the token comes from SECRET_PROVIDER_ACCESS_TOKEN.
+	// Fork: also nil with SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD, where reload replaces it.
+	tokenFile *accessTokenFile
 }
 
 // pkiCertValues holds the resolved values of a read-only pki reference: the leaf certificate and
@@ -91,6 +96,58 @@ func NewProvider(_ context.Context, address, token string) (*Provider, error) {
 	return &Provider{Client: client, issuer: issuer}, nil
 }
 
+// NewProviderWithConfig creates a Provider from cfg.
+// With a token file, it keeps the file so later operations can read rotated tokens.
+func NewProviderWithConfig(ctx context.Context, cfg *Config) (*Provider, error) {
+	var tokenFile *accessTokenFile
+
+	token := cfg.AccessToken
+	if cfg.AccessTokenFile != "" {
+		var err error
+
+		tokenFile = newAccessTokenFile(cfg.AccessTokenFile)
+
+		token, err = tokenFile.Token()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	provider, err := NewProvider(ctx, cfg.SiteUrl, token)
+	if err != nil {
+		return nil, err
+	}
+
+	provider.tokenFile = tokenFile
+
+	return provider, nil
+}
+
+// namespaceClient returns a new OpenBao client for the given namespace,
+// optionally using the issuer client for certificate issuance.
+func (p *Provider) namespaceClient(namespace string, issuance bool) (*openbao.Client, error) {
+	// Fork: the copy is taken under the token lock of the reload (nsClient, nsIssuer).
+	var c *openbao.Client
+	if issuance {
+		c = p.nsIssuer(namespace)
+	} else {
+		c = p.nsClient(namespace)
+	}
+
+	if p.tokenFile != nil {
+		token, err := p.tokenFile.Token()
+		if err != nil {
+			return nil, err
+		}
+
+		// Each operation owns its token and namespace. Shared clients stay unchanged.
+		c.SetToken(token)
+	}
+
+	return c, nil
+}
+
+// newClient creates a new OpenBao client with the given address and token.
 func newClient(address, token string) (*openbao.Client, error) {
 	config := openbao.DefaultConfig()
 	config.Address = address
@@ -112,6 +169,7 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 
+	// Fork: with the reload on, swap the token first if the file changed.
 	p.refreshToken()
 
 	var strValue string
@@ -121,9 +179,12 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		var serial string
 
 		err = p.retryOnForbidden(ctx, func() error {
-			var rerr error
+			c, rerr := p.namespaceClient(namespace, false)
+			if rerr != nil {
+				return rerr
+			}
 
-			serial, rerr = GetCertSerial(ctx, p.nsClient(namespace), engineName, id)
+			serial, rerr = GetCertSerial(ctx, c, engineName, id)
 
 			return rerr
 		})
@@ -132,9 +193,12 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		}
 
 		err = p.retryOnForbidden(ctx, func() error {
-			var rerr error
+			c, rerr := p.namespaceClient(namespace, false)
+			if rerr != nil {
+				return rerr
+			}
 
-			strValue, rerr = GetCert(ctx, p.nsClient(namespace), engineName, serial)
+			strValue, rerr = GetCert(ctx, c, engineName, serial)
 
 			return rerr
 		})
@@ -143,7 +207,12 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		}
 
 	case "pki-role":
-		issued, err := IssueCert(ctx, p.nsIssuer(namespace), engineName, key, id)
+		c, err := p.namespaceClient(namespace, true)
+		if err != nil {
+			return "", err
+		}
+
+		issued, err := IssueCert(ctx, c, engineName, key, id)
 		if err != nil {
 			return "", fmt.Errorf("%w: failed to issue certificate for common name %s using role %s: %w", secrettypes.ErrNotRetryable, id, key, err)
 		}
@@ -152,9 +221,12 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 
 	case "kv":
 		err = p.retryOnForbidden(ctx, func() error {
-			var rerr error
+			c, rerr := p.namespaceClient(namespace, false)
+			if rerr != nil {
+				return rerr
+			}
 
-			strValue, rerr = GetSecret(ctx, p.nsClient(namespace), engineName, id, key)
+			strValue, rerr = GetSecret(ctx, c, engineName, id, key)
 
 			return rerr
 		})
@@ -368,9 +440,12 @@ func (p *Provider) DeploymentHasRevokedCertificate(ctx context.Context, certStat
 			var serials []string
 
 			err := p.retryOnForbidden(ctx, func() error {
-				var rerr error
+				c, rerr := p.namespaceClient(namespace, false)
+				if rerr != nil {
+					return rerr
+				}
 
-				serials, rerr = ListRevokedCertSerials(ctx, p.nsClient(namespace), engineName)
+				serials, rerr = ListRevokedCertSerials(ctx, c, engineName)
 
 				return rerr
 			})
@@ -433,7 +508,11 @@ func (p *Provider) resolvePKICerts(ctx context.Context, refs map[string]string) 
 				return
 			}
 
-			c := p.nsClient(namespace)
+			c, err := p.namespaceClient(namespace, false)
+			if err != nil {
+				fail(err)
+				return
+			}
 
 			serial, err := GetCertSerial(ctx, c, engineName, commonName)
 			if err != nil {
@@ -495,7 +574,18 @@ func (p *Provider) issuePKIRoleCerts(ctx context.Context, refs map[string]string
 				return
 			}
 
-			cert, err := IssueCert(ctx, p.nsIssuer(namespace), engineName, roleName, commonName)
+			c, err := p.namespaceClient(namespace, true)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("%w: load certificate issuance credentials: %w", secrettypes.ErrNotRetryable, err):
+					cancel()
+				default:
+				}
+
+				return
+			}
+
+			cert, err := IssueCert(ctx, c, engineName, roleName, commonName)
 			if err != nil {
 				select {
 				case errCh <- fmt.Errorf("%w: failed to issue certificate for common name %s: %w", secrettypes.ErrNotRetryable, commonName, err):

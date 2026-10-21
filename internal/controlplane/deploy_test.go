@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
@@ -19,19 +20,92 @@ import (
 	"github.com/kimdre/doco-cd/internal/source"
 	"github.com/kimdre/doco-cd/internal/stages"
 	"github.com/kimdre/doco-cd/internal/syncwindow"
+	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
 type fakeSourcePreparer struct {
 	result source.Result
 	err    error
 
-	calls int
+	calls   int
+	lastReq source.Request
 }
 
-func (f *fakeSourcePreparer) Prepare(_ context.Context, _ source.Request) (source.Result, error) {
+func (f *fakeSourcePreparer) Prepare(_ context.Context, req source.Request) (source.Result, error) {
 	f.calls++
+	f.lastReq = req
 
 	return f.result, f.err
+}
+
+func TestDeploy_CleanupRefreshResolvesCurrentSourceWithoutRedeploying(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType: config.SourceTypeGit, RepoName: "owner/repo", Revision: "first", OCITrusted: true,
+	}}
+	reconciler := &fakeReconciler{}
+	deployment := newTestDeployment(t, preparer, reconciler)
+	request := validDeploymentRequest()
+	request.Ref = "main"
+	request.Payload.CommitSHA = plumbing.NewHash("0123456789abcdef0123456789abcdef01234567")
+	request.Payload.Digest = "old-digest"
+
+	request.Payload.Trigger = request.Payload.CommitSHA.String()
+	if err := deployment.Deploy(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	preparer.result.Revision = "current"
+
+	refreshed, release, err := reconciler.lastReq.RefreshCleanup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	if preparer.calls != 2 || reconciler.calls != 1 || refreshed.Repository.Revision != "current" ||
+		refreshed.RefreshCleanup == nil {
+		t.Fatalf("cleanup refresh redeployed or reused old source: %+v", refreshed.Repository)
+	}
+
+	if got := preparer.lastReq.Payload; got.CommitSHA != plumbing.ZeroHash || got.Digest != "" || got.Trigger != "" {
+		t.Fatalf("cleanup refresh pinned to old webhook: %+v", got)
+	}
+
+	if preparer.lastReq.Ref != "main" || refreshed.Origin != "" {
+		t.Fatal("cleanup refresh lost its reference or kept a manual override")
+	}
+}
+
+func TestDeploy_CleanupRefreshKeepsResolvedDefaultReference(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType: config.SourceTypeGit, RepoName: "owner/repo", Revision: "first",
+		Payload: webhook.ParsedPayload{Ref: "refs/heads/main"},
+	}}
+	reconciler := &fakeReconciler{}
+
+	deployment := newTestDeployment(t, preparer, reconciler)
+	if err := deployment.Deploy(t.Context(), validDeploymentRequest()); err != nil {
+		t.Fatal(err)
+	}
+
+	if reconciler.lastReq.Repository.ResolvedReference != "refs/heads/main" {
+		t.Fatal("cleanup scope lost the resolved default reference")
+	}
+
+	refreshed, release, err := reconciler.lastReq.RefreshCleanup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	if preparer.lastReq.Ref != "refs/heads/main" ||
+		refreshed.Repository.ResolvedReference != reconciler.lastReq.Repository.ResolvedReference {
+		t.Fatal("cleanup refresh changed the resolved default reference")
+	}
 }
 
 type fakeReconciler struct {
@@ -504,6 +578,25 @@ func TestDeploy_ReportsPollSyncWindowDeferral(t *testing.T) {
 		err := d.Deploy(t.Context(), req)
 		if got, ok := errors.AsType[*stages.SyncWindowBlockedError](err); !ok || got != blocked {
 			t.Fatalf("%s: Deploy() error = %v, want the sync window error", trigger, err)
+		}
+	}
+}
+
+func TestDeploy_PreservesRetrySuppression(t *testing.T) {
+	t.Parallel()
+
+	for _, trigger := range []stages.JobTrigger{stages.JobTriggerPoll, stages.JobTriggerWebhook} {
+		preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+		suppressed := &stages.RetrySuppressedError{Stacks: []stages.RetrySuppressedStack{{
+			Name: "stack", Revision: "failed", Reason: "budget_exhausted",
+		}}}
+		d := newTestDeployment(t, preparer, &fakeReconciler{err: suppressed})
+		req := validDeploymentRequest()
+		req.JobTrigger = trigger
+
+		err := d.Deploy(t.Context(), req)
+		if err != suppressed {
+			t.Fatalf("%s: Deploy() = %v, want original suppression", trigger, err)
 		}
 	}
 }

@@ -73,7 +73,7 @@ func TestTokenReloadDecryptsSOPS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err = os.WriteFile(path, encrypted, 0o600); err != nil {
+	if err = os.WriteFile(path, encrypted, 0o600); err != nil { // #nosec G703 -- the path is inside t.TempDir.
 		t.Fatal(err)
 	}
 

@@ -425,7 +425,9 @@ func (s *StageManager) runForkRollback(ctx context.Context, stageName StageName,
 		return false
 	}
 
-	mem, ok := docker.GetDeploymentFailure(s.Repository.Name, s.DeployConfig.Name)
+	// The failure recordDeploymentFailure just recorded, under the full upstream target (context,
+	// repository, config source and target), not only repository and stack.
+	mem, ok := docker.DeploymentFailures.Get(s.deploymentFailureTarget())
 	if !ok {
 		return false
 	}

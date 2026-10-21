@@ -1668,6 +1668,60 @@ func TestGetServiceSchedulerLabels(t *testing.T) {
 	})
 }
 
+func TestPrepareComposeScheduledHookProject(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		policy string
+		want   string
+	}{
+		{policy: "", want: types.PullPolicyMissing},
+		{policy: types.PullPolicyMissing, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyIfNotPresent, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyAlways, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyRefresh, want: types.PullPolicyMissing},
+		{policy: "daily", want: types.PullPolicyMissing},
+		{policy: "every_12h", want: types.PullPolicyMissing},
+		{policy: types.PullPolicyNever, want: types.PullPolicyNever},
+		{policy: types.PullPolicyBuild, want: types.PullPolicyBuild},
+	} {
+		t.Run("policy "+tt.policy, func(t *testing.T) {
+			t.Parallel()
+
+			project := &types.Project{
+				Name:         "stack",
+				WorkingDir:   "/stacks/stack",
+				ComposeFiles: []string{"/stacks/stack/compose.yaml"},
+				Services: types.Services{
+					"backup": {
+						Name: "backup",
+						ContainerSpec: types.ContainerSpec{
+							Image:        "alpine:3.22",
+							PullPolicy:   tt.policy,
+							CustomLabels: map[string]string{"user": "label"},
+						},
+						PreStart: []types.PreStartHook{{}},
+					},
+				},
+			}
+
+			prepareComposeScheduledHookProject(project, "backup")
+
+			svc := project.Services["backup"]
+			if svc.PullPolicy != tt.want {
+				t.Fatalf("pull policy = %q, want %q", svc.PullPolicy, tt.want)
+			}
+
+			if svc.CustomLabels["user"] != "label" ||
+				svc.CustomLabels[api.ProjectLabel] != "stack" ||
+				svc.CustomLabels[api.ServiceLabel] != "backup" ||
+				svc.CustomLabels[api.OneoffLabel] != "False" {
+				t.Fatalf("missing Compose tracking labels: %v", svc.CustomLabels)
+			}
+		})
+	}
+}
+
 func TestPrepareComposeProjectForOneOffRun(t *testing.T) {
 	t.Parallel()
 
@@ -1751,6 +1805,23 @@ func TestPrepareComposeProjectForOneOffRun(t *testing.T) {
 		_, err := prepareComposeProjectForOneOffRun(project, "missing")
 		if err == nil {
 			t.Fatal("expected error for missing service, got nil")
+		}
+	})
+
+	t.Run("rejects pre_start before preparing an execution", func(t *testing.T) {
+		t.Parallel()
+
+		project := &types.Project{Services: types.Services{
+			"backup": {Name: "backup", PreStart: []types.PreStartHook{{}}},
+		}}
+
+		got, err := prepareComposeProjectForOneOffRunWithOptions(project, "backup", ComposeOneOffOptions{RunID: "run"})
+		if !errors.Is(err, ErrComposeOneOffPreStartUnsupported) || got != nil {
+			t.Fatalf("one-off project = %v, error = %v, want unsupported pre_start", got, err)
+		}
+
+		if project.Services["backup"].Labels[DocoCDJobLabels.JobEphemeral] != "" {
+			t.Fatal("rejected execution mutated the source")
 		}
 	})
 }

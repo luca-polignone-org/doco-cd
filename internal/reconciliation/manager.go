@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/container"
@@ -47,11 +48,11 @@ type Dependencies struct {
 	AppConfig      *app.Config             `validate:"required,nostructlevel"`
 	DataMountPoint container.MountPoint    `validate:"required"`
 	DockerCLI      command.Cli             `validate:"required,nostructlevel"`
-	Contexts       *docker.ContextRegistry `validate:"required"`
+	Contexts       *docker.ContextRegistry `validate:"required,nostructlevel"`
 	// A nil SecretProvider means no external secret provider is configured.
-	SecretProvider secretprovider.SecretProvider
-	Notifier       notification.Sender `validate:"required,nostructlevel"`
-	RuntimeQueries RuntimeQueries
+	SecretProvider secretprovider.SecretProvider `validate:"omitempty,nostructlevel"`
+	Notifier       notification.Sender           `validate:"required,nostructlevel"`
+	RuntimeQueries RuntimeQueries                `validate:"omitempty,nostructlevel"`
 }
 
 // RuntimeQueries is the read-only Docker query surface used by reconciliation.
@@ -78,6 +79,7 @@ func (dockerRuntimeQueries) ListManagedRepositoryServices(ctx context.Context, a
 // Manager owns reconciliation jobs, active-deployment tracking, scheduler
 // holds, and deployment admission state.
 type Manager struct {
+	cleanupRetries   cleanupRetryState
 	jobs             jobRegistry
 	deployments      deploymentTracker
 	schedulerHolds   schedulerHoldRegistry
@@ -104,6 +106,9 @@ type Manager struct {
 	projectSkips    *stages.ProjectSkipCache
 	// syncWindowNotices deduplicates reports of deployments deferred by sync windows.
 	syncWindowNotices syncWindowNotices
+	pauses            pauseRegistry
+	// loadHookService replaces the Compose lifecycle hook loader in tests.
+	loadHookService func(ctx context.Context, log *slog.Logger, cli command.Cli, labels map[string]string) (types.ServiceConfig, bool)
 }
 
 // NewManager validates dependencies and creates an isolated reconciliation manager.
@@ -153,16 +158,29 @@ type contextCLIEntry struct {
 // unique test name. Stable application dependencies (app config, Docker CLI, context registry,
 // secret provider) live on the Manager itself instead; see Dependencies.
 type DeployRequest struct {
-	Logger        *slog.Logger `validate:"required,nostructlevel"`
-	Metadata      notification.Metadata
-	JobTrigger    stages.JobTrigger `validate:"required,oneof=webhook poll"`
-	Repository    stages.RepositoryData
-	DeployConfigs []*deployConfig.Config `validate:"dive,required"`
-	Payload       *webhook.ParsedPayload
-	TestName      string
+	Logger               *slog.Logger `validate:"required,nostructlevel"`
+	Metadata             notification.Metadata
+	JobTrigger           stages.JobTrigger `validate:"required,oneof=webhook poll"`
+	Repository           stages.RepositoryData
+	ConfigTarget         string
+	DeployConfigs        []*deployConfig.Config `validate:"dive,required"`
+	AutoDiscoveryOrigins []deployConfig.AutoDiscoveryOrigin
+	RefreshCleanup       func(context.Context) (DeployRequest, func(), error)
+	Payload              *webhook.ParsedPayload
+	TestName             string
 	// Origin decides how sync windows apply to the request. Empty means
 	// syncwindow.OriginAutomatic.
-	Origin syncwindow.Origin `validate:"omitempty,oneof=automatic manual reconciliation"`
+	Origin          syncwindow.Origin `validate:"omitempty,oneof=automatic manual reconciliation"`
+	pauseGeneration uint64
+}
+
+// key returns the job registry key for the request's repository and config target.
+func (r DeployRequest) key() string {
+	if target := strings.TrimSpace(r.ConfigTarget); target != "" {
+		return r.Repository.Name + "\x00" + target
+	}
+
+	return r.Repository.Name
 }
 
 type job struct {
@@ -219,7 +237,7 @@ func newJob(manager *Manager, info DeployRequest, deployConfigGroupByEvent map[s
 
 func newReconciliationJob(manager *Manager, req DeployRequest, deferred map[*deployConfig.Config]struct{}, previous *job) *job {
 	info, carried, pinned := reconciliationJobInfo(req, deferred, previous)
-	j := newJob(manager, req, getDeployConfigGroupByEvent(info.DeployConfigs))
+	j := newJob(manager, req, manager.recoveryGroupByEvent(info, info.DeployConfigs))
 	j.info = info
 	j.carried = carried
 	j.pinned = pinned
@@ -300,6 +318,7 @@ func (m *Manager) Close() {
 		m.lifecycleMu.Lock()
 		m.closed = true
 		m.lifecycleMu.Unlock()
+		m.stopCleanupRetries()
 		m.deployWG.Wait()
 
 		jobs := m.jobs.removeAll()
@@ -564,6 +583,10 @@ func (m *Manager) addJob(ctx context.Context, req DeployRequest, deferred map[*d
 ) {
 	deferred = withWebhookFilteredConfigs(req, deferred)
 
+	if m.newerPauseObservation(req) && len(forcedDeployments) == 0 {
+		return
+	}
+
 	var (
 		checked *job
 		stale   bool
@@ -577,7 +600,7 @@ func (m *Manager) addJob(ctx context.Context, req DeployRequest, deferred map[*d
 			return
 		}
 
-		old := m.jobs.jobs[req.Repository.Name]
+		old := m.jobs.jobs[req.key()]
 		if old == nil {
 			stale = false
 			break
@@ -603,23 +626,60 @@ func (m *Manager) addJob(ctx context.Context, req DeployRequest, deferred map[*d
 		checked = old
 	}
 
-	old := m.jobs.jobs[req.Repository.Name]
+	old := m.jobs.jobs[req.key()]
+	if m.newerPauseObservation(req) && len(forcedDeployments) == 0 {
+		m.jobs.mu.Unlock()
+		return
+	}
 
-	if stale {
-		req, deferred = forcedRollbackRequest(req, old, forcedDeployments)
+	if stale || m.newerPauseObservation(req) {
+		if old != nil {
+			req, deferred = forcedRollbackRequest(req, old, forcedDeployments)
+		} else {
+			configs := make([]*deployConfig.Config, 0, len(forcedDeployments))
+			for _, dc := range req.DeployConfigs {
+				if _, deployed := forcedDeployments[dc]; deployed {
+					configs = append(configs, dc)
+				}
+			}
+
+			req.DeployConfigs = configs
+		}
+	}
+
+	req = m.withPausedRootConfigs(req, old)
+	for _, dc := range req.DeployConfigs {
+		if _, deployed := forcedDeployments[dc]; deployed {
+			delete(deferred, dc)
+			continue
+		}
+
+		if m.pauseFor(req, dc) {
+			if deferred == nil {
+				deferred = make(map[*deployConfig.Config]struct{})
+			}
+
+			deferred[dc] = struct{}{}
+		}
 	}
 
 	newJob := newReconciliationJob(m, req, deferred, old)
+
+	newJob.cleanupConfigs = m.currentCleanupRequest(req).DeployConfigs
 	if len(newJob.deployConfigGroupByEvent) == 0 {
-		if stale {
-			delete(m.jobs.jobs, req.Repository.Name)
+		if m.hasPause(req) {
+			if m.jobs.jobs == nil {
+				m.jobs.jobs = make(map[string]*job)
+			}
+
+			m.jobs.jobs[req.key()] = newJob
+		} else {
+			delete(m.jobs.jobs, req.key())
 		}
 
 		m.jobs.mu.Unlock()
-
-		if stale {
-			old.close()
-		}
+		old.close()
+		newJob.signalReady()
 
 		return
 	}
@@ -628,7 +688,7 @@ func (m *Manager) addJob(ctx context.Context, req DeployRequest, deferred map[*d
 	newJob.cancel = cancel
 
 	m.jobWG.Add(1)
-	m.jobs.jobs[req.Repository.Name] = newJob
+	m.jobs.jobs[req.key()] = newJob
 	m.jobs.mu.Unlock()
 
 	old.close()

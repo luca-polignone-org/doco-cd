@@ -108,6 +108,16 @@ and then re-/started at the scheduled time without being removed after completio
     `configs` are applied when the job starts. Restart-mode services must have an effective scale of `1`; use
     [`one_off`](#one_off) for a multi-replica workload.
 
+    For a stopped service with `pre_start` hooks, doco-cd prepares fresh hook runners before each execution
+    without recreating the job's source container. This step pulls only missing images, even if the service
+    sets a `pull_policy` such as `always`. A failed hook prevents the workload from starting and is
+    retained for inspection. The next execution prepares fresh runners, so a failed hook can be retried.
+
+    An already running container is restarted like with `docker compose restart`: its `pre_stop` hooks run
+    before the restart and its `post_start` hooks run after it, but `pre_start` hooks do not run.
+    A failed `pre_stop` hook cancels the restart. A failed `post_start` hook fails the execution, but the
+    workload keeps running. See [Compose lifecycle hooks](Pre-Post-Deployment-Scripts.md#when-doco-cd-runs-lifecycle-hooks).
+
 !!! warning "Docker Swarm `global` + `restart` limitation"
     In Docker Swarm, restart-mode scheduled jobs are deployed with `0` replicas so they do not run on deployment.
     `global` services cannot be scaled to `0` (a global service always runs one task per node), so a `global` service
@@ -117,6 +127,12 @@ and then re-/started at the scheduled time without being removed after completio
 
 Alternatively, you can configure scheduled jobs to run in `one_off` mode, which means a new ephemeral container will
 be created for each scheduled run and removed after completion and reporting.
+
+!!! warning "`pre_start` hooks require `restart` mode"
+    Docker Compose's one-off API does not execute [`pre_start` lifecycle hooks](Pre-Post-Deployment-Scripts.md#compose-lifecycle-hooks). doco-cd rejects standalone scheduled
+    services that combine `one_off` with `pre_start`, both during deployment and before an execution.
+    Use `#!yaml cd.doco.job.execution_mode: "restart"` if the workload needs these hooks. `post_start` hooks
+    remain supported by Compose's one-off API.
 
 !!! note
     You won't be able to see the container or its logs after the job has completed,
@@ -230,6 +246,8 @@ Behavior:
 - After the job finishes (success or failure), listed services are started again.
 - `service` targets the same project/stack as the job.
 - `project/service` targets another compose project (standalone) or stack (swarm).
+- Standalone compose: the [Compose lifecycle hooks](Pre-Post-Deployment-Scripts.md#when-doco-cd-runs-lifecycle-hooks) of the listed services run like with `docker compose stop` and `docker compose start`.
+  If a `pre_stop` hook fails, its container keeps running and the job does not run.
 
 !!! info "Execution mode support"
     `cd.doco.job.stop_services` is supported in both execution modes for **standalone compose**:

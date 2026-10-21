@@ -28,6 +28,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/migration"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/selfupdate"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 
@@ -40,6 +41,7 @@ var (
 	ErrNotManagedByDocoCD = errors.New("stack is not managed by doco-cd")
 	ErrDeploymentConflict = errors.New("another stack with the same name already exists and is not managed by this repository")
 	ErrSkipDeployment     = errors.New("deployment skipped") // Special error to indicate deployment was skipped, not an actual failure/error
+	ErrDeploymentPaused   = fmt.Errorf("deployment paused: %w", ErrSkipDeployment)
 
 	// ErrWebhookFilterMismatch is returned when the deployment is skipped because
 	// the webhook ref does not match the configured webhook_filter. It wraps
@@ -275,6 +277,7 @@ type StageManager struct {
 	Log            *slog.Logger
 	JobID          string     // Unique identifier for the job
 	JobTrigger     JobTrigger // Trigger type for the job (e.g., "webhook", "poll")
+	Origin         syncwindow.Origin
 	AppConfig      *app.Config
 	DeployConfig   *deploy.Config
 	DeployState    *DeploymentState
@@ -305,6 +308,8 @@ type StageManager struct {
 	// inProgressPosted is set once the deployment's "In Progress" commit
 	// status was posted, which phase updates then refine.
 	inProgressPosted bool
+	retryAttempt     *docker.DeploymentAttempt
+	retryDesired     *docker.DeploymentDesiredState
 	// shortCommit memoizes the short form of the commit SHA shown in
 	// notifications, so a deployment computes it once rather than per message.
 	shortCommitMu sync.Mutex
@@ -349,8 +354,8 @@ type Dependencies struct {
 	// on-disk leftovers left behind after migration (see internal/migration). Both are optional;
 	// a nil Contexts disables the retry entirely, and a nil LeftoverTracker just disables the
 	// in-memory short-circuit for repositories already confirmed clean.
-	Contexts        *docker.ContextRegistry `validate:"omitempty,nostructlevel"`
-	LeftoverTracker *migration.LeftoverTracker
+	Contexts        *docker.ContextRegistry    `validate:"omitempty,nostructlevel"`
+	LeftoverTracker *migration.LeftoverTracker `validate:"omitempty,nostructlevel"`
 }
 
 // RunInput holds the per-deployment input for a single StageManager run: the job identity and
@@ -359,15 +364,16 @@ type Dependencies struct {
 type RunInput struct {
 	Log          *slog.Logger `validate:"required,nostructlevel"`
 	JobID        string
-	JobTrigger   JobTrigger      `validate:"required,oneof=webhook poll"`
+	JobTrigger   JobTrigger `validate:"required,oneof=webhook poll"`
+	Origin       syncwindow.Origin
 	Repository   *RepositoryData `validate:"required,nostructlevel"`
 	Docker       *Docker         `validate:"required,nostructlevel"`
 	Payload      *webhook.ParsedPayload
 	DeployConfig *deploy.Config `validate:"required,nostructlevel"`
 	Metadata     notification.Metadata
-	GitChanges   *GitChangeCache
-	GitAncestry  *GitAncestryCache
-	ProjectSkips *ProjectSkipCache
+	GitChanges   *GitChangeCache   `validate:"omitempty,nostructlevel"`
+	GitAncestry  *GitAncestryCache `validate:"omitempty,nostructlevel"`
+	ProjectSkips *ProjectSkipCache `validate:"omitempty,nostructlevel"`
 }
 
 // NewStageManager validates dependencies and run, then creates and initializes a new
@@ -385,6 +391,7 @@ func NewStageManager(dependencies Dependencies, run RunInput) (*StageManager, er
 		Log:             run.Log.With(),
 		JobID:           run.JobID,
 		JobTrigger:      run.JobTrigger,
+		Origin:          run.Origin,
 		AppConfig:       dependencies.AppConfig,
 		DeployConfig:    run.DeployConfig,
 		DeployState:     &DeploymentState{},

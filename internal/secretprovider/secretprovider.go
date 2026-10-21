@@ -117,7 +117,9 @@ func Initialize(ctx context.Context, provider, version string) (SecretProvider, 
 
 		var bao *openbao.Provider
 
-		bao, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken)
+		bao, err = openbao.NewProviderWithConfig(ctx, cfg)
+		// Fork: with SECRET_PROVIDER_ACCESS_TOKEN_FILE_RELOAD the fork reload replaces the
+		// upstream per-operation read of the token file.
 		if err == nil && cfg.AccessTokenFileReload {
 			err = bao.EnableTokenReload(cfg.AccessTokenFilePath)
 		}

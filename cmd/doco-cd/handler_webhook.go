@@ -325,8 +325,8 @@ func repositoryNameFromWebhookPayload(payload webhook.ParsedPayload) string {
 
 // postSkippedWebhookCommitStatus reports a webhook run skipped with
 // skipErr, explaining the reason for each stack if known.
-func postSkippedWebhookCommitStatus(ctx context.Context, appConfig *app.Config, log *slog.Logger, payload webhook.ParsedPayload, skipErr error) {
-	if appConfig == nil {
+func postSkippedWebhookCommitStatus(ctx context.Context, appConfig *app.Config, log *slog.Logger, payload webhook.ParsedPayload, customTarget string, skipErr error) {
+	if appConfig == nil || errors.Is(skipErr, stages.ErrRetrySuppressed) {
 		return
 	}
 
@@ -345,7 +345,7 @@ func postSkippedWebhookCommitStatus(ctx context.Context, appConfig *app.Config, 
 		ProviderOverride: appConfig.GitScmProvider,
 		APIBaseURL:       string(appConfig.GitScmApiUrl),
 		AccessToken:      appConfig.GitAccessToken,
-		ContextName:      commitstatus.DeployContext,
+		ContextName:      commitstatus.ContextForRun(customTarget),
 	})
 	if !ok {
 		return
@@ -521,6 +521,14 @@ func handleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		Deployments:  matchingInlineWebhookDeployments(appConfig, payload, sourceRef, customTarget),
 		Payload:      payload,
 	})
+	if errors.Is(deployErr, stages.ErrRetrySuppressed) {
+		msg := deployErr.Error()
+		jobLog.Debug("deployment skipped by retry policy", slog.String("reason", msg))
+		restAPI.JSONResponse(w, msg, metadata.JobID, http.StatusAccepted)
+
+		return controlplane.SkippedRun(msg), nil
+	}
+
 	// Deferred stacks already posted their own pending commit status, which a
 	// generic "Skipped" success status would contradict.
 	if blocked, ok := errors.AsType[*stages.SyncWindowBlockedError](deployErr); ok {
@@ -536,7 +544,7 @@ func handleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 	}
 
 	if errors.Is(deployErr, stages.ErrSkipDeployment) {
-		postSkippedWebhookCommitStatus(ctx, appConfig, jobLog, payload, deployErr)
+		postSkippedWebhookCommitStatus(ctx, appConfig, jobLog, payload, customTarget, deployErr)
 	}
 
 	if errors.Is(deployErr, stages.ErrWebhookFilterMismatch) {
@@ -550,6 +558,10 @@ func handleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 
 	if errors.Is(deployErr, stages.ErrSkipDeployment) {
 		msg := "deployment skipped"
+		if errors.Is(deployErr, stages.ErrDeploymentPaused) {
+			msg = deployErr.Error()
+		}
+
 		elapsedTime := time.Since(startTime)
 		jobLog.Info(msg, slog.String("elapsed_time", elapsedTime.Truncate(time.Millisecond).String()))
 		restAPI.JSONResponse(w, msg, metadata.JobID, http.StatusAccepted)

@@ -55,6 +55,8 @@ state shared by parallel tests:
 | Changelog             | Real notifications, selected-target config changes, and pull-request merge attribution                                            |
 | Appended documents    | Plain additions, first encrypted addition, and later additions after decryption, preserving existing containers                   |
 | Scheduled status      | Uninterrupted automatic execution, dependency stop/restore, cleanup, failed-source isolation, manual execution, and API reporting |
+| Scheduled pre_start   | Unrelated webhook skips, repeated hooks without source recreation, hook failure/retry, and unsupported one-off rejection          |
+| Autostart drift       | Explicit and discovered stopped-service polling, cached skips, external start/stop, missing-container recovery, and config changes |
 | Self-update scale-out | Bootstrap adoption and labels, followed by healthy overlap and handover                                                           |
 
 Config decoding, successive artifact decryption, and detailed changelog filtering
@@ -66,6 +68,36 @@ process-crash windows retain their E2E coverage.
 
 Keep Swarm scheduled-job recovery serial: scheduler discovery scans the shared
 cluster, so different stack names do not isolate concurrent schedulers.
+
+`TestScheduledPreStart_UnrelatedWebhooks` uses an isolated remote Docker context
+and a label-based restart-mode job scheduled every 24 hours. A long poll interval
+allows the initial deployment but leaves both subsequent unrelated commits for
+real signed GitHub push webhooks. Each webhook's returned job ID is checked
+through the run API for a completed skip of the discovered stack. Docker
+inventory includes stopped containers (`All: true`), distinguishes hook runners
+by Compose's hook label, and checks that source and hook IDs, Created states,
+container counts, and deployment metadata remain unchanged. The scheduled job
+API must still report the real source with no last run. This catches hook runners
+incorrectly supplying deployment labels or replacing scheduled-job sources
+without executing the workload.
+
+The same scenario then triggers consecutive executions through the scheduled-job
+API. Persistent counters verify that hooks run before each workload, a failing
+hook blocks the workload, and the next execution recovers. The source container
+and its deployment labels remain unchanged, and an unrelated autostart-disabled
+service stays Created. Finally, a deployment that changes the job to `one_off`
+must fail with the unsupported `pre_start` error and preserve the existing source.
+
+`TestAutostartDrift` runs explicit and auto-discovered deployments in separate
+isolated remote Docker contexts, with reconciliation disabled to isolate polling.
+An autostart-disabled service with `restart: unless-stopped` starts in Created
+state. Fresh stack-specific log markers and completed poll API outcomes prove
+full-path skips and auto-discovery warm-cache skips. After an external start/stop
+simulates Sablier, three distinct unchanged polls must preserve the container ID,
+deployment labels, and Exited state without new deployment notifications or
+commits. Removing the container must create a stopped replacement. A real service
+configuration change must still deploy without starting it, and enabling
+autostart must start the service. This coverage is Standalone-only.
 
 ## How it works
 

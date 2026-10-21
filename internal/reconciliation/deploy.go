@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -45,6 +46,14 @@ func (m *Manager) Deploy(ctx context.Context, req DeployRequest) error {
 		return fmt.Errorf("validate deploy request: %w", err)
 	}
 
+	// An unverified artifact must not change the observed pause intent or run cleanup.
+	if req.Repository.Source == config.SourceTypeOCI && !req.Repository.OCITrusted {
+		return fmt.Errorf("%w: refusing to use its deployment configuration before trust-policy verification", ErrOCIArtifactNotVerified)
+	}
+
+	req.pauseGeneration = m.observePause(req)
+	m.cancelCleanupRetry(req)
+
 	// Sync windows are evaluated once for the whole request, see syncWindowGate.
 	gate := m.newSyncWindowGate(req, time.Now())
 
@@ -54,6 +63,26 @@ func (m *Manager) Deploy(ctx context.Context, req DeployRequest) error {
 	// Test runs use testName only to make stacks unique and do not need background
 	// Docker event watchers that can outlive the test and race with TempDir cleanup.
 	if req.TestName == "" {
+		if m.newerPauseObservation(req) {
+			// Keep the newer control intent, but remember operations admitted
+			// before it that actually completed.
+			completed := make(map[*deployConfig.Config]struct{})
+
+			for _, result := range results {
+				if result.err == nil && !result.config.Destroy.Enabled {
+					completed[result.config] = struct{}{}
+				}
+			}
+
+			if len(completed) == 0 {
+				return err
+			}
+
+			m.addJob(ctx, req, gate.deferred(), completed)
+
+			return err
+		}
+
 		m.addJob(ctx, req, gate.deferred(), successfulForcedDeployments(results))
 	}
 
@@ -61,20 +90,63 @@ func (m *Manager) Deploy(ctx context.Context, req DeployRequest) error {
 }
 
 func (m *Manager) deploy(ctx context.Context, req DeployRequest, gate *syncWindowGate) ([]stackResult, error) {
-	if req.Repository.Source == config.SourceTypeOCI && !req.Repository.OCITrusted {
-		return nil, fmt.Errorf("%w: refusing to run reconciliation cleanup before trust-policy verification", ErrOCIArtifactNotVerified)
+	pending, cleanupErr := m.cleanupObsolete(ctx, req, gate)
+	m.scheduleCleanupRetry(ctx, req, pending || cleanupErr != nil)
+
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, m.activeDeployConfigs(req))
+
+	results, err := m.deployWithContexts(ctx, req, contextCLIs, gate)
+	if cleanupErr != nil && errors.Is(err, stages.ErrSkipDeployment) {
+		return results, cleanupErr
 	}
 
-	configsByContext := map[string][]*deployConfig.Config{}
-	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, req.DeployConfigs)
+	return results, errors.Join(cleanupErr, err)
+}
 
-	for _, dc := range req.DeployConfigs {
+func (m *Manager) cleanupObsolete(ctx context.Context, req DeployRequest, gate *syncWindowGate) (bool, error) {
+	if req.Repository.Source == config.SourceTypeOCI && !req.Repository.OCITrusted {
+		return false, fmt.Errorf("%w: refusing to run reconciliation cleanup before trust-policy verification", ErrOCIArtifactNotVerified)
+	}
+
+	if m.cleanupRetrySuperseded(req) {
+		return false, nil
+	}
+
+	cleanupReq := m.currentCleanupRequest(req)
+	configsByContext := map[string][]*deployConfig.Config{}
+	contextConfigs := m.activeDeployConfigs(req)
+
+	for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+		if !origin.Pause {
+			contextConfigs = append(contextConfigs, &deployConfig.Config{Context: origin.Context})
+		}
+	}
+
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, contextConfigs)
+
+	for _, dc := range cleanupReq.DeployConfigs {
 		contextName := docker.NormalizeContextName(dc.Context)
 		configsByContext[contextName] = append(configsByContext[contextName], dc)
 	}
 
+	for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+		contextName := docker.NormalizeContextName(origin.Context)
+		if _, exists := configsByContext[contextName]; !exists {
+			configsByContext[contextName] = nil
+		}
+	}
+
+	var (
+		pending bool
+		errs    []error
+	)
+
 	for contextName, groupedConfigs := range configsByContext {
-		entry := contextCLIs[contextName]
+		entry, available := contextCLIs[contextName]
+		if !available {
+			continue
+		}
+
 		if entry.err != nil {
 			// Isolate per-context failures: an unreachable context must not block
 			// cleanup/deploy for other (healthy) contexts. handleDeploy below fails
@@ -82,13 +154,37 @@ func (m *Manager) deploy(ctx context.Context, req DeployRequest, gate *syncWindo
 			req.Logger.Error("failed to create docker client for context, skipping cleanup for it",
 				slog.String("context", docker.DisplayContextName(contextName)), logger.ErrAttr(entry.err))
 
+			errs = append(errs, fmt.Errorf("cleanup context %q: %w", contextName, entry.err))
+
 			continue
 		}
 
-		for swarmMode, modeConfigs := range groupDeployConfigsByMode(groupedConfigs, entry.swarmMode) {
-			if err := cleanupObsoleteAutoDiscoveredContainers(ctx, req.Logger,
-				entry.cli, swarmMode, contextName, req,
-				modeConfigs, m.notifier, gate.removalPredicate(contextName)); err != nil {
+		modes := groupDeployConfigsByMode(groupedConfigs, entry.swarmMode)
+
+		for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+			if docker.NormalizeContextName(origin.Context) != contextName || origin.Pause {
+				continue
+			}
+			// Removed children can remain in either mode after a root mode change.
+			if _, exists := modes[false]; !exists {
+				modes[false] = nil
+			}
+
+			if entry.swarmMode {
+				if _, exists := modes[true]; !exists {
+					modes[true] = nil
+				}
+			}
+		}
+
+		for swarmMode, modeConfigs := range modes {
+			deferred, err := cleanupObsoleteAutoDiscoveredContainersResult(ctx, req.Logger,
+				entry.cli, swarmMode, contextName, cleanupReq,
+				modeConfigs, m.notifier, m.removalPredicate(cleanupReq, contextName, gate))
+			pending = pending || deferred
+
+			if err != nil {
+				errs = append(errs, err)
 				req.Logger.Error("failed to clean up obsolete auto-discovered containers for context",
 					slog.String("context", docker.DisplayContextName(contextName)),
 					slog.Bool("swarm_mode", swarmMode),
@@ -97,14 +193,14 @@ func (m *Manager) deploy(ctx context.Context, req DeployRequest, gate *syncWindo
 		}
 	}
 
-	return m.deployWithContexts(ctx, req, contextCLIs, gate)
+	return pending, errors.Join(errs...)
 }
 
 // handleDeploy deploys req. It is used by reconciliation, whose requests are
 // only gated by sync windows for stacks that would not be restored to a
 // revision known to be deployed, see stackRevision.restoresDeployed.
 func (m *Manager) handleDeploy(ctx context.Context, req DeployRequest) error {
-	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, req.DeployConfigs)
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, m.activeDeployConfigs(req))
 
 	return m.handleDeployWithContexts(ctx, req, contextCLIs, m.newSyncWindowGate(req, time.Now()))
 }
@@ -141,6 +237,15 @@ func (m *Manager) deployWithContexts(ctx context.Context, req DeployRequest, con
 		// It is not used in production.
 		if req.TestName != "" {
 			deployCfg.Name = test.ConvertTestName(req.TestName)
+		}
+
+		if err := m.admitPause(req, deployCfg, nil); err != nil {
+			deployLog.Debug("deployment skipped", logger.ErrAttr(err))
+			gate.record(deployCfg, err)
+
+			resultCh <- stackResult{config: deployCfg, name: deployCfg.Name, context: deployCfg.Context, err: err}
+
+			continue
 		}
 
 		m.deployments.start(req.Repository.Name, deployCfg.Context, deployCfg.Name)
@@ -196,6 +301,18 @@ func (m *Manager) deployWithContexts(ctx context.Context, req DeployRequest, con
 		results = append(results, e)
 	}
 
+	if len(req.DeployConfigs) == 0 && len(req.AutoDiscoveryOrigins) > 0 &&
+		!slices.ContainsFunc(req.AutoDiscoveryOrigins, func(origin deployConfig.AutoDiscoveryOrigin) bool {
+			return !origin.Pause
+		}) {
+		var skipped []stages.SkippedStack
+		for _, origin := range req.AutoDiscoveryOrigins {
+			skipped = append(skipped, stages.NewSkippedStack(req.Repository.Name, origin.Context, stages.DeploymentPaused()))
+		}
+
+		return results, stages.NewSkippedRunError(skipped)
+	}
+
 	return results, summarizeDeployResults(results, len(req.DeployConfigs))
 }
 
@@ -239,6 +356,7 @@ func summarizeDeployResults(results []stackResult, total int) error {
 	var (
 		errs            []error
 		blocked         []*stages.SyncWindowBlockedError
+		suppressed      []*stages.RetrySuppressedError
 		skipped         []stages.SkippedStack
 		successCount    int
 		skipCount       int
@@ -261,8 +379,17 @@ func summarizeDeployResults(results []stackResult, total int) error {
 			continue
 		}
 
-		if blockedErr, ok := errors.AsType[*stages.SyncWindowBlockedError](e); ok {
+		retryErr, retrySuppressed := errors.AsType[*stages.RetrySuppressedError](e)
+		if retrySuppressed {
+			suppressed = append(suppressed, retryErr)
+		}
+
+		blockedErr, windowBlocked := errors.AsType[*stages.SyncWindowBlockedError](e)
+		if windowBlocked {
 			blocked = append(blocked, blockedErr)
+		}
+
+		if retrySuppressed || windowBlocked {
 			continue
 		}
 
@@ -290,8 +417,35 @@ func summarizeDeployResults(results []stackResult, total int) error {
 		return selfupdate.ErrHandover
 	}
 
+	if len(suppressed) > 0 {
+		retryErr := stages.MergeRetrySuppressed(suppressed)
+
+		var outcomes []error
+		if len(blocked) > 0 {
+			outcomes = append(outcomes, stages.MergeSyncWindowBlocked(blocked))
+		}
+
+		if slices.ContainsFunc(skipped, func(stack stages.SkippedStack) bool {
+			return stack.Reason == stages.SkipReasonPaused
+		}) {
+			outcomes = append(outcomes, stages.NewSkippedRunError(skipped))
+		}
+
+		if len(outcomes) > 0 {
+			return errors.Join(append([]error{retryErr}, outcomes...)...)
+		}
+
+		return retryErr
+	}
+
 	if successCount == 0 && total > 0 && skipCount+filterSkipCount+len(blocked) == total {
 		if len(blocked) > 0 {
+			if slices.ContainsFunc(skipped, func(stack stages.SkippedStack) bool {
+				return stack.Reason == stages.SkipReasonPaused
+			}) {
+				return errors.Join(stages.MergeSyncWindowBlocked(blocked), stages.NewSkippedRunError(skipped))
+			}
+
 			return stages.MergeSyncWindowBlocked(blocked)
 		}
 
@@ -342,11 +496,19 @@ func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deploy
 	deploymentDockerCli command.Cli, swarmAvailable bool, dc *deployConfig.Config, gitChanges *stages.GitChangeCache,
 	gitAncestry *stages.GitAncestryCache, gate *syncWindowGate,
 ) error {
+	if err := m.admitPause(req, dc, nil); err != nil {
+		return err
+	}
+
 	swarmMode, err := dc.ResolveSwarmMode(swarmAvailable)
 	if err != nil {
 		return fmt.Errorf("failed to resolve swarm mode for deployment %q on docker context %q: %w",
 			dc.Name, docker.DisplayContextName(dc.Context), err)
 	}
+
+	// Init switches the stage repository to a repository_url override.
+	// Pause checks must keep the identity of the configuration source.
+	repository := req.Repository
 
 	stageMgr, err := stages.NewStageManager(
 		stages.Dependencies{
@@ -361,7 +523,8 @@ func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deploy
 			Log:        deployLog,
 			JobID:      req.Metadata.JobID,
 			JobTrigger: req.JobTrigger,
-			Repository: &req.Repository,
+			Origin:     req.Origin,
+			Repository: &repository,
 			Docker: &stages.Docker{
 				Cmd:            deploymentDockerCli,
 				DataMountPoint: m.dataMountPoint,
@@ -404,6 +567,10 @@ func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deploy
 		}
 		defer release()
 
+		if err := m.admitPause(req, dc, nil); err != nil {
+			return err
+		}
+
 		return stageMgr.RunStages(ctx, nil)
 	}
 
@@ -429,6 +596,9 @@ func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deploy
 			deployed: stageMgr.DeployState.DeployedCommit,
 			own:      stageMgr.ResolvedOwnReference(),
 		}
+		if err := m.admitPause(req, dc, &rev); err != nil {
+			return nil, err
+		}
 
 		if err := gate.admitStack(deployLog, dc, rev, func(description string) {
 			stageMgr.PostCommitStatusWithOutcome(ctx, commitstatus.StatePending, description, commitstatus.OutcomeDeferred)
@@ -436,7 +606,17 @@ func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deploy
 			return nil, err
 		}
 
-		return m.acquireQueuedDeploymentPhase(ctx, stageMgr)
+		release, err := m.acquireQueuedDeploymentPhase(ctx, stageMgr)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := m.admitPause(req, dc, &rev); err != nil {
+			release()
+			return nil, err
+		}
+
+		return release, nil
 	})
 }
 

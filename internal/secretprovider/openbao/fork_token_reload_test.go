@@ -56,13 +56,13 @@ var stampSeq atomic.Int64
 func writeToken(t *testing.T, path, tok string) {
 	t.Helper()
 
-	if err := writeTokenFile(path, tok); err != nil {
+	if err := renameTokenFile(path, tok); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// writeTokenFile is writeToken without the testing.T, for goroutines that are not the test's.
-func writeTokenFile(path, tok string) error {
+// renameTokenFile is writeToken without the testing.T, for goroutines that are not the test's.
+func renameTokenFile(path, tok string) error {
 	// The agent writes the sink with a rename: so does the test, so a reader never sees half a file.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(tok+"\n"), 0o600); err != nil {
@@ -271,7 +271,7 @@ func TestTokenReloadConcurrent(t *testing.T) {
 			defer wg.Done()
 
 			if i == 10 {
-				if err := writeTokenFile(path, "tok-2"); err != nil {
+				if err := renameTokenFile(path, "tok-2"); err != nil {
 					record(fmt.Errorf("write token file: %w", err))
 				}
 

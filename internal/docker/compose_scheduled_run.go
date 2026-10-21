@@ -31,6 +31,7 @@ import (
 var (
 	ErrComposeScheduledMetadataUnavailable = errors.New("compose scheduled-job metadata unavailable")
 	ErrComposeScheduledServiceReplicated   = errors.New("standalone scheduled compose service must have exactly one replica")
+	ErrComposeOneOffPreStartUnsupported    = errors.New("pre_start hooks are not supported for Compose one_off jobs; use cd.doco.job.execution_mode=restart")
 	// ErrComposeScheduledSourceUnavailable reports that a deployment source is not yet on disk.
 	// This can occur before the first poll fetches it, so timer-based callers should retry rather
 	// than treat it as a deployment failure.
@@ -89,11 +90,7 @@ func RunComposeScheduledContainer(
 	// Keep prior scheduler behavior for running containers:
 	// restart when already running, start when stopped.
 	if inspectResult.Container.State != nil && inspectResult.Container.State.Running {
-		if waitForExit {
-			return RestartContainerAndWait(ctx, dockerCli.Client(), containerID)
-		}
-
-		return RestartContainer(ctx, dockerCli.Client(), containerID)
+		return restartComposeScheduledContainer(ctx, dockerCli.Client(), containerID, project.Services[ref.Service], waitForExit)
 	}
 
 	service, err := compose.NewComposeService(dockerCli)
@@ -101,25 +98,131 @@ func RunComposeScheduledContainer(
 		return fmt.Errorf("create compose service: %w", err)
 	}
 
-	var waitResult client.ContainerWaitResult
+	if err := prepareComposePreStartRunners(ctx, service, project, ref.Service); err != nil {
+		return fmt.Errorf("prepare pre_start hooks for compose service %s/%s: %w", ref.Project, ref.Service, err)
+	}
+
+	var awaitExit func() error
+
 	if waitForExit {
-		waitResult = dockerCli.Client().ContainerWait(ctx, containerID, client.ContainerWaitOptions{
-			Condition: containerTypes.WaitConditionNextExit,
-		})
+		var cancelWait context.CancelFunc
+
+		awaitExit, cancelWait = subscribeComposeScheduledExit(ctx, dockerCli.Client(), containerID, containerTypes.WaitConditionNextExit)
+		defer cancelWait()
 	}
 
 	if err := service.Start(ctx, ref.Project, api.StartOptions{
 		Project:  project,
 		Services: []string{ref.Service},
 	}); err != nil {
-		return fmt.Errorf("start compose service %s/%s: %w", ref.Project, ref.Service, err)
+		err = fmt.Errorf("start compose service %s/%s: %w", ref.Project, ref.Service, err)
+
+		// A failed post_start hook leaves the container running. Wait for the job to end,
+		// so the services in stop_services stay stopped while the job runs.
+		if waitForExit && containerIsRunning(ctx, dockerCli.Client(), containerID) {
+			return errors.Join(err, awaitExit())
+		}
+
+		return err
 	}
 
 	if waitForExit {
-		return awaitContainerExit(waitResult, containerID)
+		return awaitExit()
 	}
 
 	return nil
+}
+
+// restartComposeScheduledContainer restarts a running restart-mode job like `docker compose restart`.
+// It runs pre_stop hooks before the restart and post_start hooks after it. pre_start hooks do not run.
+func restartComposeScheduledContainer(ctx context.Context, apiClient client.APIClient, containerID string, svc types.ServiceConfig, waitForExit bool) error {
+	if !HasComposeHooks(svc, ComposeHookPreStop) && !HasComposeHooks(svc, ComposeHookPostStart) {
+		if waitForExit {
+			return RestartContainerAndWait(ctx, apiClient, containerID)
+		}
+
+		return RestartContainer(ctx, apiClient, containerID)
+	}
+
+	// Like Compose, a failed pre_stop hook cancels the restart.
+	// A container that stopped in the meantime has nothing to prepare for the stop.
+	if err := RunComposeHooks(ctx, apiClient, containerID, svc, ComposeHookPreStop); err != nil && !IsComposeHookContainerUnavailable(err) {
+		return err
+	}
+
+	if _, err := apiClient.ContainerRestart(ctx, containerID, client.ContainerRestartOptions{}); err != nil {
+		return fmt.Errorf("restart container %s: %w", containerID, err)
+	}
+
+	// The restarted job may already have exited when the restart request returns.
+	// not-running includes that exit; next-exit would wait for another execution.
+	var awaitExit func() error
+
+	if waitForExit {
+		var cancelWait context.CancelFunc
+
+		awaitExit, cancelWait = subscribeComposeScheduledExit(ctx, apiClient, containerID, containerTypes.WaitConditionNotRunning)
+		defer cancelWait()
+	}
+
+	hookErr := RunComposeHooks(ctx, apiClient, containerID, svc, ComposeHookPostStart)
+	if !waitForExit {
+		return hookErr
+	}
+
+	// The job runs even if post_start fails. Wait for it, so the services in stop_services stay stopped.
+	return errors.Join(hookErr, awaitExit())
+}
+
+// subscribeComposeScheduledExit drains the wait response even when a failed start returns early.
+// Canceling the subscription then closes the request instead of leaving an idle wait behind.
+func subscribeComposeScheduledExit(ctx context.Context, apiClient client.APIClient, containerID string, condition containerTypes.WaitCondition) (func() error, context.CancelFunc) {
+	waitCtx, cancel := context.WithCancel(ctx)
+	waitResult := apiClient.ContainerWait(waitCtx, containerID, client.ContainerWaitOptions{Condition: condition})
+	exited := make(chan error, 1)
+
+	go func() {
+		exited <- awaitContainerExit(waitResult, containerID)
+	}()
+
+	return func() error { return <-exited }, cancel
+}
+
+// prepareComposePreStartRunners creates fresh pre_start hook runners for an existing service container.
+// Compose removes the runners after a successful start, so each start needs new runners.
+// Create does not recreate the service container. It prepares no runners while the service runs.
+func prepareComposePreStartRunners(ctx context.Context, service api.Compose, project *types.Project, serviceName string) error {
+	if len(project.Services[serviceName].PreStart) == 0 {
+		return nil
+	}
+
+	prepareComposeScheduledHookProject(project, serviceName)
+
+	return service.Create(ctx, project, api.CreateOptions{
+		Services:             []string{serviceName},
+		Recreate:             api.RecreateNever,
+		RecreateDependencies: api.RecreateNever,
+		IgnoreOrphans:        true,
+		QuietPull:            true,
+	})
+}
+
+// prepareComposeScheduledHookProject sets the labels and pull policy that
+// Create needs to prepare pre_start runners for an existing service container.
+func prepareComposeScheduledHookProject(project *types.Project, serviceName string) {
+	addComposeServiceTrackingLabels(project)
+
+	svc, ok := project.Services[serviceName]
+	if !ok {
+		return
+	}
+
+	// The source container keeps its image. Pull only missing hook images, so
+	// a scheduled run does not contact the registry on every execution.
+	if svc.PullPolicy != types.PullPolicyNever && svc.PullPolicy != types.PullPolicyBuild {
+		svc.PullPolicy = types.PullPolicyMissing
+		project.Services[serviceName] = svc
+	}
 }
 
 func RunComposeOneOffFromServiceDefinition(
@@ -202,6 +305,10 @@ func prepareComposeProjectForOneOffRunWithOptions(project *types.Project, servic
 		return nil, fmt.Errorf("compose service %q not found", serviceName)
 	}
 
+	if err := validateComposeOneOffHooks(sourceSvc); err != nil {
+		return nil, fmt.Errorf("service %s: %w", serviceName, err)
+	}
+
 	projectCopy := *project
 	projectCopy.Services = maps.Clone(project.Services)
 
@@ -267,7 +374,7 @@ func loadComposeScheduledProject(
 		return nil, fmt.Errorf("cannot resolve cached source for project %s: %w", ref.Project, err)
 	}
 
-	unlockSource, err := lockScheduledSource(ref, opts.ComposeLoad.DataMountPath, sourceRepoPath)
+	unlockSource, err := lockScheduledSource(ctx, ref, opts.ComposeLoad.DataMountPath, sourceRepoPath)
 	if err != nil {
 		return nil, fmt.Errorf("lock scheduled source for project %s: %w", ref.Project, err)
 	}
@@ -713,8 +820,8 @@ func resolveScheduledSourceRepo(ref composeScheduledServiceRef, dataMountPath st
 
 // lockScheduledSource protects a scheduled compose reload with the repository's GC gate and, when available, an
 // exclusive lock on the published artifact. Legacy layouts use only the GC gate.
-func lockScheduledSource(ref composeScheduledServiceRef, dataMountPath, sourceRepoPath string) (func(), error) {
-	unlockGC, err := sourcecache.AcquireSharedGCPathLock(sourceRepoPath)
+func lockScheduledSource(ctx context.Context, ref composeScheduledServiceRef, dataMountPath, sourceRepoPath string) (func(), error) {
+	unlockGC, err := sourcecache.AcquireSharedGCPathLockContext(ctx, sourceRepoPath)
 	if err != nil {
 		return nil, err
 	}
@@ -723,7 +830,7 @@ func lockScheduledSource(ref composeScheduledServiceRef, dataMountPath, sourceRe
 
 	var unlockDeploymentGC func()
 	if found && filepath.Clean(deploymentStore) != filepath.Clean(sourceRepoPath) {
-		unlockDeploymentGC, err = sourcecache.AcquireSharedGCPathLock(deploymentStore)
+		unlockDeploymentGC, err = sourcecache.AcquireSharedGCPathLockContext(ctx, deploymentStore)
 		if err != nil {
 			unlockGC()
 
@@ -733,7 +840,16 @@ func lockScheduledSource(ref composeScheduledServiceRef, dataMountPath, sourceRe
 
 	var unlockArtifact func()
 	if found {
-		unlockArtifact = sourcecache.AcquirePathLock(artifactRoot)
+		unlockArtifact, err = sourcecache.AcquirePathLockContext(ctx, artifactRoot)
+		if err != nil {
+			if unlockDeploymentGC != nil {
+				unlockDeploymentGC()
+			}
+
+			unlockGC()
+
+			return nil, err
+		}
 	}
 
 	return func() {

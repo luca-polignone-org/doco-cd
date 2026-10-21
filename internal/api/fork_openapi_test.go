@@ -15,11 +15,11 @@ import (
 )
 
 // The goldens are the raw /openapi/rest.json and /openapi/webhook.json documents of upstream
-// v0.127.0 (commit 772ed15), served by RegisterRoutes with app.Config{OpenAPIEnabled: true}, the
+// v0.129.0 (commit 6216106f), served by RegisterRoutes with app.Config{OpenAPIEnabled: true}, the
 // handler built as below and app.Version "dev". They are committed exactly as upstream produced them.
 const (
-	forkRestGolden    = "openapi-upstream-v0.127.0.json"
-	forkWebhookGolden = "openapi-webhook-upstream-v0.127.0.json"
+	forkRestGolden    = "openapi-upstream-v0.129.0.json"
+	forkWebhookGolden = "openapi-webhook-upstream-v0.129.0.json"
 
 	// forkDeployConfigSchema is the deploy config component; the fork adds its rollback property.
 	forkDeployConfigSchema = "github.com_kimdre_doco-cd_internal_config_deploy.Config"
@@ -115,7 +115,7 @@ func readOpenAPIGolden(t *testing.T, name string) map[string]any {
 }
 
 // TestForkOpenAPIMatchesUpstreamWithoutKeys is the non-regression check of the fork on the API
-// documents: with no new app key they equal the upstream v0.127.0 documents except for exactly
+// documents: with no new app key they equal the upstream v0.129.0 documents except for exactly
 // two additive pieces, the rollback property of the deploy config schema and the RollbackConfig
 // component. rollback is a per-repository deploy config key that no app key gates (without
 // HOOK_PRE_ROLLBACK_URL it still works and ends blocked), so the schema documents it whatever

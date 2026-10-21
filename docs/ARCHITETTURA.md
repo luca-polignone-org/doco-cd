@@ -1,7 +1,7 @@
 # Fork architecture
 
 Last verified: 2026-10-21, on the merge of upstream `v0.129.0` (branch
-`merge/upstream-v0.129.0`, base `main` `b7754382`); before that on 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
+`merge/upstream-v0.129.0`, commit `f93ba649`, base `main` `b7754382`); before that on 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
 `METRICS_BIND_ADDRESS`; base `main` `d715be6d`); before that on 2026-10-19, on commit `ad4fa837`
 (PR #15, TCK-644: rollback image references, image verification and the retry after a rollback;
 base `main` `20f46cb3`); before that on 2026-10-17, on
@@ -326,7 +326,8 @@ deploy configs without `Internal.File` (inline, auto-discovery).
 - Since `v0.129.0` direct start and restart operations reload the deployed project for Compose
   hooks through `loadComposeScheduledProject`, hence through the job gate: on an object without a
   verdict in this process the load is refused and the service starts without its hooks (one Warn),
-  as before `v0.129.0`.
+  as before `v0.129.0`. The job gate and the compose policy check the services, not the hooks
+  themselves: see the Known debts.
 - `HTTP_BIND_ADDRESS` and `METRICS_BIND_ADDRESS` choose the IP the API and the metrics server bind
   to; empty (the default) binds every interface, as upstream. Only a literal IP is accepted: a
   hostname would be resolved once at startup. With a specific API address the container
@@ -383,7 +384,14 @@ deploy configs without `Internal.File` (inline, auto-discovery).
 - `failure_kind` in the outcome (spec 3c, «useful») is not done —
   https://app.notion.com/p/3fca27896a5381489b6cde008677b74b
 - The fork CI has no permanent `-race` job: the token reload race test ran with `-race` once, in a
-  temporary CI step of PR #9 — https://app.notion.com/p/3fca27896a538183ae97daa6ec9dc280
+  temporary CI step of PR #9, and the merge of `v0.129.0` ran `-race` locally on
+  `internal/secretprovider/openbao` (without `TestProvider_OpenBao`) and `internal/stages`
+  (`CC="zig cc"`, `-ldflags=-linkmode=external`) —
+  https://app.notion.com/p/3fca27896a538183ae97daa6ec9dc280
+- The compose policy ignores Compose lifecycle hooks: `pre_start[]` containers (image,
+  `privileged`, volumes, namespaces, `cap_add`) and `privileged` on `post_start`/`pre_stop` are
+  not checked by `checkService`. Since `v0.129.0` hooks also run on start, stop and restart —
+  https://app.notion.com/p/400a27896a5381b4b02fd8c330f4a6d6
 - Upstream `GetCertSerial` panics when the `pki/certs/detailed` response has no `key_info` —
   https://app.notion.com/p/3fca27896a5381a4afa2e9d9d66bdc3e
 - `runForkPreDeployStage` (`internal/stages/fork_policy.go`) is at 80% statement coverage since

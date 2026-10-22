@@ -1,6 +1,7 @@
 # Fork architecture
 
-Last verified: 2026-10-21, on the merge of upstream `v0.129.0` (branch
+Last verified: 2026-10-22, on branch `fork/git-token-reload` (poli.6: `GIT_ACCESS_TOKEN_FILE`
+reload; base `main` `5e738969`; the merge commit is not known yet); before that on 2026-10-21, on the merge of upstream `v0.129.0` (branch
 `merge/upstream-v0.129.0`, commit `f93ba649`, base `main` `b7754382`); before that on 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
 `METRICS_BIND_ADDRESS`; base `main` `d715be6d`); before that on 2026-10-19, on commit `ad4fa837`
 (PR #15, TCK-644: rollback image references, image verification and the retry after a rollback;
@@ -38,6 +39,9 @@ Smaller fork files in upstream packages: `internal/filesystem/atomic_write.go`,
 `internal/composepolicy/{check,file}.go` (the `secret_allowlist` and `logging` keys, `checkLogging`
 in `checkService`) and `internal/rollback/{store,lastgood}.go` (failure store version 2 with
 `content_key`, last good still version 1).
+Added by poli.6: `internal/config/fork_reloading_file.go`, `internal/git/fork_token_source.go`,
+`cmd/doco-cd/fork_git_token_file.go`; upstream lines changed: one in `internal/git/auth.go`
+(`resolveAuthConfig`), one call in `cmd/doco-cd/main.go`.
 
 **Registries, nil until a key is set.** `cmd/doco-cd/main.go` fills them at startup, before any
 scheduler or handler runs; a nil registry is the upstream behaviour.
@@ -201,6 +205,19 @@ and logs one ERROR per distinct failure, and one line on recovery. A 403 on an i
 re-reads the file once and retries once (`retryOnForbidden`); `pki-role` issuance is never
 retried. Without the key the behaviour is upstream's.
 
+**Git token reload (`poli.6`).** With `GIT_ACCESS_TOKEN_FILE` (and no `GIT_ACCESS_TOKEN`, no
+global GitHub App) `main` installs a `config.ReloadingFile` as the global token source of the git
+auth resolver and clears `app.Config.GitAccessToken`, so that every caller, which passes that
+field as an explicit token, falls back to the resolver. Every resolution (clone, fetch, poll,
+remote includes, commit statuses and check runs) stats the file and re-reads it when its inode,
+mtime or size changed, SOPS-decrypted as upstream. A missing, unreadable, empty or undecryptable
+file keeps the last good token, logs one WARN per distinct failure with `value_age` and never the
+token, and one INFO on recovery; after a failure the file is read again on every use. The token's
+expiry is not known: an expired token gets a 401, as no token would. Scoped `GIT_AUTH_DOMAINS`
+tokens are not reloaded. In reload mode `appConfig.GitAccessToken` is always empty after startup,
+so future upstream code must not test it and must go through `git.ResolveAuthConfig` or
+`GetAuthMethod`.
+
 **Poison by content (`poli.2`).** With `rollback.unblock_on: content`, the failure record carries
 `content_key` = `tree:<git tree hash of working_dir at the failed commit, from the deploy
 mirror>;config:<git blob hash of the deploy config file read from disk>`. In `rollbackPoisoned` a
@@ -334,6 +351,8 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   healthcheck targets that address instead of `localhost`. With `network_mode: host` behind a
   local `tailscale serve`, both set to `127.0.0.1` keep the plain-HTTP API and metrics off every
   other interface. IPv6 zones are rejected. The pprof server is loopback-only already.
+- `GIT_ACCESS_TOKEN_FILE` must be replaced atomically (temp file + rename): an in-place write that
+  keeps inode, size and mtime is not seen.
 
 ## Known debts
 

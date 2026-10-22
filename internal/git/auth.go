@@ -141,6 +141,8 @@ func resolveAuthConfig(url, privateKey, keyPassphrase, token string) ResolvedAut
 
 	authResolverMu.RUnlock()
 
+	resolver.globalToken = liveGlobalToken(resolver.globalToken) // poli: GIT_ACCESS_TOKEN_FILE reload (fork_token_source.go)
+
 	host := parseGitHost(url)
 	if host == "" {
 		return ResolvedAuthConfig{

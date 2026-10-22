@@ -215,6 +215,13 @@ func run() error {
 	// Set the actual log level
 	log = logger.New(logLevel)
 
+	// poli: GIT_ACCESS_TOKEN_FILE is re-read when it changes (fork_git_token_file.go).
+	if err = enableGitTokenFileReload(c, log.Logger); err != nil {
+		log.Critical("failed to enable the GIT_ACCESS_TOKEN_FILE reload", logger.ErrAttr(err))
+
+		return err
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "apply-self" {
 		return runApplySelf(ctx, log, c, os.Args[2:])
 	}

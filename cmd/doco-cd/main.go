@@ -600,20 +600,27 @@ func run() error {
 
 	logSyncWindows(log.Logger, c.SyncWindows, time.Now())
 
+	// poli: the poll jobs follow POLL_CONFIG_FILE when it changes (fork_poll_config_file.go).
+	pollJobs := newPollJobSet(ctx, &h, &wg)
+
 	if len(c.PollConfig) > 0 {
 		log.Info(
 			"poll configuration found, scheduling polling jobs",
 			slog.Any("poll_config", logger.BuildSliceLogValue(c.PollConfig, "Deployments.Internal")),
 		)
 
-		for _, pollConfig := range c.PollConfig {
-			err = StartPoll(ctx, &h, pollConfig, &wg)
-			if err != nil {
-				log.Critical("failed to scheduling polling jobs", logger.ErrAttr(err))
+		_, err = pollJobs.Apply(c.PollConfig)
+		if err != nil {
+			log.Critical("failed to scheduling polling jobs", logger.ErrAttr(err))
 
-				return err
-			}
+			return err
 		}
+	}
+
+	if err = enablePollConfigFileReload(ctx, c, pollJobs, &wg, log.Logger); err != nil {
+		log.Critical("failed to enable the POLL_CONFIG_FILE reload", logger.ErrAttr(err))
+
+		return err
 	}
 
 	if c.SchedulerEnabled {
@@ -700,7 +707,7 @@ func run() error {
 			SyncWindows:          c.SyncWindows,
 			Auth:                 authenticator,
 			RBAC:                 enforcer,
-			PollConfig:           c.PollConfig,
+			PollConfig:           c.CurrentPollConfig,
 		})
 		if err != nil {
 			log.Critical("failed to create MCP handler", logger.ErrAttr(err))

@@ -246,8 +246,11 @@ func matchingInlineWebhookDeployments(
 
 	var deployments []*deploy.Config
 
-	for i := range appConfig.PollConfig {
-		pollConfig := &appConfig.PollConfig[i]
+	// Fork: the poll configuration in force, reloaded from POLL_CONFIG_FILE (fork_poll_config.go).
+	pollConfigs := appConfig.CurrentPollConfig()
+
+	for i := range pollConfigs {
+		pollConfig := &pollConfigs[i]
 		if config.NormalizeSourceType(pollConfig.Source) != config.SourceTypeGit ||
 			len(pollConfig.Deployments) == 0 ||
 			strings.TrimSpace(pollConfig.CustomTarget) != customTarget ||

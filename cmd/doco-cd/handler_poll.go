@@ -43,6 +43,12 @@ const pollWatcherlessFallbackInterval = 24 * time.Hour
 
 // StartPoll initializes PollJob with the provided configuration and starts the PollHandler goroutine.
 func StartPoll(ctx context.Context, h *orchestrationHandler, pollConfig poll.Config, wg *sync.WaitGroup) error {
+	return startStoppablePoll(ctx, h, pollConfig, nil, wg)
+}
+
+// startStoppablePoll is StartPoll with a stop channel (fork): closing it ends the job after its run
+// in progress (fork_poll_config_file.go).
+func startStoppablePoll(ctx context.Context, h *orchestrationHandler, pollConfig poll.Config, stop <-chan struct{}, wg *sync.WaitGroup) error {
 	isLocalGit := config.NormalizeSourceType(pollConfig.Source) == config.SourceTypeGit &&
 		git.IsLocalFile(pollConfig.SourceUrl)
 
@@ -59,6 +65,7 @@ func StartPoll(ctx context.Context, h *orchestrationHandler, pollConfig poll.Con
 		Config:  pollConfig,
 		LastRun: 0,
 		NextRun: 0,
+		Stop:    stop,
 	}
 
 	h.log.Debug("Starting poll handler", "config", &pollConfig)
@@ -119,7 +126,11 @@ func (h *orchestrationHandler) PollHandler(ctx context.Context, pollJob *poll.Jo
 	if isLocalGit && pollJob.Config.Watch && !pollJob.Config.RunOnce && schedule == nil {
 		var watchErr error
 
-		watchCh, watchErr = git.WatchLocalGitRef(ctx, pollJob.Config.SourceUrl, logger)
+		// Fork: the watcher ends with the handler, which a reload may stop before ctx is done.
+		watchCtx, cancelWatch := context.WithCancel(ctx)
+		defer cancelWatch()
+
+		watchCh, watchErr = git.WatchLocalGitRef(watchCtx, pollJob.Config.SourceUrl, logger)
 		if watchErr != nil {
 			logger.Warn("failed to start local repository watcher, falling back to interval polling",
 				log.ErrAttr(watchErr))
@@ -178,6 +189,10 @@ func (h *orchestrationHandler) PollHandler(ctx context.Context, pollJob *poll.Jo
 	// Interval polls run immediately on startup. Scheduled polls wait for the
 	// next occurrence so a restart never polls outside the schedule.
 	if schedule == nil {
+		if pollJobStopped(logger, pollJob) {
+			return
+		}
+
 		doRun("startup")
 	} else {
 		updateNextRun()
@@ -242,7 +257,15 @@ func (h *orchestrationHandler) PollHandler(ctx context.Context, pollJob *poll.Jo
 			logger.Debug("ctx is done in poll handler")
 			return
 
+		case <-pollJob.Stop:
+			pollJobStopped(logger, pollJob)
+			return
+
 		case <-timerC:
+			if pollJobStopped(logger, pollJob) {
+				return
+			}
+
 			doRun(timerTrigger)
 			resetTimer(nextDelay(time.Now()))
 
@@ -262,6 +285,11 @@ func (h *orchestrationHandler) PollHandler(ctx context.Context, pollJob *poll.Jo
 			}
 
 			logger.Debug("local repository watcher detected new commit(s), triggering poll")
+
+			if pollJobStopped(logger, pollJob) {
+				return
+			}
+
 			doRun("watch")
 			resetTimer(pollInterval)
 		}

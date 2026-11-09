@@ -196,8 +196,8 @@ func newForkMCPServer(t *testing.T, runs *forkMCPRuns, enforcer *rbac.Enforcer) 
 		Runs:           runs,
 		Auth:           &restapi.Authenticator{APISecret: testMCPAPIKey, APIKeyEnabled: true, JWT: forkTokenVerifier{}},
 		RBAC:           enforcer,
-		PollConfig: []poll.Config{
-			{SourceUrl: validPollSourceURL, Reference: "refs/heads/main", Interval: 5 * time.Minute},
+		PollConfig: func() []poll.Config {
+			return []poll.Config{{SourceUrl: validPollSourceURL, Reference: "refs/heads/main", Interval: 5 * time.Minute}}
 		},
 	})
 

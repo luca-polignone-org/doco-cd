@@ -50,16 +50,16 @@ type Dependencies struct {
 	Auth *restapi.Authenticator `validate:"-"`
 	// Fork: RBAC authorizes every tool call; nil disables authorization (upstream behavior).
 	RBAC *rbac.Enforcer `validate:"-"`
-	// Fork: PollConfig is the operator's poll configuration, the only targets trigger_poll may
-	// run when RBAC is enabled.
-	PollConfig []poll.Config `validate:"-"`
+	// Fork: PollConfig returns the operator's poll configuration in force (reloaded from
+	// POLL_CONFIG_FILE), the only targets trigger_poll may run when RBAC is enabled. Nil means none.
+	PollConfig func() []poll.Config `validate:"-"`
 }
 
 // Handler serves the stateless MCP HTTP transport and owns all MCP tools.
 type Handler struct {
 	auth                 *restapi.Authenticator
 	rbac                 *rbac.Enforcer
-	pollConfig           []poll.Config
+	pollConfig           func() []poll.Config
 	trustedProxyHeader   string
 	trustedProxyNetworks []netip.Prefix
 	log                  *logger.Logger

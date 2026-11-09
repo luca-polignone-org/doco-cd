@@ -134,7 +134,12 @@ func (h *Handler) restrictPollConfigs(configs []poll.Config) ([]poll.Config, err
 		return configs, nil
 	}
 
-	allowed, err := controlplane.RestrictPollConfigs(h.pollConfig, configs)
+	var known []poll.Config
+	if h.pollConfig != nil {
+		known = h.pollConfig()
+	}
+
+	allowed, err := controlplane.RestrictPollConfigs(known, configs)
 	if err != nil {
 		return nil, fmt.Errorf("poll configuration not allowed: %w", err)
 	}

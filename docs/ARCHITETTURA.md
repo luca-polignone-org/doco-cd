@@ -1,7 +1,8 @@
 # Fork architecture
 
-Last verified: 2026-10-22, on branch `fork/git-token-reload` (poli.6: `GIT_ACCESS_TOKEN_FILE`
-reload; base `main` `5e738969`; the merge commit is not known yet); before that on 2026-10-21, on the merge of upstream `v0.129.0` (branch
+Last verified: 2026-11-09, on branch `fork/poll-config-reload` (poli.7: `POLL_CONFIG_FILE`
+reload; base `main` `d7be3ce1`; the merge commit is not known yet); before that on 2026-10-22, on
+branch `fork/git-token-reload` (poli.6: `GIT_ACCESS_TOKEN_FILE` reload; base `main` `5e738969`); before that on 2026-10-21, on the merge of upstream `v0.129.0` (branch
 `merge/upstream-v0.129.0`, commit `f93ba649`, base `main` `b7754382`); before that on 2026-10-21, on commit `1011ea7b` (PR #16: `HTTP_BIND_ADDRESS` and
 `METRICS_BIND_ADDRESS`; base `main` `d715be6d`); before that on 2026-10-19, on commit `ad4fa837`
 (PR #15, TCK-644: rollback image references, image verification and the retry after a rollback;
@@ -42,6 +43,14 @@ in `checkService`) and `internal/rollback/{store,lastgood}.go` (failure store ve
 Added by poli.6: `internal/config/fork_reloading_file.go`, `internal/git/fork_token_source.go`,
 `cmd/doco-cd/fork_git_token_file.go`; upstream lines changed: one in `internal/git/auth.go`
 (`resolveAuthConfig`), one call in `cmd/doco-cd/main.go`.
+Added by poli.7: `internal/config/poll/fork_reload.go` (`ParseConfigs`, `JobSet`,
+`WatchConfigFile`), `internal/config/app/fork_poll_config.go`,
+`cmd/doco-cd/fork_poll_config_file.go`; upstream lines changed: the `Stop` field of `poll.Job` and
+the unexported `pollConfigLive` field of `app.Config`, `startStoppablePoll` (`StartPoll` with a
+stop channel, in `handler_poll.go`) and the stop checks in `PollHandler` (whose local repository watcher now ends with the handler), the job start
+in `cmd/doco-cd/main.go` (through the `JobSet`), and the readers of `PollConfig` in
+`internal/api/poll.go` and `cmd/doco-cd/handler_webhook.go` (`CurrentPollConfig`); the MCP
+`Dependencies.PollConfig` is now a function.
 
 **Registries, nil until a key is set.** `cmd/doco-cd/main.go` fills them at startup, before any
 scheduler or handler runs; a nil registry is the upstream behaviour.
@@ -218,6 +227,23 @@ tokens are not reloaded. In reload mode `appConfig.GitAccessToken` is always emp
 so future upstream code must not test it and must go through `git.ResolveAuthConfig` or
 `GetAuthMethod`.
 
+**Poll configuration reload (`poli.7`).** With `POLL_CONFIG_FILE`, `main` starts the poll jobs
+through a `poll.JobSet` and a goroutine (`poll.WatchConfigFile`) that checks the file every 5 s
+through a `config.ReloadingFile` (inode, mtime, size). Content that differs from the last seen
+(initially the content parsed at start, so a change made in between is applied on the first
+check) is parsed and validated as at start (`poll.ParseConfigs`: YAML, then `Config.Validate` on
+every entry). Invalid content keeps the entries in force and logs one ERROR per distinct content; a
+missing, unreadable or empty file keeps them too, with the `ReloadingFile` WARN (unlike the start,
+where an empty file is no entries: the Portico reconciler writes `[]`). Valid content is installed
+with `app.Config.SetPollConfig`, read under a lock by the API (`RestrictPollConfigs`), the MCP
+`trigger_poll` and the webhook's inline deployments through `CurrentPollConfig`, and applied to the
+jobs: entries are matched by value (the JSON of the user-set fields, taken when the job started, so
+the `Internal` fields a run fills do not count), one job per entry; a job without an entry has its
+`Stop` closed and ends before its next run, never during one; an entry without a job starts one
+(an interval job runs at once, as at start); a matched entry keeps its job, timer and watcher.
+`apply-self` reads the start configuration only. Without the key, or with `POLL_CONFIG`, the jobs
+are started once, as upstream.
+
 **Poison by content (`poli.2`).** With `rollback.unblock_on: content`, the failure record carries
 `content_key` = `tree:<git tree hash of working_dir at the failed commit, from the deploy
 mirror>;config:<git blob hash of the deploy config file read from disk>`. In `rollbackPoisoned` a
@@ -353,6 +379,8 @@ deploy configs without `Internal.File` (inline, auto-discovery).
   other interface. IPv6 zones are rejected. The pprof server is loopback-only already.
 - `GIT_ACCESS_TOKEN_FILE` must be replaced atomically (temp file + rename): an in-place write that
   keeps inode, size and mtime is not seen.
+- `POLL_CONFIG_FILE` likewise; and a writer that renames must have the directory bind-mounted, not
+  the file: a bind mount of a single file keeps the old inode inside the container.
 
 ## Known debts
 

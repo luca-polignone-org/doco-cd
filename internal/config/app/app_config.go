@@ -136,6 +136,8 @@ type Config struct {
 	HookSecretFile                string                 `env:"HOOK_SECRET_FILE,file"`                                                                           // HookSecretFile is the file containing the HookSecret
 	HttpBindAddress               string                 `env:"HTTP_BIND_ADDRESS"`                                                                               // HttpBindAddress is the IP the HTTP server binds to; empty binds every interface (fork)
 	MetricsBindAddress            string                 `env:"METRICS_BIND_ADDRESS"`                                                                            // MetricsBindAddress is the IP the metrics server binds to; empty binds every interface (fork)
+
+	pollConfigLive *livePollConfig // fork: the poll configuration reloaded from POLL_CONFIG_FILE, see fork_poll_config.go
 }
 
 // GetConfig returns the app Config.

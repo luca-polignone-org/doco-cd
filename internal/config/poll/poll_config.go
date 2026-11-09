@@ -50,6 +50,9 @@ type Job struct {
 	Config  Config // config is the Config for this instance
 	LastRun int64  // LastRun is the last time this instance ran
 	NextRun int64  // NextRun is the next time this instance should run
+	// Stop, closed when the entry left a reloaded POLL_CONFIG_FILE, ends the job after its run in
+	// progress (fork, see fork_reload.go). Nil never stops it.
+	Stop <-chan struct{}
 }
 
 const MinPollInterval = 10 * time.Second // Minimum allowed poll interval

@@ -69,7 +69,7 @@ func (h *Handler) TriggerPollHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	if h.rbac.Enabled() {
-		allowed, err := controlplane.RestrictPollConfigs(h.appConfig.PollConfig, pollConfigs)
+		allowed, err := controlplane.RestrictPollConfigs(h.appConfig.CurrentPollConfig(), pollConfigs)
 		if err != nil {
 			jobLog.Warn("poll configuration not allowed", logger.ErrAttr(err))
 			restapi.JSONError(w, "poll configuration not allowed", err.Error(), jobID, http.StatusBadRequest)
